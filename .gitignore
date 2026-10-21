@@ -1,0 +1,15 @@
+# Fichiers generes
+__pycache__/
+*.pyc
+build/
+dist/
+release/
+*.spec
+
+# Donnees locales du lanceur et du mod : jamais dans le depot
+*.log
+sims4mp_backups/
+sims4mp_settings.json
+sims4mp_launcher_config.json
+*.part
+*.save
