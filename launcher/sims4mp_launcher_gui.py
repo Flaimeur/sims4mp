@@ -409,7 +409,8 @@ def game_is_running():
 
 def game_is_running_mac(run=subprocess.run):
     """pgrep sur l'executable de The Sims 4.app (code 0 : trouve, 1 : aucun)."""
-    proc = run(['pgrep', '-f', '{}/Contents/MacOS/'.format(MAC_GAME_APP)], capture_output=True)
+    # Motif fixe (regex de pgrep) : The Sims 4.app, The Sims™ 4.app, Les Sims 4.app...
+    proc = run(['pgrep', '-f', 'Sims[^/]*4\\.app/Contents/MacOS/'], capture_output=True)
     if proc.returncode not in (0, 1):
         raise LauncherError('pgrep a echoue (code {}), impossible de verifier '
                             'si le jeu tourne.'.format(proc.returncode))
@@ -654,10 +655,44 @@ def detect_game(reg=read_registry_value):
     return GameInstall(None, None)
 
 
+def _plain_name(name):
+    """Nom sans ™ / ® ni espace insecable, en minuscules : « The Sims™ 4 » -> « the sims 4 »."""
+    return re.sub(r'\s+', ' ', re.sub('[™®]', '', name)).strip().lower()
+
+
+def is_sims4_app(name):
+    """The Sims 4.app, The Sims™ 4.app, Les Sims 4.app... (pas Sims 4 Studio.app)."""
+    return re.fullmatch(r'((the|les) )?sims ?4\.app', _plain_name(name)) is not None
+
+
+def is_game_process(name):
+    return _plain_name(name) in {_plain_name(GAME_PROCESS), 'the sims 4', 'les sims 4'}
+
+
+def _find_sims4_app(folder):
+    """The Sims 4.app dans ce dossier, ou dans un de ses sous-dossiers (ex. « EA Games »)."""
+    try:
+        entries = sorted(Path(folder).iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        if is_sims4_app(entry.name) and entry.is_dir():
+            return entry
+    for entry in entries:
+        if entry.suffix.lower() != '.app' and entry.is_dir() and not entry.is_symlink():
+            try:
+                for sub in sorted(entry.iterdir()):
+                    if is_sims4_app(sub.name) and sub.is_dir():
+                        return sub
+            except OSError:
+                continue
+    return None
+
+
 def detect_game_mac(home=None, applications=Path('/Applications')):
     """Cherche The Sims 4.app : bibliotheques Steam d'abord (~/Library/Application
     Support/Steam et libraryfolders.vdf), puis /Applications et ~/Applications
-    (app EA). Ne lance rien."""
+    (app EA, nom avec ou sans ™, ou dans un sous-dossier). Ne lance rien."""
     home = Path(home or Path.home())
     root = home / 'Library' / 'Application Support' / 'Steam'
     libraries = []
@@ -676,8 +711,8 @@ def detect_game_mac(home=None, applications=Path('/Applications')):
                 if app.is_dir():
                     return GameInstall('steam', app)
     for folder in (applications, home / 'Applications'):
-        app = folder / MAC_GAME_APP
-        if app.is_dir():
+        app = _find_sims4_app(folder)
+        if app is not None:
             return GameInstall('ea', app)
     return GameInstall(None, None)
 
@@ -851,7 +886,7 @@ def run_diagnostic(documents, is_running=game_is_running, list_ips=local_ipv4_ad
                 lines.append('Port {} : libre (aucune application n\'ecoute)'.format(settings['port']))
             for pid in pids:
                 name = proc_name(pid)
-                if name.lower() == GAME_PROCESS.lower():
+                if is_game_process(name):
                     lines.append('Port {} : ecoute par Les Sims 4 (mp.host actif)'.format(settings['port']))
                 else:
                     warn('port {} deja utilise par {} (PID {})'.format(settings['port'], name, pid))
@@ -929,11 +964,25 @@ class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+MAC_SYSTEM_CA = Path('/etc/ssl/cert.pem')
+
+
+def tls_context(mac=None, system_ca=MAC_SYSTEM_CA):
+    """Contexte TLS verifie (certificat et nom d'hote). Le Python de python.org
+    sur Mac n'a aucun certificat racine tant qu'« Install Certificates » n'a
+    pas ete lance : on prend alors ceux de macOS (/etc/ssl/cert.pem)."""
+    context = ssl.create_default_context()
+    if (IS_MAC if mac is None else mac) and context.cert_store_stats()['x509_ca'] == 0 \
+            and Path(system_ca).is_file():
+        context.load_verify_locations(cafile=str(system_ca))
+    return context
+
+
 def make_https_opener():
     # Pas de HTTPHandler, FileHandler ni FTPHandler : seul https:// est ouvrable.
     opener = urllib.request.OpenerDirector()
     for handler in (urllib.request.UnknownHandler(),      # http://, file:// -> URLError
-                    urllib.request.HTTPSHandler(context=ssl.create_default_context()),
+                    urllib.request.HTTPSHandler(context=tls_context()),
                     HTTPSOnlyRedirectHandler(),
                     urllib.request.HTTPDefaultErrorHandler(),
                     urllib.request.HTTPErrorProcessor()):

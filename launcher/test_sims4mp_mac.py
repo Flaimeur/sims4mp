@@ -114,7 +114,31 @@ class MacCommandsTest(unittest.TestCase):
         self.assertFalse(gui.game_is_running_mac(run=fake(1)))
         with self.assertRaisesRegex(gui.LauncherError, 'pgrep a echoue'):
             gui.game_is_running_mac(run=fake(3))
-        self.assertEqual(calls[0], ['pgrep', '-f', 'The Sims 4.app/Contents/MacOS/'])
+        self.assertEqual(calls[0], ['pgrep', '-f', 'Sims[^/]*4\\.app/Contents/MacOS/'])
+
+    def test_game_process_names(self):
+        for name in ('The Sims 4', 'The Sims™ 4', 'Les Sims\xa04'):
+            self.assertTrue(gui.is_game_process(name), name)
+        for name in ('Python', 'Sims 4 Studio', 'EA app'):
+            self.assertFalse(gui.is_game_process(name), name)
+
+    def test_tls_falls_back_to_macos_certificates(self):
+        tmp = Path(tempfile.mkdtemp(prefix='sims4mp_mac_tls_'))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        bundle = tmp / 'cert.pem'
+        bundle.write_text('')
+        empty = mock.Mock()
+        empty.cert_store_stats.return_value = {'x509_ca': 0}
+        with mock.patch.object(gui.ssl, 'create_default_context', return_value=empty):
+            self.assertIs(gui.tls_context(mac=True, system_ca=bundle), empty)
+            empty.load_verify_locations.assert_called_once_with(cafile=str(bundle))
+            empty.reset_mock()
+            gui.tls_context(mac=False, system_ca=bundle)                  # Windows : rien a ajouter
+            gui.tls_context(mac=True, system_ca=tmp / 'absent.pem')
+            empty.load_verify_locations.assert_not_called()
+        real = gui.tls_context(mac=False)
+        self.assertEqual(real.verify_mode, gui.ssl.CERT_REQUIRED)
+        self.assertTrue(real.check_hostname)
 
     def test_listening_pids(self):
         seen = []
@@ -196,6 +220,23 @@ class MacDetectTest(unittest.TestCase):
         app = self.home / 'Applications' / gui.MAC_GAME_APP
         app.mkdir(parents=True)
         self.assertEqual(self.detect(), gui.GameInstall('ea', app))
+
+    def test_ea_app_name_variants(self):
+        for name in ('The Sims™ 4.app', 'Les Sims 4.app', 'The Sims\xa04.app'):
+            app = self.applications / name
+            app.mkdir()
+            self.assertEqual(self.detect(), gui.GameInstall('ea', app), name)
+            app.rmdir()
+
+    def test_ea_app_in_subfolder(self):
+        app = self.applications / 'EA Games' / 'The Sims™ 4.app'
+        app.mkdir(parents=True)
+        self.assertEqual(self.detect(), gui.GameInstall('ea', app))
+
+    def test_other_sims_apps_ignored(self):
+        for name in ('Sims 4 Studio.app', 'The Sims 3.app', 'EA app.app'):
+            (self.applications / name).mkdir()
+        self.assertEqual(self.detect(), gui.GameInstall(None, None))
 
     def test_hostile_installdir_ignored(self):
         (self.steam / 'steamapps').mkdir(parents=True)

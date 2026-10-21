@@ -127,7 +127,9 @@ il n'y a pas d'exe : on le lance avec Python.
    directement `python3 launcher/sims4mp_launcher_gui.py`.
 
 Le jeu est détecté dans la bibliothèque Steam (`~/Library/Application Support/Steam`) puis dans
-`/Applications/The Sims 4.app` (app EA). Les dossiers sont ceux du jeu sur Mac :
+`/Applications` ou `~/Applications` (app EA : `The Sims 4.app`, `The Sims™ 4.app`, aussi dans un
+sous-dossier). Le téléchargement du mod utilise les certificats de macOS si Python n'a pas les
+siens (sinon : lancez une fois « Install Certificates.command » du dossier Python 3 dans Applications). Les dossiers sont ceux du jeu sur Mac :
 `~/Documents/Electronic Arts/Les Sims 4/Mods` et `saves`. Le journal, `sims4mp_backups/` et
 les options sont écrits dans le dossier `launcher` à côté du script.
 
