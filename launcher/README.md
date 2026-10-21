@@ -112,8 +112,32 @@ l'état du pare-feu, et :
 Page **Mod** → **Restaurer l'ancien mod** : choisissez une sauvegarde (date, version),
 confirmez. Le jeu doit être fermé. Le mod en place est lui-même sauvegardé avant d'être remplacé.
 
+## 9. Sur Mac
+
+Le mod est le même fichier sur Mac et sur PC. Le lanceur fonctionne aussi sur macOS, mais
+il n'y a pas d'exe : on le lance avec Python.
+
+1. Installez **Python 3** depuis python.org (rubrique macOS). Le `python3` fourni par Apple
+   a une bibliothèque de fenêtres (Tk) trop ancienne.
+2. Téléchargez le dépôt (bouton **Code → Download ZIP** sur GitHub) et décompressez-le,
+   par exemple dans `Documents/Sims4MP`.
+3. Double-cliquez sur `launcher/Sims4MP_Mac.command`. La première fois, macOS peut refuser
+   (« développeur non identifié ») : clic droit → **Ouvrir** → **Ouvrir**. Si le fichier ne
+   s'ouvre pas, dans Terminal : `chmod +x launcher/Sims4MP_Mac.command`, ou lancez
+   directement `python3 launcher/sims4mp_launcher_gui.py`.
+
+Le jeu est détecté dans la bibliothèque Steam (`~/Library/Application Support/Steam`) puis dans
+`/Applications/The Sims 4.app` (app EA). Les dossiers sont ceux du jeu sur Mac :
+`~/Documents/Electronic Arts/Les Sims 4/Mods` et `saves`. Le journal, `sims4mp_backups/` et
+les options sont écrits dans le dossier `launcher` à côté du script.
+
+Pare-feu : si le pare-feu de macOS est activé, il demande d'autoriser **Python** (pour la room)
+et **The Sims 4** (pour `mp.host`) à recevoir des connexions : cliquez sur **Autoriser**.
+Le diagnostic affiche « Pare-feu, macOS : activé / désactivé ». En jeu, la console s'ouvre
+avec Cmd + Maj + C.
+
 ## Fichiers créés par le lanceur
 
-À côté de l'exe : `launcher.log`, `sims4mp_backups\`, `sims4mp_launcher_config.json` (dépôt GitHub).
+À côté de l'exe (ou du script) : `launcher.log`, `sims4mp_backups\`, `sims4mp_launcher_config.json` (dépôt GitHub).
 Dans `Documents\Electronic Arts\` : `sims4mp_settings.json` (rôle, IP, port).
 Le lanceur ne lit ni ne modifie vos sauvegardes de partie.

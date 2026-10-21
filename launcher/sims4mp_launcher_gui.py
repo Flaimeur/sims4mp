@@ -2,6 +2,7 @@
 #
 # Python 3.12, bibliotheque standard uniquement.
 # Build :  py -3.12 -m PyInstaller --onefile --noconsole --noconfirm --name Sims4MP_Launcher_GUI launcher/sims4mp_launcher_gui.py
+# Mac :    python3 launcher/sims4mp_launcher_gui.py  (ou double-clic sur launcher/Sims4MP_Mac.command)
 #
 # Choix Heberger / Rejoindre, reglage sims4mp_settings.json, installation du
 # mod local et mise a jour du mod depuis une Release GitHub (manifeste JSON).
@@ -63,8 +64,16 @@ CONFIG_NAME = 'sims4mp_launcher_config.json'
 CONFIG_KEYS = {'depot', 'tag'}
 MANIFEST_NAME = 'sims4mp_manifest.json'
 
+IS_WINDOWS = sys.platform == 'win32'
+IS_MAC = sys.platform == 'darwin'
+# Sans effet hors Windows (pas de console a cacher).
+NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+
 MOD_FILE = 'sims4mp_hello.ts4script'
-GAME_PROCESS = 'TS4_x64.exe'
+WINDOWS_GAME_PROCESS = 'TS4_x64.exe'
+MAC_GAME_PROCESS = 'The Sims 4'                   # executable dans The Sims 4.app/Contents/MacOS
+MAC_GAME_APP = 'The Sims 4.app'
+GAME_PROCESS = MAC_GAME_PROCESS if IS_MAC else WINDOWS_GAME_PROCESS
 STEAM_GAME_URL = 'steam://rungameid/1222670'     # Les Sims 4 sur Steam
 BACKUP_DIR_NAME = 'sims4mp_backups'
 LOG_NAME = 'launcher.log'
@@ -87,9 +96,19 @@ class LauncherError(Exception):
 
 # --- Journal -----------------------------------------------------------------
 
+def mac_data_dir(home=None):
+    """Dossier des donnees du lanceur compile sur Mac : l'interieur d'une .app
+    peut etre en lecture seule (et y ecrire casserait sa signature)."""
+    folder = Path(home or Path.home()) / 'Library' / 'Application Support' / 'Sims4MP'
+    folder.mkdir(parents=True, exist_ok=True)
+    return folder
+
+
 def base_dir():
-    # Dossier du .exe une fois compile, sinon dossier du script.
+    # Dossier du .exe une fois compile (Application Support sur Mac), sinon dossier du script.
     if getattr(sys, 'frozen', False):
+        if IS_MAC:
+            return mac_data_dir()
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
 
@@ -309,6 +328,9 @@ def local_ipv4_addresses():
 # --- Installation du mod (reprise de sims4mp_launcher.py) -------------------
 
 def documents_dir():
+    if not IS_WINDOWS:
+        # Les Sims 4 sur Mac : ~/Documents/Electronic Arts/Les Sims 4.
+        return Path.home() / 'Documents'
     # SHGetKnownFolderPath gere les Documents deplaces (OneDrive, autre disque...).
     class GUID(ctypes.Structure):
         _fields_ = [('Data1', ctypes.c_uint32), ('Data2', ctypes.c_uint16),
@@ -377,12 +399,36 @@ def find_mods_dir(documents):
 def game_is_running():
     proc = subprocess.run(
         ['tasklist', '/FI', 'IMAGENAME eq {}'.format(GAME_PROCESS), '/NH', '/FO', 'CSV'],
-        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        capture_output=True, creationflags=NO_WINDOW)
     if proc.returncode != 0:
         raise LauncherError('tasklist a echoue (code {}), impossible de verifier '
                             'si le jeu tourne.'.format(proc.returncode))
     output = proc.stdout.decode('oem', errors='replace').lower()
     return '"{}"'.format(GAME_PROCESS.lower()) in output
+
+
+def game_is_running_mac(run=subprocess.run):
+    """pgrep sur l'executable de The Sims 4.app (code 0 : trouve, 1 : aucun)."""
+    proc = run(['pgrep', '-f', '{}/Contents/MacOS/'.format(MAC_GAME_APP)], capture_output=True)
+    if proc.returncode not in (0, 1):
+        raise LauncherError('pgrep a echoue (code {}), impossible de verifier '
+                            'si le jeu tourne.'.format(proc.returncode))
+    return proc.returncode == 0
+
+
+if IS_MAC:
+    game_is_running = game_is_running_mac
+
+
+def open_path(target):
+    """Ouvre un fichier, un dossier, une app ou une URL steam:// avec le
+    programme du systeme. Arguments en liste, jamais de shell."""
+    if IS_WINDOWS:
+        os.startfile(str(target))
+    elif IS_MAC:
+        subprocess.Popen(['open', str(target)])
+    else:
+        subprocess.Popen(['xdg-open', str(target)])
 
 
 def sha256_of(path):
@@ -461,12 +507,12 @@ def run_install(source, documents, backup_dir, is_running=game_is_running):
     return lines
 
 
-def launch_game(is_running=game_is_running, start=os.startfile, target=STEAM_GAME_URL):
-    """Lance Les Sims 4 (Steam par defaut, ou le .exe detecte pour l'app EA),
-    sans attendre le jeu. Refuse s'il tourne deja."""
+def launch_game(is_running=game_is_running, start=None, target=STEAM_GAME_URL):
+    """Lance Les Sims 4 (Steam par defaut, ou le .exe / la .app detectee pour
+    l'app EA), sans attendre le jeu. Refuse s'il tourne deja."""
     if is_running():
         raise LauncherError('Les Sims 4 est deja lance ({} en cours d\'execution).'.format(GAME_PROCESS))
-    start(target)
+    (start or open_path)(target)
     if target == STEAM_GAME_URL:
         return ['Lancement des Sims 4 via Steam ({}).'.format(STEAM_GAME_URL),
                 'Si rien ne s\'ouvre, verifiez que Steam est installe et connecte.']
@@ -608,6 +654,38 @@ def detect_game(reg=read_registry_value):
     return GameInstall(None, None)
 
 
+def detect_game_mac(home=None, applications=Path('/Applications')):
+    """Cherche The Sims 4.app : bibliotheques Steam d'abord (~/Library/Application
+    Support/Steam et libraryfolders.vdf), puis /Applications et ~/Applications
+    (app EA). Ne lance rien."""
+    home = Path(home or Path.home())
+    root = home / 'Library' / 'Application Support' / 'Steam'
+    libraries = []
+    vdf = root / 'steamapps' / 'libraryfolders.vdf'
+    for folder in [root] + [Path(p) for p in _vdf_values(_read_text(vdf), 'path')]:
+        if folder.is_dir() and folder not in libraries:
+            libraries.append(folder)
+    for library in libraries:
+        acf = library / 'steamapps' / 'appmanifest_{}.acf'.format(STEAM_APP_ID)
+        for installdir in _vdf_values(_read_text(acf), 'installdir'):
+            if not re.fullmatch(r'[^/:]+', installdir) or installdir.strip('. ') == '':
+                continue
+            folder = library / 'steamapps' / 'common' / installdir
+            apps = [folder / MAC_GAME_APP] + sorted(folder.glob('*.app')) if folder.is_dir() else []
+            for app in apps:
+                if app.is_dir():
+                    return GameInstall('steam', app)
+    for folder in (applications, home / 'Applications'):
+        app = folder / MAC_GAME_APP
+        if app.is_dir():
+            return GameInstall('ea', app)
+    return GameInstall(None, None)
+
+
+if IS_MAC:
+    detect_game = detect_game_mac
+
+
 def game_target(game):
     """Ce que launch_game ouvre pour l'installation detectee."""
     return str(game.exe) if game.kind == 'ea' else STEAM_GAME_URL
@@ -620,17 +698,18 @@ JOIN_HELP = ('le port ne répond pas : vérifiez que le host a lancé mp.host '
 
 
 def decode_console(data):
-    """Sortie d'une commande Windows : UTF-8 (netsh recent) sinon page de code OEM."""
+    """Sortie d'une commande : UTF-8 (netsh recent, macOS) sinon page de code OEM
+    (latin-1 hors Windows, ou le codec 'oem' n'existe pas)."""
     try:
         return data.decode('utf-8')
     except UnicodeDecodeError:
-        return data.decode('oem', errors='replace')
+        return data.decode('oem' if IS_WINDOWS else 'latin-1', errors='replace')
 
 
-def _run_quiet(args):
-    """Commande Windows a arguments fixes (jamais construits depuis le reseau)."""
-    proc = subprocess.run(args, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
-    if proc.returncode != 0:
+def _run_quiet(args, ok_codes=(0,)):
+    """Commande systeme a arguments fixes (jamais construits depuis le reseau)."""
+    proc = subprocess.run(args, capture_output=True, creationflags=NO_WINDOW, timeout=15)
+    if proc.returncode not in ok_codes:
         raise LauncherError('{} a echoue (code {}).'.format(args[0], proc.returncode))
     return decode_console(proc.stdout)
 
@@ -669,6 +748,45 @@ def firewall_profiles(run=_run_quiet):
                 profiles.append((current, pieces[-1]))
                 current = None
     return profiles
+
+
+MAC_FIREWALL = '/usr/libexec/ApplicationFirewall/socketfilterfw'
+
+
+def listening_pids_mac(port, run=_run_quiet):
+    """PID des programmes qui ecoutent en TCP sur ce port (lsof ; code 1 : aucun)."""
+    port = validate_port(port)
+    output = run(['lsof', '-nP', '-iTCP:{}'.format(port), '-sTCP:LISTEN', '-Fp'], ok_codes=(0, 1))
+    pids = []
+    for line in output.splitlines():
+        # -Fp : une ligne « p<pid> » par programme.
+        if line.startswith('p') and line[1:].isdigit() and int(line[1:]) not in pids:
+            pids.append(int(line[1:]))
+    return pids
+
+
+def process_name_mac(pid, run=_run_quiet):
+    # ps donne le chemin complet de l'executable : on garde le dernier element.
+    output = run(['ps', '-p', str(int(pid)), '-o', 'comm='], ok_codes=(0, 1)).strip()
+    return output.rsplit('/', 1)[-1] if output else 'PID {}'.format(int(pid))
+
+
+def firewall_profiles_mac(run=_run_quiet):
+    """[('macOS', etat)] d'apres le pare-feu applicatif (socketfilterfw)."""
+    output = run([MAC_FIREWALL, '--getglobalstate'])
+    match = re.search(r'State\s*=\s*(\d)', output)
+    if match:
+        return [('macOS', 'désactivé' if match.group(1) == '0' else 'activé')]
+    lowered = output.lower()
+    if 'disabled' in lowered:
+        return [('macOS', 'désactivé')]
+    if 'enabled' in lowered:
+        return [('macOS', 'activé')]
+    return []
+
+
+if IS_MAC:
+    listening_pids, process_name, firewall_profiles = listening_pids_mac, process_name_mac, firewall_profiles_mac
 
 
 def tcp_probe(ip, port, timeout=3, connect=socket.create_connection):
@@ -987,9 +1105,11 @@ def run_update(manifest_url, documents, backup_dir, temp_dir, allow_test=False,
 
 # --- Fenetre -----------------------------------------------------------------
 
-FONT_FAMILY = 'Segoe UI'
+FONT_FAMILY = 'Helvetica Neue' if IS_MAC else 'Segoe UI'
 FONT_SIZE = 10
-MONO_FAMILY = 'Consolas'
+MONO_FAMILY = 'Menlo' if IS_MAC else 'Consolas'
+# Tk sur Mac compte 72 points par pouce (96 sous Windows) : sans cela, tout le texte y est plus petit.
+MAC_TK_SCALING = 96 / 72
 PAD = 12                      # marge exterieure et entre les cadres
 GAP = 6                       # espacement entre les lignes d'un cadre
 SIDEBAR_WIDTH = 200
@@ -1059,6 +1179,8 @@ def apply_style(root):
     from tkinter import ttk
     style = ttk.Style(root)
     style.theme_use('clam')
+    if IS_MAC:
+        root.tk.call('tk', 'scaling', MAC_TK_SCALING)
     for name in ('TkDefaultFont', 'TkTextFont', 'TkMenuFont', 'TkHeadingFont',
                  'TkCaptionFont', 'TkSmallCaptionFont', 'TkIconFont', 'TkTooltipFont'):
         try:
@@ -1797,17 +1919,17 @@ class LauncherApp:
         if not path.exists():
             log('Journal cree.')
         try:
-            os.startfile(str(path))
+            open_path(path)
         except OSError as exc:
             self.show('Impossible d\'ouvrir le journal : {}'.format(exc), 'error')
             self.set_status('Impossible d\'ouvrir le journal', 'error')
 
     def _open_launcher_dir(self):
-        os.startfile(str(base_dir()))
+        open_path(base_dir())
 
     def _open_mods_dir(self):
         try:
-            os.startfile(str(find_mods_dir(self._documents())))
+            open_path(find_mods_dir(self._documents()))
         except LauncherError as exc:
             self.show(str(exc), 'error')
             self.set_status(str(exc), 'error')
@@ -2345,6 +2467,10 @@ def main():
         root.mainloop()
     except Exception:
         log('ERREUR au demarrage :\n' + traceback.format_exc())
+        if not IS_WINDOWS:
+            # Sur Mac le lanceur est ouvert depuis Terminal (ou le .command) : le message s'y affiche.
+            sys.stderr.write('Le lanceur n\'a pas pu demarrer.\nDetail dans {}\n'.format(base_dir() / LOG_NAME))
+            return 1
         try:
             ctypes.windll.user32.MessageBoxW(
                 None, 'Le lanceur n\'a pas pu demarrer.\nDetail dans {}'.format(base_dir() / LOG_NAME),

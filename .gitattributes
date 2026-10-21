@@ -1,0 +1,2 @@
+# Script du lanceur Mac : fins de ligne Unix, sinon bash refuse « #!/bin/bash\r ».
+*.command text eol=lf
