@@ -161,5 +161,32 @@ class OptionsWindowTest(TempDirTest):
         self.assertEqual(run.call_args.args[0], gui.manifest_url_for('a/b', 'v1'))
 
 
+class GithubOnlyInstallTest(OptionsWindowTest):
+    def test_no_local_install_button(self):
+        app = self.make_app()
+        self.assertFalse(hasattr(app, 'install_button'))
+        self.assertEqual(app.update_button.cget('text'), 'Installer / mettre à jour depuis GitHub')
+
+    def test_source_label(self):
+        app = self.make_app()
+        self.assertIn('Source non configurée', app.source_label.cget('text'))
+        app.repo.set('Flaimeur/sims4mp')
+        app.tag_mode.set('tag')
+        app.tag.set('v0.4.0')
+        app._save_config()
+        self.assertEqual(app.source_label.cget('text'), 'Source : Flaimeur/sims4mp (tag v0.4.0)')
+
+    def test_latest_404_explains_tag(self):
+        import urllib.error
+        url = gui.manifest_url_for('Flaimeur/sims4mp')
+        opener = FakeOpener({url: urllib.error.HTTPError(url, 404, 'Not Found', {}, None)})
+        with self.assertRaisesRegex(gui.LauncherError, 'Aucune version stable publiée.*Tag précis'):
+            gui.fetch_manifest(url, opener)
+        tag_url = gui.manifest_url_for('Flaimeur/sims4mp', 'v9.9.9')
+        opener = FakeOpener({tag_url: urllib.error.HTTPError(tag_url, 404, 'Not Found', {}, None)})
+        with self.assertRaisesRegex(gui.LauncherError, r'refuse par le serveur \(HTTP 404\)'):
+            gui.fetch_manifest(tag_url, opener)                 # tag precis : message d'origine
+
+
 if __name__ == '__main__':
     unittest.main()

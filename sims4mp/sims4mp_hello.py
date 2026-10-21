@@ -1,9 +1,18 @@
-# Sims 4 Multiplayer - etape 4 : synchronisation en lecture seule (mp.state).
+# Sims 4 Multiplayer - etape M1 : role lu depuis le lanceur, connexion
+# automatique, notifications ; etat en lecture seule (mp.state).
 # Compatible Python 3.7 (version embarquee par Les Sims 4) : pas de walrus,
 # pas de match, pas d'annotations avancees.
 #
 # Commandes : mp.hello, mp.host [port], mp.join <ip> [port], mp.status,
 #             mp.ping, mp.state, mp.disconnect
+#
+# Connexion automatique (M1) : a la fin de chaque chargement de partie
+# (zone.Zone.on_loading_screen_animation_finished, verifie dans simulation.zip),
+# le mod lit sims4mp_settings.json ecrit par le lanceur (Documents\Electronic
+# Arts\, retrouve a partir du dossier Mods, lecture seule, validation stricte) :
+# role host -> ecoute ; role join -> connexion non bloquante a l'hote. Un echec
+# est retente au plus toutes les AUTO_RETRY_INTERVAL secondes. mp.disconnect
+# arrete la connexion automatique jusqu'au prochain chargement.
 #
 # Etat envoye par le host (EVENT kind "state"), API verifiees dans simulation.zip :
 #   heure     services.time_service().sim_now (.hour/.minute/.day/.week)
@@ -23,6 +32,7 @@
 # la pompe tourne dans Zone.update, donc sur le thread principal.
 
 import functools
+import json
 import os
 import time
 import traceback
@@ -30,7 +40,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.4.0'
+MOD_VERSION = '0.5.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -40,6 +50,11 @@ STATE_MAX_SIMS = 16      # limite du nombre de Sims acceptes dans un etat
 STATE_MAX_TEXT = 64      # longueur maximale d'un texte recu
 STATE_MAX_FUNDS = 10 ** 12
 LOT_VALUES = ('lot actif', 'hors lot', 'absent')
+SETTINGS_NAME = 'sims4mp_settings.json'   # ecrit par le lanceur, lu ici seulement
+SETTINGS_KEYS = frozenset(['role', 'ip', 'port'])
+SETTINGS_MAX_SIZE = 4096
+AUTO_PORT_MIN = 1024                      # memes bornes que le lanceur
+AUTO_RETRY_INTERVAL = 30.0                # secondes reelles entre deux tentatives
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +80,7 @@ def _find_log_dir():
 
 
 LOG_PATH = os.path.join(_find_log_dir(), LOG_FILE_NAME)
+_mods_dir = _find_log_dir()      # dossier qui contient l'archive (Mods ou un sous-dossier)
 
 
 def log(message):
@@ -437,6 +453,8 @@ def _handle_host_event(session, kind, value):
         session.state_sent_to_peer = None
         session.state_checked_at = 0.0
     elif kind == 'disconnected':
+        if session.handshake_done:
+            bridge_notify('L\'autre joueur a quitté la partie. En attente d\'une nouvelle connexion…')
         session.peer = None
         session.handshake_done = False
         session.close_after_flush = False
@@ -447,6 +465,8 @@ def _handle_host_event(session, kind, value):
             if data.get('protocol') == protocol.PROTOCOL_VERSION:
                 _send(session, protocol.welcome('Sims4MP host ' + MOD_VERSION))
                 session.handshake_done = True
+                peer = session.peer[0] if isinstance(session.peer, tuple) and session.peer else '?'
+                bridge_notify('Un joueur a rejoint la partie ({}).'.format(peer))
             else:
                 _send(session, protocol.reject('protocole {} attendu, recu {}'.format(
                     protocol.PROTOCOL_VERSION, data.get('protocol'))))
@@ -476,10 +496,20 @@ def _handle_client_event(session, kind, value):
     elif kind == 'disconnected':
         log('[client] session terminee')
         _session = None
+        if _auto['target'] is not None:
+            # Pas de nouvelle tentative en boucle : la prochaine dans 30 s au plus tot.
+            _auto['next_try'] = time.monotonic() + AUTO_RETRY_INTERVAL
+            if session.handshake_done:
+                bridge_notify('Connexion à l\'hôte perdue. Nouvelle tentative dans {:.0f} s.'.format(
+                    AUTO_RETRY_INTERVAL))
+            elif _auto['attempts'] == 1:
+                bridge_notify('Hôte injoignable pour l\'instant. Nouvelle tentative toutes les {:.0f} s.'.format(
+                    AUTO_RETRY_INTERVAL))
     elif kind == 'message':
         msg_type = value['type']
         if msg_type == protocol.WELCOME:
             session.handshake_done = True
+            bridge_notify('Connecté à l\'hôte : la partie à deux est prête.')
         elif msg_type == protocol.REJECT:
             log('[client] refuse par le host : {}'.format(value['data'].get('reason')))
             client.close()
@@ -565,10 +595,11 @@ def pump_tick():
     if _pump['calls'] == 1:
         log('pompe : premier appel de Zone.update recu')
 
+    now = time.monotonic()
+    _auto_tick(now)                       # connexion automatique, au plus toutes les 30 s
     session = _session
     if session is None:
         return
-    now = time.monotonic()
     if now - _pump['last_poll'] < PUMP_INTERVAL:
         return
     _pump['last_poll'] = now
@@ -685,6 +716,206 @@ def _network_ready(output):
 
 
 # ---------------------------------------------------------------------------
+# Demarrage host / client (commun aux commandes et a la connexion automatique)
+# ---------------------------------------------------------------------------
+
+def _start_host(port):
+    """Ouvre l'ecoute. Renvoie (True, None) ou (False, raison)."""
+    global _session
+    server = transport.Server('0.0.0.0', port)
+    try:
+        server.start()
+    except OSError as e:
+        log('host : echec ecoute port {} : {!r}'.format(port, e))
+        return False, 'impossible d\'écouter sur le port {} ({})'.format(port, e)
+    _session = NetSession('host', server)
+    log('[host] ecoute sur 0.0.0.0:{} (IP locales : {})'.format(server.port, _local_ips()))
+    return True, None
+
+
+def _start_client(ip, port):
+    """Connexion non bloquante a l'hote (terminee par la pompe). (True, None) ou (False, raison)."""
+    global _session
+    client = transport.Client(ip, port)
+    try:
+        client.connect()
+    except OSError as e:
+        log('client : echec connexion {}:{} : {!r}'.format(ip, port, e))
+        return False, 'connexion impossible à {}:{} ({})'.format(ip, port, e)
+    _session = NetSession('client', client)
+    # Mis en file : envoye des que la connexion est etablie.
+    _send(_session, protocol.hello(MOD_VERSION))
+    log('[client] connexion en cours vers {}:{}'.format(ip, port))
+    return True, None
+
+
+# ---------------------------------------------------------------------------
+# Reglage du lanceur et connexion automatique (M1)
+# ---------------------------------------------------------------------------
+# Le reglage est ecrit par le lanceur dans Documents\Electronic Arts\. On le
+# retrouve depuis le dossier Mods (Documents\Electronic Arts\<jeu>\Mods), sans
+# chemin ecrit en dur. Lecture seule : le mod n'ecrit jamais ce fichier.
+
+_auto = {
+    'target': None,          # ('host', port) ou ('join', ip, port) ; None : rien d'automatique
+    'next_try': 0.0,         # time.monotonic() avant lequel on ne retente pas
+    'attempts': 0,
+    'last_error': None,
+    'loads': 0,              # nombre de fins de chargement vues
+}
+
+
+def settings_path(mods_dir=None):
+    """Chemin du reglage, ou None si le dossier Mods n'est pas retrouve."""
+    path = os.path.abspath(mods_dir or _mods_dir)
+    while True:
+        if os.path.basename(path).lower() == 'mods':
+            game_dir = os.path.dirname(path)          # ...\Les Sims 4
+            return os.path.join(os.path.dirname(game_dir), SETTINGS_NAME)
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def _valid_ipv4(text):
+    """Adresse IPv4 utilisable pour se connecter (pas de module ipaddress requis)."""
+    if not isinstance(text, str):
+        return False
+    parts = text.split('.')
+    if len(parts) != 4:
+        return False
+    numbers = []
+    for part in parts:
+        if not part.isdigit() or not part.isascii() or (len(part) > 1 and part[0] == '0'):
+            return False
+        numbers.append(int(part))
+    if any(n > 255 for n in numbers):
+        return False
+    if numbers == [0, 0, 0, 0] or numbers == [255, 255, 255, 255] or 224 <= numbers[0] <= 239:
+        return False
+    return True
+
+
+def validate_settings(data):
+    """(reglage, None) si valide, sinon (None, raison). Memes regles que le lanceur."""
+    if not isinstance(data, dict):
+        return None, 'objet JSON attendu'
+    if set(data) != SETTINGS_KEYS:
+        return None, 'cles attendues : role, ip, port'
+    role, ip, port = data['role'], data['ip'], data['port']
+    if role not in ('host', 'join'):
+        return None, 'role inconnu'
+    if isinstance(port, bool) or not isinstance(port, int) or not AUTO_PORT_MIN <= port <= 65535:
+        return None, 'port invalide (1024 a 65535)'
+    if not isinstance(ip, str):
+        return None, 'ip invalide'
+    ip = ip.strip()
+    if role == 'join' and not _valid_ipv4(ip):
+        return None, 'ip de l\'hote invalide'
+    return {'role': role, 'ip': ip, 'port': port}, None
+
+
+def read_settings(path):
+    """(reglage, None), (None, None) si absent, ou (None, raison) si invalide."""
+    if path is None or not os.path.isfile(path):
+        return None, None
+    try:
+        if os.path.getsize(path) > SETTINGS_MAX_SIZE:
+            return None, 'fichier trop grand'
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, 'illisible ({})'.format(e.__class__.__name__)
+    return validate_settings(data)
+
+
+def _auto_start(now):
+    """Tente le demarrage prevu par le reglage. Ne bloque jamais."""
+    target = _auto['target']
+    if target is None or _session is not None:
+        return
+    _auto['attempts'] += 1
+    _auto['next_try'] = now + AUTO_RETRY_INTERVAL
+    if target[0] == 'host':
+        ok, reason = _start_host(target[1])
+        if ok:
+            _auto['last_error'] = None
+            bridge_notify('Vous hébergez la partie (port {}). En attente de l\'autre joueur…'.format(target[1]))
+            return
+    else:
+        ok, reason = _start_client(target[1], target[2])
+        if ok:
+            _auto['last_error'] = None
+            log('auto : connexion lancee vers {}:{} (tentative {})'.format(target[1], target[2], _auto['attempts']))
+            return
+    _auto['last_error'] = reason
+    log('auto : echec ({}), nouvelle tentative dans {:.0f} s'.format(reason, AUTO_RETRY_INTERVAL))
+    if _auto['attempts'] == 1:
+        bridge_notify('Sims4MP : {}. Nouvelle tentative toutes les {:.0f} s.'.format(reason, AUTO_RETRY_INTERVAL))
+
+
+def _auto_tick(now):
+    """Appele par la pompe : relance la connexion automatique, au plus toutes les 30 s."""
+    if _auto['target'] is not None and _session is None and now >= _auto['next_try']:
+        _auto_start(now)
+
+
+def on_zone_loaded():
+    """Fin d'un chargement de partie : lit le reglage et demarre une seule fois."""
+    _auto['loads'] += 1
+    if NET_IMPORT_ERROR is not None or not _pump['installed']:
+        log('auto : couche reseau ou pompe indisponible, rien d\'automatique')
+        return
+    if _session is not None:
+        log('auto : session deja active ({}), rien a faire'.format(_session.role))
+        return
+    path = settings_path()
+    settings, reason = read_settings(path)
+    if settings is None:
+        _auto['target'] = None
+        if reason is None:
+            log('auto : aucun reglage du lanceur ({}), connexion manuelle (mp.host / mp.join)'.format(path))
+        else:
+            log('auto : reglage ignore ({}) : {}'.format(path, reason))
+            bridge_notify('Réglage Sims4MP ignoré ({}). Utilisez le lanceur, ou mp.host / mp.join.'.format(reason))
+        return
+    if settings['role'] == 'host':
+        _auto['target'] = ('host', settings['port'])
+    else:
+        _auto['target'] = ('join', settings['ip'], settings['port'])
+    _auto['attempts'] = 0
+    log('auto : reglage lu ({}) : {}'.format(path, _auto['target']))
+    _auto_start(time.monotonic())
+
+
+def _safe_on_zone_loaded():
+    # Aucune exception ne doit remonter dans le chargement du jeu.
+    try:
+        on_zone_loaded()
+    except Exception:
+        log('ERREUR connexion automatique :\n' + traceback.format_exc())
+
+
+def _install_zone_loaded_hook():
+    import zone
+    original = zone.Zone.on_loading_screen_animation_finished
+    if getattr(original, '_sims4mp_hook', False):
+        log('auto : hook de chargement deja installe')
+        return
+
+    @functools.wraps(original)
+    def on_loading_screen_animation_finished(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        _safe_on_zone_loaded()
+        return result
+
+    on_loading_screen_animation_finished._sims4mp_hook = True
+    zone.Zone.on_loading_screen_animation_finished = on_loading_screen_animation_finished
+    log('auto : zone.Zone.on_loading_screen_animation_finished enveloppe')
+
+
+# ---------------------------------------------------------------------------
 # Commandes de triche
 # ---------------------------------------------------------------------------
 
@@ -730,16 +961,12 @@ def mp_host(port=None, _connection=None):
         port = _parse_port(port, output)
         if port is None:
             return
-        server = transport.Server('0.0.0.0', port)
-        try:
-            server.start()
-        except OSError as e:
-            output('Impossible d\'ecouter sur le port {} : {}'.format(port, e))
-            log('mp.host : echec ecoute port {} : {!r}'.format(port, e))
+        ok, reason = _start_host(port)
+        if not ok:
+            output('Echec : ' + reason)
             return
-        _session = NetSession('host', server)
+        server = _session.endpoint
         ips = _local_ips()
-        log('[host] ecoute sur 0.0.0.0:{} (IP locales : {})'.format(server.port, ips))
         output('Host en ecoute sur le port {}.'.format(server.port))
         # Plusieurs IP possibles (cartes virtuelles, VPN...) : on les affiche toutes.
         output('Sur le client : mp.join <ip> {}'.format(server.port))
@@ -765,17 +992,10 @@ def mp_join(ip=None, port=None, _connection=None):
         port = _parse_port(port, output)
         if port is None:
             return
-        client = transport.Client(ip, port)
-        try:
-            client.connect()
-        except OSError as e:
-            output('Connexion impossible a {}:{} : {}'.format(ip, port, e))
-            log('mp.join : echec connexion {}:{} : {!r}'.format(ip, port, e))
+        ok, reason = _start_client(ip, port)
+        if not ok:
+            output('Echec : ' + reason)
             return
-        _session = NetSession('client', client)
-        # Mis en file : envoye des que la connexion est etablie.
-        _send(_session, protocol.hello(MOD_VERSION))
-        log('[client] connexion en cours vers {}:{}'.format(ip, port))
         output('Connexion en cours vers {}:{}... (mp.status)'.format(ip, port))
     except Exception:
         log('ERREUR mp.join :\n' + traceback.format_exc())
@@ -805,6 +1025,14 @@ def mp_status(_connection=None):
             output('Poll effectues : {} , erreurs : {}'.format(session.polls, session.errors))
             if session.last_ping:
                 output('Dernier ping : ' + session.last_ping)
+        target = _auto['target']
+        if target is None:
+            output('Connexion automatique : aucune (reglage absent, invalide ou mp.disconnect)')
+        else:
+            output('Connexion automatique : {} (tentatives {}){}'.format(
+                'host port {}'.format(target[1]) if target[0] == 'host' else 'join {}:{}'.format(target[1], target[2]),
+                _auto['attempts'], ' , derniere erreur : ' + _auto['last_error'] if _auto['last_error'] else ''))
+        output('Reglage du lanceur : {}'.format(settings_path()))
         output('Journal : ' + LOG_PATH)
     except Exception:
         log('ERREUR mp.status :\n' + traceback.format_exc())
@@ -879,11 +1107,14 @@ def mp_state(_connection=None):
 def mp_disconnect(_connection=None):
     output = sims4.commands.CheatOutput(_connection)
     try:
+        # La connexion automatique s'arrete aussi (jusqu'au prochain chargement de partie).
+        stopped_auto = _auto['target'] is not None
+        _auto['target'] = None
         if _session is None:
-            output('Aucune session active.')
+            output('Aucune session active.' + (' Connexion automatique arretee.' if stopped_auto else ''))
             return
         _close_session(send_bye=True)
-        output('Session fermee.')
+        output('Session fermee.' + (' Connexion automatique arretee.' if stopped_auto else ''))
     except Exception:
         log('ERREUR mp.disconnect :\n' + traceback.format_exc())
         output('Erreur dans mp.disconnect (voir le journal).')
@@ -905,3 +1136,9 @@ try:
 except Exception:
     _pump['error'] = traceback.format_exc().strip().splitlines()[-1]
     log('ERREUR installation pompe :\n' + traceback.format_exc())
+
+try:
+    _install_zone_loaded_hook()
+except Exception:
+    # Sans ce hook, mp.host / mp.join restent utilisables a la main.
+    log('ERREUR installation connexion automatique :\n' + traceback.format_exc())

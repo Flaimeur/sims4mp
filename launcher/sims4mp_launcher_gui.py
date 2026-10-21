@@ -37,6 +37,11 @@ import uuid
 import zipfile
 from pathlib import Path
 
+if __name__ == '__main__':
+    # sims4mp_room importe « sims4mp_launcher_gui » : meme module, pas une seconde copie
+    # (sinon ses erreurs ne seraient pas des LauncherError de cette copie-ci).
+    sys.modules.setdefault('sims4mp_launcher_gui', sys.modules[__name__])
+
 # --- Mise a jour depuis GitHub -----------------------------------------------
 # URL HTTPS du manifeste JSON publie avec la Release (a remplir). Exemple :
 #   https://github.com/<compte>/<depot>/releases/latest/download/sims4mp_manifest.json
@@ -858,7 +863,14 @@ def read_limited(url, out, max_size, timeout, opener):
 def fetch_manifest(url, opener, timeout=DOWNLOAD_TIMEOUT):
     url = require_https(url, 'URL du manifeste')
     buffer = _BytesSink()
-    read_limited(url, buffer, MAX_MANIFEST_SIZE, timeout, opener)
+    try:
+        read_limited(url, buffer, MAX_MANIFEST_SIZE, timeout, opener)
+    except LauncherError as exc:
+        # GitHub ignore les pre-versions dans « latest » : 404 tant qu'aucune version stable n'existe.
+        if '(HTTP 404)' in str(exc) and '/releases/latest/' in url:
+            raise LauncherError('Aucune version stable publiée sur ce dépôt (HTTP 404). Pour une '
+                                'pré-version, choisissez « Tag précis » dans Options.\n{}'.format(url)) from None
+        raise
     try:
         data = json.loads(bytes(buffer.data).decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1011,14 +1023,15 @@ VIRTUAL_PREFIXES = ('192.168.147.', '192.168.49.')
 
 # Aide du bouton « ? » : 10 lignes au plus (le guide complet est launcher/README.md).
 HELP_TEXT = '\n'.join([
-    '1. Gardez l\'exe et sims4mp_hello.ts4script dans le même dossier (pas dans Program Files).',
-    '2. Mod → Installer le mod, jeu fermé. L\'ancien mod est sauvegardé.',
-    '3. Hôte : Connexion → Héberger → Enregistrer, puis copiez et envoyez votre IP.',
-    '4. Invité : Connexion → Rejoindre, IP et port de l\'hôte → Enregistrer.',
-    '5. Lancer Les Sims 4. En jeu (Ctrl+Maj+C) : l\'hôte tape mp.host, l\'invité mp.join <ip>.',
-    '6. Pare-feu : n\'autorisez le jeu que sur les réseaux privés.',
-    '7. Un souci ? Options → Diagnostic, puis Ouvrir le journal.',
-    '8. Revenir en arrière : Mod → Restaurer l\'ancien mod.',
+    '1. Options : dépôt GitHub (compte/dépôt), « Tag précis » pour une version de test → Enregistrer.',
+    '2. Mod → Installer / mettre à jour depuis GitHub, jeu fermé. L\'ancien mod est sauvegardé.',
+    '3. Hôte (jeu fermé) : Héberger, choisissez une partie manuelle → Créer la room → Copier l\'invitation → Accepter.',
+    '4. Invité (jeu fermé) : Connexion → Rejoindre, IP de l\'hôte et code → Rejoindre la room.',
+    '5. Port : Options → Réseau, le même chez les deux joueurs (la room utilise le port + 1).',
+    '6. Hôte : « Lancer pour tous » lance aussi le jeu des invités qui l\'ont permis. En jeu : mp.host / mp.join <ip>.',
+    '7. Pare-feu : n\'autorisez le jeu et le lanceur que sur les réseaux privés.',
+    '8. Un souci ? Options → Diagnostic, puis Ouvrir le journal.',
+    '9. Revenir en arrière : Mod → Restaurer l\'ancien mod.',
     'Projet de fan, non affilié à EA. Gardez une copie de vos sauvegardes.',
 ])
 
@@ -1077,6 +1090,8 @@ def apply_style(root):
     style.configure('SideSub.TLabel', background=COLOR_SIDEBAR, foreground=COLOR_MUTED,
                     font=(FONT_FAMILY, 9))
     style.configure('Side.TLabel', background=COLOR_SIDEBAR)
+    style.configure('RoomCode.TLabel', foreground=COLOR_ACCENT, font=(MONO_FAMILY, 26, 'bold'))
+    style.configure('Warning.TLabel', foreground='#b45309')
     style.configure('SideSection.TLabel', background=COLOR_SIDEBAR, foreground='#94a3b8',
                     font=(FONT_FAMILY, 8, 'bold'))
     style.configure('SideMuted.TLabel', background=COLOR_SIDEBAR, foreground=COLOR_MUTED,
@@ -1175,6 +1190,17 @@ def draw_logo(canvas, cx, top, scale=1.0):
         canvas.create_polygon(*[c for p in points for c in p], fill=color, outline='')
 
 
+def default_pseudo():
+    """Nom d'utilisateur Windows, nettoye (pseudo modifiable, jamais enregistre)."""
+    try:
+        import getpass
+        name = getpass.getuser()
+    except Exception:
+        name = ''
+    name = ''.join(c for c in name if c.isprintable()).strip()[:24]
+    return name or 'Joueur'
+
+
 def load_plumbob(root):
     """Plumbob officiel embarque (sims4mp_assets.py) ; None si indisponible,
     l'en-tete utilise alors le losange dessine par draw_logo."""
@@ -1210,7 +1236,7 @@ class LauncherApp:
 
         apply_style(root)
         root.title('Sims4MP - Lanceur')
-        root.minsize(960, 620)
+        root.minsize(960, 760)
         root.report_callback_exception = self._on_callback_error
 
         # Barre laterale : logo, titre, navigation.
@@ -1262,7 +1288,8 @@ class LauncherApp:
         self.play_button.pack(side='bottom', fill='x', padx=PAD + 2, pady=(0, GAP))
         ttk.Frame(quit_row, style='NavBarOff.TFrame', width=3).pack(side='left', fill='y')
         ttk.Button(quit_row, text='Quitter', style='Nav.TButton', takefocus=False,
-                   command=root.destroy).pack(side='left', fill='x', expand=True)
+                   command=self._quit).pack(side='left', fill='x', expand=True)
+        root.protocol('WM_DELETE_WINDOW', self._quit)        # la croix ferme aussi la room
         tk.Frame(root, width=1, background=COLOR_BORDER).pack(side='left', fill='y')
 
         # Zone de droite : barre d'etat en bas, contenu au-dessus.
@@ -1292,9 +1319,12 @@ class LauncherApp:
             page.grid(row=0, column=0, sticky='nsew')
             page.columnconfigure(0, weight=1)
 
-        # Page CONNEXION : mode, puis adresse et port.
+        # Page CONNEXION (« Partie a deux ») : le mode, puis la room de l'hote ou de l'invite.
+        # Les IP locales et le port sont dans Options → Reseau.
         page = self.pages['connexion']
         self.role = tk.StringVar(value=ROLE_HOST)
+        self.ip = tk.StringVar()
+        self.port = tk.StringVar(value=str(DEFAULT_PORT))
         mode = self._card(page, 'Mode de jeu', row=0)
         toggles = ttk.Frame(mode)
         toggles.grid(row=1, column=0, sticky='w')
@@ -1303,62 +1333,131 @@ class LauncherApp:
         ttk.Radiobutton(toggles, text='Rejoindre', value=ROLE_JOIN, variable=self.role,
                         style='Toggle.TRadiobutton', command=self._on_role).pack(side='left', padx=(GAP, 0))
 
-        conn = self._card(page, 'Connexion', row=1)
-        conn.columnconfigure(1, weight=1)
-        ttk.Label(conn, text='IP locales', style='Muted.TLabel').grid(
-            row=1, column=0, sticky='nw', pady=GAP, padx=(0, PAD))
-        self.ip_list = ttk.Frame(conn)
-        self.ip_list.grid(row=1, column=1, sticky='nw', pady=GAP)
-        self.copy_button = ttk.Button(conn, text='Copier l\'IP principale', command=self._copy_ips)
-        self.copy_button.grid(row=2, column=1, sticky='w', pady=(0, GAP))
+        # Room : une seule carte, dont le contenu depend du mode.
+        room_card = self._card(page, 'Room', row=1)
+        room_card.columnconfigure(0, weight=1)
+        self.room = None                 # RoomServer ouvert (hote)
+        self.saves = []                  # sauvegardes proposees, dans l'ordre de la liste
+        self._after_task = None
+        self._join_info = None
 
-        ttk.Label(conn, text='IP de l\'hôte', style='Muted.TLabel').grid(
-            row=3, column=0, sticky='w', pady=GAP, padx=(0, PAD))
-        line = ttk.Frame(conn)
-        line.grid(row=3, column=1, sticky='w', pady=GAP)
-        self.ip = tk.StringVar()
-        self.ip_entry = ttk.Entry(line, textvariable=self.ip, width=18)
-        self.ip_entry.pack(side='left')
-        self.ip_hint = ttk.Label(line, style='Muted.TLabel')
-        self.ip_hint.pack(side='left', padx=(PAD, 0))
+        # Hote : room fermee (choix de la partie) ou ouverte (code en grand).
+        host = self.host_room = ttk.Frame(room_card)
+        host.grid(row=1, column=0, sticky='nsew')
+        host.columnconfigure(0, weight=1)
+        closed = self.host_closed = ttk.Frame(host)
+        closed.grid(row=0, column=0, sticky='ew')
+        closed.columnconfigure(1, weight=1)
+        ttk.Label(closed, text='Partie à partager', style='Muted.TLabel').grid(
+            row=0, column=0, sticky='w', padx=(0, PAD))
+        self.save_choice = tk.StringVar()
+        self.save_box = ttk.Combobox(closed, textvariable=self.save_choice, state='readonly')
+        self.save_box.grid(row=0, column=1, sticky='ew')
+        self.create_room_button = ttk.Button(closed, text='Créer la room', style='Accent.TButton',
+                                             command=self._create_room)
+        self.create_room_button.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
+        self.room_hint = ttk.Label(closed, style='Muted.TLabel', wraplength=400, justify='left',
+                                   text='Le jeu doit être fermé. L\'invité recevra une copie de cette partie.')
+        self.room_hint.grid(row=2, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
+        self.save_warning = ttk.Label(closed, style='Warning.TLabel', wraplength=400, justify='left')
+        self.save_warning.grid(row=3, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
+        self.save_box.bind('<<ComboboxSelected>>', lambda event: self._update_save_warning())
 
-        ttk.Label(conn, text='Port', style='Muted.TLabel').grid(
-            row=4, column=0, sticky='w', pady=GAP, padx=(0, PAD))
-        line = ttk.Frame(conn)
-        line.grid(row=4, column=1, sticky='w', pady=GAP)
-        self.port = tk.StringVar(value=str(DEFAULT_PORT))
-        ttk.Entry(line, textvariable=self.port, width=8).pack(side='left')
-        ttk.Label(line, text='{} à {}'.format(PORT_MIN, PORT_MAX), style='Muted.TLabel').pack(
-            side='left', padx=(PAD, 0))
-        ttk.Button(conn, text='Enregistrer le réglage', style='Accent.TButton', command=self._save).grid(
-            row=5, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
+        opened = self.host_opened = ttk.Frame(host)
+        opened.grid(row=0, column=0, sticky='ew')
+        opened.columnconfigure(0, weight=1)
+        opened.columnconfigure(1, weight=1)
+        ttk.Label(opened, text='Code de la room', style='Muted.TLabel').grid(row=0, column=0, columnspan=2, sticky='w')
+        self.room_code_label = ttk.Label(opened, style='RoomCode.TLabel')
+        self.room_code_label.grid(row=1, column=0, columnspan=2, sticky='w')
+        self.room_label = ttk.Label(opened, style='Muted.TLabel')
+        self.room_label.grid(row=2, column=0, columnspan=2, sticky='w', pady=(0, PAD))
+        # Etat du partage de la partie (ferme quand chaque invite accepte l'a recue).
+        self.sharing_label = ttk.Label(opened, style='Muted.TLabel')
+        self.sharing_label.grid(row=7, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
+        self.copy_room_button = ttk.Button(opened, text='Copier l\'invitation', style='Accent.TButton',
+                                           command=self._copy_room)
+        self.copy_room_button.grid(row=3, column=0, sticky='ew', padx=(0, GAP // 2))
+        self.close_room_button = ttk.Button(opened, text='Fermer la room', command=self._close_room)
+        self.close_room_button.grid(row=3, column=1, sticky='ew', padx=(GAP // 2, 0))
+        ttk.Label(opened, text='Joueurs', style='Muted.TLabel').grid(row=4, column=0, columnspan=2,
+                                                                    sticky='w', pady=(PAD, 0))
+        self.players_label = ttk.Label(opened, justify='left', text='En attente d\'un joueur…')
+        self.players_label.grid(row=5, column=0, columnspan=2, sticky='w')
+        # Demandes en attente : une ligne « pseudo · IP  [Accepter] [Refuser] » par invite.
+        self.pending_frame = ttk.Frame(opened)
+        self.pending_frame.grid(row=6, column=0, columnspan=2, sticky='ew')
+        self.pending_frame.columnconfigure(0, weight=1)
+        self._pending_key = None
+        self.launch_all_button = ttk.Button(opened, text='▶  Lancer pour tous', style='Play.TButton',
+                                            command=self._launch_all)
+        self.launch_all_button.grid(row=9, column=0, columnspan=2, sticky='ew', pady=(GAP, 0))
 
-        # Page MOD : installation locale et mise a jour.
+        # Invite : pseudo, adresse de l'hote et code.
+        join = self.join_room_frame = ttk.Frame(room_card)
+        join.grid(row=1, column=0, sticky='nsew')
+        join.columnconfigure(1, weight=1)
+        self.pseudo = tk.StringVar(value=default_pseudo())
+        for row, (text, var, width) in enumerate([('Pseudo', self.pseudo, 18), ('IP de l\'hôte', self.ip, 18),
+                                                  ('Code de room', None, 12)]):
+            ttk.Label(join, text=text, style='Muted.TLabel').grid(row=row, column=0, sticky='w',
+                                                                   pady=GAP // 2, padx=(0, PAD))
+            if var is None:
+                self.room_code = var = tk.StringVar()
+            entry = ttk.Entry(join, textvariable=var, width=width)
+            entry.grid(row=row, column=1, sticky='w', pady=GAP // 2)
+            if var is self.ip:
+                self.ip_entry = entry
+        buttons = ttk.Frame(join)
+        buttons.grid(row=3, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
+        buttons.columnconfigure(0, weight=1)
+        buttons.columnconfigure(1, weight=1)
+        self.check_room_button = ttk.Button(buttons, text='Vérifier sans copier', command=self._check_room)
+        self.check_room_button.grid(row=0, column=0, sticky='ew', padx=(0, GAP // 2))
+        self.join_room_button = ttk.Button(buttons, text='Rejoindre la room', style='Accent.TButton',
+                                           command=self._join_room)
+        self.join_room_button.grid(row=0, column=1, sticky='ew', padx=(GAP // 2, 0))
+        ttk.Label(join, style='Muted.TLabel', wraplength=400, justify='left',
+                  text='La partie reçue va dans un slot réservé Sims4MP ; vos sauvegardes sont '
+                       'copiées avant. Port : Options → Réseau (le même que l\'hôte).').grid(
+            row=4, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
+        # Presence (9b) : decochee par defaut ; l'hote ne peut lancer que le jeu detecte ici.
+        self.allow_host_launch = tk.BooleanVar(value=False)
+        ttk.Checkbutton(join, text='Laisser l\'hôte lancer mon jeu', variable=self.allow_host_launch).grid(
+            row=5, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
+        status = ttk.Frame(join)
+        status.grid(row=6, column=0, columnspan=2, sticky='ew', pady=(GAP, 0))
+        status.columnconfigure(0, weight=1)
+        self.presence_label = ttk.Label(status, style='Muted.TLabel', text='Non connecté à une room.')
+        self.presence_label.grid(row=0, column=0, sticky='w')
+        self.leave_room_button = ttk.Button(status, text='Quitter la room', command=self._leave_room,
+                                            state='disabled')
+        self.leave_room_button.grid(row=0, column=1, sticky='e')
+        self.presence = None                 # connexion de l'invite a une room (presence)
+        self.received_this_session = False   # partie de l'hote recue depuis l'ouverture du lanceur
+        self.presence_results = queue.Queue()
+
+        # Page MOD : le mod est toujours telecharge depuis GitHub (aucun fichier local).
         page = self.pages['mod']
-        mod = self._card(page, 'Mod Sims4MP', row=0)
-        mod.columnconfigure(0, weight=1)
-        ttk.Label(mod, style='Muted.TLabel', wraplength=360, justify='left',
-                  text='Installe sims4mp_hello.ts4script dans le dossier Mods. L\'ancien mod est '
-                       'sauvegardé, et le jeu doit être fermé.').grid(row=1, column=0, sticky='w')
-        self.install_button = ttk.Button(mod, text='Installer le mod', command=self._install)
-        self.install_button.grid(row=2, column=0, sticky='ew', pady=(PAD, 0))
-
-        update = self._card(page, 'Mise à jour', row=1)
+        update = self._card(page, 'Mod Sims4MP', row=0)
         update.columnconfigure(0, weight=1)
-        ttk.Label(update, style='Muted.TLabel', wraplength=360, justify='left',
-                  text='Télécharge la dernière version publiée sur GitHub, vérifiée par '
-                       'taille et SHA-256.').grid(row=1, column=0, sticky='w')
-        self.update_button = ttk.Button(update, text='Mettre à jour depuis GitHub',
+        ttk.Label(update, style='Muted.TLabel', wraplength=400, justify='left',
+                  text='Télécharge le mod depuis GitHub, le vérifie (taille et SHA-256) puis l\'installe '
+                       'dans Mods. Le jeu doit être fermé ; l\'ancien mod est sauvegardé.').grid(
+            row=1, column=0, sticky='w')
+        self.source_label = ttk.Label(update, wraplength=400, justify='left')
+        self.source_label.grid(row=2, column=0, sticky='w', pady=(GAP, 0))
+        self.update_button = ttk.Button(update, text='Installer / mettre à jour depuis GitHub',
                                         style='Accent.TButton', command=self._update)
-        self.update_button.grid(row=2, column=0, sticky='ew', pady=(PAD, GAP))
+        self.update_button.grid(row=3, column=0, sticky='ew', pady=(PAD, GAP))
         self.allow_test = tk.BooleanVar(value=False)
         ttk.Checkbutton(update, text='Installer une version de test', variable=self.allow_test).grid(
-            row=3, column=0, sticky='w', pady=(GAP, 0))
+            row=4, column=0, sticky='w', pady=(GAP, 0))
         self.allow_downgrade = tk.BooleanVar(value=False)
         ttk.Checkbutton(update, text='Autoriser le retour à une version plus ancienne',
-                        variable=self.allow_downgrade).grid(row=4, column=0, sticky='w', pady=(GAP, 0))
+                        variable=self.allow_downgrade).grid(row=5, column=0, sticky='w', pady=(GAP, 0))
 
-        restore = self._card(page, 'Restaurer l\'ancien mod', row=2)
+        restore = self._card(page, 'Restaurer l\'ancien mod', row=1)
         restore.columnconfigure(0, weight=1)
         self.backup_choice = tk.StringVar()
         self.backup_box = ttk.Combobox(restore, textvariable=self.backup_choice, state='readonly')
@@ -1374,8 +1473,6 @@ class LauncherApp:
         ttk.Label(gh, text='Dépôt', style='Muted.TLabel').grid(row=1, column=0, sticky='w', pady=GAP, padx=(0, PAD))
         self.repo = tk.StringVar()
         ttk.Entry(gh, textvariable=self.repo, width=30).grid(row=1, column=1, sticky='w', pady=GAP)
-        ttk.Label(gh, text='compte/dépôt, par exemple Flaimeur/sims4mp', style='Muted.TLabel').grid(
-            row=2, column=1, sticky='w')
 
         ttk.Label(gh, text='Version', style='Muted.TLabel').grid(row=3, column=0, sticky='w', pady=GAP, padx=(0, PAD))
         self.tag_mode = tk.StringVar(value='latest')
@@ -1395,8 +1492,8 @@ class LauncherApp:
         self.manifest_preview = ttk.Label(gh, wraplength=330, justify='left')
         self.manifest_preview.grid(row=5, column=1, sticky='w', pady=GAP)
         ttk.Label(gh, style='Muted.TLabel', wraplength=400, justify='left',
-                  text='Une pré-version n\'est jamais « Dernière stable » : pour la tester, choisissez '
-                       '« Tag précis ». La Release doit être publique, le lanceur ne stocke aucun jeton.').grid(
+                  text='Dépôt : compte/dépôt (ex. Flaimeur/sims4mp), Release publique, aucun jeton stocké. '
+                       'Une pré-version demande « Tag précis ».').grid(
             row=6, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
         buttons = ttk.Frame(gh)
         buttons.grid(row=7, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
@@ -1421,9 +1518,23 @@ class LauncherApp:
         ttk.Button(tools, text='Dossier Mods', command=self._open_mods_dir).grid(
             row=2, column=1, sticky='ew', padx=(GAP // 2, 0))
         ttk.Label(tools, style='Muted.TLabel', wraplength=400, justify='left',
-                  text='Le diagnostic ne modifie rien. En mode Rejoindre, il tente une connexion '
-                       'de 3 s vers l\'hôte enregistré.').grid(
+                  text='Le diagnostic ne modifie rien ; en Rejoindre, il essaie l\'hôte 3 s.').grid(
             row=3, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
+
+        # Reseau : IP locales et port du jeu (la room utilise le port + 1).
+        net = self._card(page, 'Réseau', row=2)
+        net.columnconfigure(1, weight=1)
+        ttk.Label(net, text='IP locales', style='Muted.TLabel').grid(row=1, column=0, sticky='nw', padx=(0, PAD))
+        self.ip_list = ttk.Frame(net)
+        self.ip_list.grid(row=1, column=1, columnspan=2, sticky='nw')
+        ttk.Label(net, text='Port du jeu', style='Muted.TLabel').grid(row=2, column=0, sticky='w',
+                                                                     padx=(0, PAD), pady=(GAP, 0))
+        line = ttk.Frame(net)
+        line.grid(row=2, column=1, sticky='w', pady=(GAP, 0))
+        ttk.Entry(line, textvariable=self.port, width=8).pack(side='left')
+        ttk.Label(line, text='room = port + 1', style='Muted.TLabel').pack(side='left', padx=(PAD, 0))
+        self.copy_button = ttk.Button(net, text='Copier l\'IP', command=self._copy_ips)
+        self.copy_button.grid(row=2, column=2, sticky='e', pady=(GAP, 0))
 
         # Journal, toujours visible a droite.
         box = ttk.Frame(content, style='Card.TFrame', padding=PAD + 2)
@@ -1448,12 +1559,13 @@ class LauncherApp:
         self._refresh_ips()
         self._load_settings()
         self._load_config()
+        self._refresh_source_label()
         self._on_role()
         self._on_tag_mode()
         self._refresh_backups()
         self.game = detect_game()
         self._apply_game_state()
-        center_window(root, 1040, 700)
+        center_window(root, 1040, 790)
 
     def _card(self, parent, title, row):
         """Carte sombre avec un titre vert ; renvoie le cadre interieur (grid)."""
@@ -1473,12 +1585,13 @@ class LauncherApp:
             button.configure(style='NavActive.TButton' if active else 'Nav.TButton')
 
     # -- messages --
-    def show(self, text, tag=None):
+    def show(self, text, tag=None, log_line=True):
         self.messages.configure(state='normal')
         self.messages.insert('end', text + '\n', tag or ())
         self.messages.see('end')
         self.messages.configure(state='disabled')
-        log(('ERREUR : ' if tag == 'error' else '') + text)
+        if log_line:
+            log(('ERREUR : ' if tag == 'error' else '') + text)
 
     def set_status(self, text, kind=None):
         style = {'ok': 'StatusOk.TLabel', 'error': 'StatusError.TLabel'}.get(kind, 'Status.TLabel')
@@ -1581,6 +1694,20 @@ class LauncherApp:
             return
         self.show('Options enregistrees : {}'.format(manifest_url_for(data['depot'], data['tag'])), 'ok')
         self.set_status('Options enregistrées', 'ok')
+        self._refresh_source_label()
+
+    def _refresh_source_label(self):
+        """Page Mod : d'ou le mod sera telecharge, d'apres les options enregistrees."""
+        try:
+            data = read_config(config_path())
+        except ValueError:
+            data = None
+        if data:
+            version = 'tag {}'.format(data['tag']) if data['tag'] else 'dernière version stable'
+            self.source_label.configure(text='Source : {} ({})'.format(data['depot'], version), style='TLabel')
+        else:
+            self.source_label.configure(text='Source non configurée : renseignez le dépôt dans Options.',
+                                        style='Muted.TLabel')
 
     def _check_manifest(self):
         try:
@@ -1688,7 +1815,427 @@ class LauncherApp:
     def _on_role(self):
         joining = self.role.get() == ROLE_JOIN
         self.ip_entry.configure(state='normal' if joining else 'disabled')
-        self.ip_hint.configure(text='' if joining else 'inutile pour héberger')
+        (self.host_room if joining else self.join_room_frame).grid_remove()
+        (self.join_room_frame if joining else self.host_room).grid()
+        if not joining:
+            self._refresh_saves()
+
+    # -- room --
+    def _room_port(self):
+        """Port de la room : port du jeu + 1 (valide)."""
+        import sims4mp_room as room
+        port = validate_port(self.port.get()) + room.ROOM_PORT_OFFSET
+        try:
+            return validate_port(port)
+        except ValueError:
+            raise ValueError('Port trop grand : la room utilise le port du jeu + 1 ({}).'.format(port)) from None
+
+    def _refresh_saves(self):
+        """Liste rapide (nom, date, taille) ; partie et foyer sont lus a la creation."""
+        import sims4mp_room as room
+        try:
+            self.saves = room.list_saves(room.saves_dir(self._documents()))
+        except (LauncherError, OSError):
+            self.saves = []
+        labels = []
+        for path in self.saves:
+            stat = path.stat()
+            labels.append('{}{} · {} · {:.1f} Mo'.format(
+                path.name, ' (automatique)' if path.name.lower() == 'slot_ffffffff.save' else '',
+                datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%d/%m/%Y %H:%M'), stat.st_size / 1e6))
+        self.save_box.configure(values=labels)
+        if self.save_box.current() < 0 or self.save_box.current() >= len(labels):
+            # list_saves met les parties manuelles d'abord : l'automatique n'est jamais le choix par defaut.
+            self.save_choice.set(labels[0] if labels else '')
+        self._update_save_warning()
+        self._apply_room_state()
+
+    def _update_save_warning(self):
+        import sims4mp_room as room
+        index = self.save_box.current()
+        auto = 0 <= index < len(self.saves) and room.is_auto_save(self.saves[index])
+        self.save_warning.configure(text='Sauvegarde automatique (Slot_ffffffff) : préférez une partie '
+                                         'sauvegardée à la main.' if auto else '')
+
+    def _apply_room_state(self):
+        busy = self.installing
+        opened = self.room is not None
+        self.create_room_button.configure(state='disabled' if busy or opened or not self.saves else 'normal')
+        self.save_box.configure(state='disabled' if opened else 'readonly')
+        self.close_room_button.configure(state='normal' if opened else 'disabled')
+        self.copy_room_button.configure(state='normal' if opened else 'disabled')
+        for button in (self.check_room_button, self.join_room_button):
+            button.configure(state='disabled' if busy else 'normal')
+        # Room fermee : choix de la partie ; ouverte : le code en grand. Une seule vue
+        # affichee (superposees, la plus grande depasserait de l'autre).
+        (self.host_closed if opened else self.host_opened).grid_remove()
+        (self.host_opened if opened else self.host_closed).grid()
+        if opened:
+            self.room_code_label.configure(text=self.room.code)
+            self.room_label.configure(text='IP {} · port {}'.format(self.room.bind_ip, self.room.port))
+            self.sharing_label.configure(text='Partage de la partie : ouvert aux invités acceptés'
+                                         if getattr(self.room, 'sharing_open', True) else
+                                         'Partage fermé : chaque invité accepté a reçu la partie')
+        else:
+            self.room_code_label.configure(text='')
+            self.room_label.configure(text='')
+            self.sharing_label.configure(text='')
+
+    def _create_room(self):
+        import sims4mp_room as room
+        index = self.save_box.current()
+        bind_ip = primary_ip(self.ips)
+        try:
+            if index < 0 or index >= len(self.saves):
+                raise ValueError('Choisissez une sauvegarde dans la liste.')
+            if not bind_ip:
+                raise ValueError('Aucune IP locale utilisable pour ouvrir la room.')
+            port = self._room_port()
+        except ValueError as exc:
+            self.show(str(exc), 'error')
+            self.set_status(str(exc), 'error')
+            return
+        save, documents = self.saves[index], self._documents()
+
+        def task():
+            mod = find_mods_dir(documents) / MOD_FILE
+            version = read_mod_version(mod) if mod.is_file() else None
+            if version in (None, 'inconnue'):
+                raise LauncherError('Installez le mod Sims4MP (page Mod) avant de créer la room.')
+            server = room.RoomServer(save, room.saves_dir(documents), base_dir() / 'sims4mp_room',
+                                     version, bind_ip, port)
+            info = server.prepare()
+            try:
+                server.start()
+            except OSError as exc:
+                server.stop()
+                raise LauncherError('Impossible d\'ouvrir la room sur {}:{} ({}). Le port est peut-être '
+                                    'déjà utilisé.'.format(bind_ip, port, exc)) from None
+            self._pending_room = server
+            lines = ['Partie : {} ({})'.format(info['partie'] or 'nom non lu', info['fichier']),
+                     'Foyer(s) : {}'.format(', '.join(info['foyers']) or 'non lu'),
+                     'Taille : {:.1f} Mo, SHA-256 {}...'.format(info['taille'] / 1e6, info['sha256'][:16]),
+                     'Envoyez à l\'invité : IP {} · port {} · code {}'.format(bind_ip, server.port, server.code),
+                     'Chaque invité devra être accepté (Joueurs → Accepter) avant de voir ou recevoir la partie.']
+            if room.is_auto_save(save):
+                lines.append('ATTENTION : vous partagez la sauvegarde automatique (Slot_ffffffff).')
+            lines.append('Room ouverte. Gardez le lanceur ouvert jusqu\'à ce que l\'invité ait reçu la partie.')
+            return lines, 'Room ouverte (code {})'.format(server.code)
+        self._pending_room = None
+        self._start_task('Création de la room...', lambda: self._run_worker(task), after=self._room_opened)
+
+    def _room_opened(self):
+        self.room, self._pending_room = self._pending_room, None
+        self._apply_room_state()
+        self._auto_save(ROLE_HOST)
+        self.root.after(500, self._poll_room)
+
+    def _auto_save(self, role):
+        """Enregistre le reglage (role, IP, port) sans bouton ; une erreur ne bloque pas la room."""
+        try:
+            ip = validate_ipv4(self.ip.get()) if role == ROLE_JOIN else ''
+            data = write_settings(self._settings_file(), {'role': role, 'ip': ip,
+                                                          'port': validate_port(self.port.get())})
+        except (ValueError, LauncherError, OSError) as exc:
+            self.show('Reglage non enregistre : {}'.format(exc), 'error')
+            return
+        self.show('Reglage enregistre automatiquement ({}, port {}).'.format(
+            'Heberger' if role == ROLE_HOST else 'Rejoindre {}'.format(data['ip']), data['port']))
+
+    def _poll_room(self):
+        if self.room is None:
+            return
+        self._refresh_players()
+        for event in self.room.take_events():
+            self.show('Room : ' + event, 'ok' if event.startswith('Sauvegarde envoyée') else None,
+                      log_line=False)                     # deja ecrit dans launcher.log par la room
+        self._apply_room_state()                          # le partage a pu se fermer
+        self.root.after(500, self._poll_room)
+
+    def _refresh_players(self):
+        """Joueurs acceptes (texte) et demandes en attente (une ligne avec Accepter / Refuser)."""
+        import sims4mp_room as room
+        guests = self.room.guests_snapshot() if self.room is not None else []
+        guests.sort(key=lambda g: g['pseudo'].casefold())
+        accepted = [g for g in guests if g['accord'] == 'accepte']
+        waiting = [g for g in guests if g['accord'] == 'attente']
+        lines = ['{} · {} · {} · {}'.format(g['pseudo'], g['ip'], room.GUEST_STATES[g['etat']],
+                                            'lancement autorisé' if g['autorise'] else 'lancement non autorisé')
+                 for g in accepted]
+        if not lines:
+            lines = ['Aucun joueur accepté.' if waiting else 'En attente d\'un joueur…']
+        self.players_label.configure(text='\n'.join(lines))
+        # Ne reconstruire les boutons que si les demandes changent (un clic n'est jamais perdu).
+        key = tuple((g['session'], g['pseudo'], g['ip']) for g in waiting)
+        if key == self._pending_key:
+            return
+        self._pending_key = key
+        for child in self.pending_frame.winfo_children():
+            child.destroy()
+        for row, guest in enumerate(waiting):
+            self.ttk.Label(self.pending_frame, style='Warning.TLabel', text='{} · {} · demande'.format(
+                guest['pseudo'], guest['ip'])).grid(row=row, column=0, sticky='w', pady=(GAP // 2, 0))
+            self.ttk.Button(self.pending_frame, text='Accepter', style='Accent.TButton',
+                            command=lambda s=guest['session']: self._answer_guest(s, True)).grid(
+                row=row, column=1, padx=(GAP, 0), pady=(GAP // 2, 0))
+            self.ttk.Button(self.pending_frame, text='Refuser',
+                            command=lambda s=guest['session']: self._answer_guest(s, False)).grid(
+                row=row, column=2, padx=(GAP // 2, 0), pady=(GAP // 2, 0))
+
+    def _answer_guest(self, session, accept):
+        if self.room is None:
+            return
+        if accept:
+            self.room.accept_guest(session)
+        else:
+            self.room.refuse_guest(session)
+        self._refresh_players()
+        for event in self.room.take_events():
+            self.show('Room : ' + event, log_line=False)
+        self._apply_room_state()
+
+    def _launch_all(self):
+        """Signal aux invites, puis lancement du jeu de l'hote (s'il est detecte et ferme)."""
+        if self.room is None:
+            return
+        self.room.request_launch()
+        self.show('Signal « Lancer pour tous » envoyé : les invités qui l\'ont autorisé lancent leur jeu.')
+        try:
+            running = game_is_running()
+        except LauncherError:
+            running = False
+        if self.game.kind is None:
+            self.show('Jeu introuvable sur ce PC : seuls les invités sont prévenus.', 'error')
+        elif running:
+            self.show('Votre jeu est déjà lancé : seuls les invités sont prévenus.')
+        else:
+            self._launch_game()
+
+    # -- presence de l'invite (9b) --
+    def _start_presence(self, ip, port, code):
+        """Se signale a l'hote (meme room : garde la session et donc l'accord deja obtenu)."""
+        import sims4mp_room as room
+        current = self.presence
+        if current and (current['ip'], current['port'], current['code']) == (ip, port, code):
+            return
+        self.presence = {'ip': ip, 'port': port, 'code': code, 'session': room.new_session_id(),
+                         'etat': 'connecte', 'accord': 'attente', 'pending': None,
+                         'handled': None, 'primed': False, 'failures': 0, 'busy': False}
+        self._apply_presence_state()
+        self.root.after(0, self._presence_tick)
+
+    def _apply_presence_state(self):
+        import sims4mp_room as room
+        if self.presence is None:
+            self.presence_label.configure(text='Non connecté à une room.', style='Muted.TLabel')
+            self.leave_room_button.configure(state='disabled')
+        else:
+            state = ('en attente de l\'accord' if self.presence['accord'] == 'attente'
+                     else room.GUEST_STATES[self.presence['etat']])
+            self.presence_label.configure(style='TLabel', text='Connecté à {} · {}'.format(
+                self.presence['ip'], state))
+            self.leave_room_button.configure(state='normal')
+
+    def _on_agreement(self, agreement):
+        """Reponse de l'hote a notre demande ; lance l'action en attente une fois accepte."""
+        presence = self.presence
+        previous, presence['accord'] = presence['accord'], agreement
+        if agreement == 'refuse':
+            self.show('L\'hôte a refusé votre demande : rien n\'a été lu ni écrit.', 'error')
+            self.set_status('Refusé par l\'hôte', 'error')
+            self.presence = None
+            self._apply_presence_state()
+            return
+        if agreement == 'accepte' and previous != 'accepte':
+            self.show('L\'hôte a accepté votre demande.', 'ok')
+        if agreement == 'accepte' and presence['pending']:
+            action, presence['pending'] = presence['pending'], None
+            (self._run_check if action == 'check' else self._run_join)()
+
+    def _presence_tick(self):
+        """Toutes les 2 s : traite la derniere reponse, puis envoie la presence (tache de fond)."""
+        import sims4mp_room as room
+        presence = self.presence
+        if presence is None:
+            return
+        while True:
+            try:
+                session, kind, value = self.presence_results.get_nowait()
+            except queue.Empty:
+                break
+            if self.presence is not presence or session != presence['session']:
+                continue                                   # reponse d'une ancienne connexion
+            presence['busy'] = False
+            if kind == 'ok':
+                presence['failures'] = 0
+                self._on_agreement(value['accord'])
+                if self.presence is not presence:
+                    return                                 # refuse : presence arretee
+                token = value['lancer']
+                if presence['accord'] != 'accepte':
+                    pass                                   # aucun signal avant l'accord
+                elif not presence['primed']:
+                    # Un signal emis avant notre accord ne nous concerne pas.
+                    presence['handled'], presence['primed'] = token, True
+                elif token and token != presence['handled']:
+                    presence['handled'] = token
+                    self._on_launch_signal()
+            else:
+                presence['failures'] += 1
+                if presence['failures'] >= 3:
+                    self.show('Room perdue après 3 échecs : {}'.format(value), 'error')
+                    self.set_status('Room perdue : hôte injoignable', 'error')
+                    self.presence = None
+                    self._apply_presence_state()
+                    return
+        if self.presence is None:
+            return
+        if not presence['busy']:
+            presence['busy'] = True
+            args = (presence['ip'], presence['port'], presence['code'], presence['session'],
+                    self.pseudo.get(), presence['etat'], bool(self.allow_host_launch.get()))
+
+            def worker():
+                try:
+                    self.presence_results.put((args[3], 'ok', room.send_presence(*args)))
+                except LauncherError as exc:
+                    self.presence_results.put((args[3], 'error', str(exc)))
+            self._spawn(worker)
+        self._apply_presence_state()
+        self.root.after(int(room.PRESENCE_INTERVAL * 1000), self._presence_tick)
+
+    def _on_launch_signal(self):
+        """Signal « Lancer pour tous » recu : lance le jeu d'ici, si toutes les conditions sont reunies."""
+        reason = None
+        if not self.allow_host_launch.get():
+            reason = 'vous n\'avez pas coché « Laisser l\'hôte lancer mon jeu »'
+        elif not self.received_this_session:
+            reason = 'la partie de l\'hôte n\'a pas été reçue pendant cette session'
+        elif self.game.kind is None:
+            reason = 'jeu introuvable sur ce PC'
+        if reason is None:
+            target = game_target(self.game)
+            try:
+                lines = launch_game() if target == STEAM_GAME_URL else launch_game(target=target)
+            except LauncherError as exc:
+                reason = str(exc).splitlines()[0]
+            else:
+                self.presence['etat'] = 'jeu_lance'
+                for line in lines:
+                    self.show(line)
+                self.show('L\'hôte a lancé la partie : jeu lancé.', 'ok')
+                self.set_status('Jeu lancé par l\'hôte', 'ok')
+        if reason is not None:
+            self.presence['etat'] = 'lancement_refuse'
+            self.show('L\'hôte a demandé le lancement, refusé : {}.'.format(reason), 'error')
+            self.set_status('Lancement demandé par l\'hôte : refusé', 'error')
+        self._apply_presence_state()
+
+    def _leave_room(self):
+        if self.presence is None:
+            return
+        self.presence = None
+        self._apply_presence_state()
+        self.show('Room quittée.')
+        self.set_status('Room quittée')
+
+    def _join_done(self):
+        """Partie de l'hote installee : elle peut maintenant etre lancee par l'hote."""
+        self.received_this_session = True
+        if self.presence is not None:
+            self.presence['etat'] = 'partie_recue'
+            self._apply_presence_state()
+
+    def _close_room(self):
+        if self.room is None:
+            return
+        server, self.room = self.room, None
+        server.stop()
+        for event in server.take_events():
+            self.show('Room : ' + event, log_line=False)
+        self.set_status('Room fermée', 'ok')
+        self._apply_room_state()
+
+    def _copy_room(self):
+        if self.room is None:
+            return
+        text = 'Sims4MP · IP {} · port {} · code {}'.format(self.room.bind_ip, self.room.port, self.room.code)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.set_status('Invitation copiée', 'ok')
+
+    def _join_params(self):
+        import sims4mp_room as room
+        return validate_ipv4(self.ip.get()), self._room_port(), room.validate_room_code(self.room_code.get())
+
+    def _request_room(self, action):
+        """Verifier ou Rejoindre : se signale d'abord a l'hote, puis agit une fois accepte."""
+        try:
+            ip, port, code = self._join_params()
+        except (ValueError, LauncherError) as exc:
+            self.show(str(exc), 'error')
+            self.set_status(str(exc), 'error')
+            return
+        if action == 'join':
+            self._auto_save(ROLE_JOIN)
+        self._start_presence(ip, port, code)
+        if self.presence['accord'] == 'accepte':
+            (self._run_check if action == 'check' else self._run_join)()
+            return
+        self.presence['pending'] = action
+        self.show('Demande envoyée à l\'hôte : en attente de son accord (rien n\'est lu avant).')
+        self.set_status('En attente de l\'accord de l\'hôte')
+
+    def _check_room(self):
+        """« Verifier sans copier » : lit la room et decrit ce qui serait fait, sans rien ecrire."""
+        self._request_room('check')
+
+    def _join_room(self):
+        self._request_room('join')
+
+    def _run_check(self):
+        import sims4mp_room as room
+        p, documents = self.presence, self._documents()
+
+        def task():
+            info = room.fetch_room_info(p['ip'], p['port'], p['code'], p['session'])
+            lines, plan = room.plan_join(info, documents)
+            return lines + ['Vérification seulement : rien n\'a été écrit.'], 'Vérification OK : rien n\'a été écrit'
+        self._start_task('Vérification de la room...', lambda: self._run_worker(task))
+
+    def _run_join(self):
+        import sims4mp_room as room
+        p, documents = self.presence, self._documents()
+
+        def task():
+            info = room.fetch_room_info(p['ip'], p['port'], p['code'], p['session'])
+            lines, plan = room.plan_join(info, documents)
+            self._join_info = (p['ip'], p['port'], p['code'], p['session'], info, lines)
+            return lines, 'Room trouvée : confirmation demandée'
+        self._join_info = None
+        self._start_task('Connexion à la room...', lambda: self._run_worker(task), after=self._confirm_join)
+
+    def _confirm_join(self):
+        """Rien n'est ecrit sans un « Oui » explicite ; la copie datee est faite par apply_join."""
+        import sims4mp_room as room
+        ip, port, code, session, info, lines = self._join_info
+        text = '\n'.join(lines) + ('\n\nVos sauvegardes seront d\'abord copiées dans sims4mp_backups\\saves_… '
+                                   '\nLes actions en jeu ne sont pas encore synchronisées : '
+                                   'les deux parties évolueront séparément après le chargement.')
+        if not self._confirm('Rejoindre la room', text + '\n\nInstaller cette partie ?'):
+            self.show('Rejoindre la room : annulé, rien n\'a été écrit.')
+            self.set_status('Annulé : rien n\'a été écrit')
+            return
+        documents = self._documents()
+        self._start_task('Téléchargement de la partie...', lambda: self._run_worker(
+            lambda: room.apply_join(ip, port, code, session, info, documents,
+                                    base_dir() / BACKUP_DIR_NAME, base_dir())),
+            after=self._join_done)
+
+    def _quit(self):
+        self._close_room()
+        self.presence = None                 # l'hote retirera l'invite apres 10 s sans nouvelles
+        self.root.destroy()
 
     # -- IP locales --
     def _refresh_ips(self):
@@ -1719,23 +2266,26 @@ class LauncherApp:
         self.set_status('IP copiée : {}'.format(main_ip), 'ok')
 
     # -- installation (thread : la recherche dans Documents peut etre lente) --
-    def _start_task(self, message, worker):
+    def _start_task(self, message, worker, after=None):
+        """Lance worker dans un thread ; after() est appele (fenetre) si la tache reussit."""
         if self.installing:
             return
         self.installing = True
-        for button in (self.install_button, self.update_button, self.check_button, self.play_button,
+        self._after_task = after
+        for button in (self.update_button, self.check_button, self.play_button,
                        self.restore_button, self.diag_button):
             button.configure(state='disabled')
+        self._apply_room_state()
         self.show(message)
         self.set_status(message)
-        threading.Thread(target=worker, daemon=True).start()
+        self._spawn(worker)
         self.root.after(100, self._poll_install)
 
-    def _install(self):
-        self._start_task('Installation du mod...', self._install_worker)
+    def _spawn(self, worker):
+        threading.Thread(target=worker, daemon=True).start()
 
     def _update(self):
-        self._start_task('Mise à jour depuis GitHub...', self._update_worker)
+        self._start_task('Installation depuis GitHub...', self._update_worker)
 
     def _run_worker(self, func):
         # Execute dans le thread : le resultat passe par la file pour l'interface.
@@ -1748,13 +2298,6 @@ class LauncherApp:
             log('ERREUR inattendue :\n' + traceback.format_exc())
             self.results.put(('error', ['Erreur inattendue : {}\nDetail dans {}'.format(
                 exc, base_dir() / LOG_NAME)], None))
-
-    def _install_worker(self):
-        def task():
-            source = find_mod_source()
-            lines = run_install(source, self._documents(), base_dir() / BACKUP_DIR_NAME)
-            return lines + ['Mod installe.'], 'Mod installé'
-        self._run_worker(task)
 
     def _update_worker(self):
         allow_test = bool(self.allow_test.get())
@@ -1783,11 +2326,15 @@ class LauncherApp:
         else:
             self.set_status(lines[0] if lines else 'Échec', 'error')
         self.installing = False
-        for button in (self.install_button, self.update_button, self.check_button, self.diag_button):
+        for button in (self.update_button, self.check_button, self.diag_button):
             button.configure(state='normal')
-        # Ces deux boutons dependent d'un etat : jeu detecte, sauvegardes presentes.
+        # Ces boutons dependent d'un etat : jeu detecte, sauvegardes presentes, room ouverte.
         self._apply_game_state()
         self._refresh_backups()
+        self._apply_room_state()
+        after, self._after_task = self._after_task, None
+        if kind == 'ok' and after is not None:
+            after()
 
 
 def main():
