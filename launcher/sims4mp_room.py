@@ -11,6 +11,9 @@
 #   (« Verifier sans copier »), apply_join telecharge, verifie (taille, SHA-256),
 #   copie toutes les sauvegardes dans sims4mp_backups\saves_AAAAMMJJ_HHMMSS\, puis
 #   installe dans le slot reserve Sims4MP par remplacement atomique.
+# Mods : /mods donne la liste (avec SHA-256) ; /modfile/<n> sert le n-ieme fichier.
+#   plan_mods_sync compare, apply_mods_sync copie ce qui manque ou differe, apres
+#   verification de chaque fichier et copie datee des fichiers remplaces.
 #
 # Format des sauvegardes (etape 7a) : conteneur DBPF 2.1, ressource 0x0D compressee
 # en RefPack, message protobuf SaveGameData. Champs confirmes dans
@@ -70,6 +73,15 @@ RECEIVED_STATES = ('partie_recue', 'jeu_lance')       # l'invite a verifie et in
 AGREEMENTS = ('attente', 'accepte', 'refuse')        # accord de l'hote pour un invite
 SESSION_RE = re.compile(r'[0-9a-f]{16,32}')
 AUTO_SAVE_NAME = 'slot_ffffffff.save'                # sauvegarde automatique du jeu
+
+# Copie des mods de l'hote vers l'invite : /modfile/<n> sert le n-ieme mod de la
+# liste /mods (aucun chemin ne vient de la requete). L'invite verifie taille et
+# SHA-256 de chaque fichier et range d'abord ses versions remplacees.
+MODFILE_RE = re.compile(r'/modfile/(\d{1,6})')
+MAX_SYNC_FILE = 2 * 1024 ** 3                         # 2 Go par fichier
+MAX_SYNC_TOTAL = 20 * 1024 ** 3                       # 20 Go en tout
+DISK_MARGIN = 1024 ** 3                               # garder 1 Go libre apres la copie
+WINDOWS_RESERVED = re.compile(r'(con|prn|aux|nul|com\d|lpt\d)(\..*)?', re.IGNORECASE)
 
 
 class RoomError(core.LauncherError):
@@ -462,6 +474,23 @@ class RoomServer:
             self.mods = mods_cmp.mods_list(self.mods_dir, self.mods_sha, self.mods_cache)
         return self.info
 
+    def mod_file(self, index):
+        """(chemin, entree, None) pour le n-ieme mod de la liste, sinon (None, entree ou None, raison).
+        Le fichier doit etre encore dans Mods, sans lien, avec la taille annoncee."""
+        mods = self.mods['mods'] if self.mods is not None else []
+        if self.mods_dir is None or not 0 <= index < len(mods):
+            return None, None, 'mod inconnu'
+        entry = mods[index]
+        path = self.mods_dir / entry['chemin']
+        try:
+            inside = path.resolve().is_relative_to(self.mods_dir.resolve())
+            ok = inside and not path.is_symlink() and path.is_file() and path.stat().st_size == entry['taille']
+        except OSError:
+            ok = False
+        if not ok:
+            return None, entry, 'mod modifié ou supprimé depuis la création de la room'
+        return path, entry, None
+
     def start(self):
         if self.info is None:
             raise RoomError('Room non préparée.')
@@ -493,7 +522,8 @@ class RoomServer:
                         if room.bad_codes >= MAX_BAD_CODES:
                             room.locked = True
                     return self._deny(401, 'code de room faux')
-                if self.path in ('/info', '/save', '/mods'):
+                modfile = MODFILE_RE.fullmatch(self.path)
+                if self.path in ('/info', '/save', '/mods') or modfile:
                     # Rien n'est lisible sans l'accord de l'hote pour cette session et cette IP.
                     status, reason = room.authorize(self.headers.get(SESSION_HEADER, ''), client, self.path)
                     if status is not None:
@@ -551,6 +581,22 @@ class RoomServer:
                     self.end_headers()
                     self.wfile.write(body)
                     room._event('{} a comparé ses mods ({} mods de l\'hôte)'.format(client, len(room.mods['mods'])))
+                elif modfile and room.mods is not None:
+                    path, entry, reason = room.mod_file(int(modfile.group(1)))
+                    if path is None:
+                        return self._deny(409 if entry is not None else 404, reason)
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/octet-stream')
+                    self.send_header('Content-Length', str(entry['taille']))
+                    self.end_headers()
+                    try:
+                        with open(path, 'rb') as f:
+                            shutil.copyfileobj(f, self.wfile, 256 * 1024)
+                    except OSError:
+                        core.log('Room : {} : envoi du mod {} interrompu'.format(client, entry['chemin']))
+                        return
+                    # Journal seulement : des centaines de mods noieraient les evenements de la room.
+                    core.log('Room : mod envoyé à {} : {}'.format(client, entry['chemin']))
                 else:
                     self._deny(404, 'adresse inconnue {}'.format(self.path[:40]))
 
@@ -743,6 +789,132 @@ def run_mod_compare(ip, port, code, session, documents, report_dir):
     return lines, mods_cmp.summary_text(result)
 
 
+def _safe_rel_path(rel):
+    """Chemin relatif de l'hote utilisable dans Mods sur Windows comme sur Mac, sinon None."""
+    parts = rel.split('/')
+    for part in parts:
+        if (not part or part in ('.', '..') or part != part.rstrip('. ') or WINDOWS_RESERVED.fullmatch(part)
+                or any(c in part for c in '<>:"|?*') or any(ord(c) < 32 for c in part)):
+            return None
+    return parts
+
+
+def plan_mods_sync(ip, port, code, session, documents, cache_dir, is_running=None):
+    """Compare les mods et prepare la copie de ceux qui manquent ou different, sans rien
+    ecrire dans Mods. Renvoie (lignes, plan) ; plan['copier'] vide : rien a faire."""
+    is_running = is_running or core.game_is_running
+    host = fetch_mods_list(ip, port, code, session)
+    if not host['avec_sha']:
+        raise mods_cmp.ModsError('L\'hôte n\'envoie pas les empreintes SHA-256 de ses mods : copie '
+                                 'impossible (lanceur de l\'hôte trop ancien).')
+    mods_dir = core.find_mods_dir(documents)
+    guest = mods_cmp.scan_mods(mods_dir, with_sha=True, cache_path=Path(cache_dir) / mods_cmp.CACHE_NAME)
+    result = mods_cmp.compare_mods(host['mods'], guest, use_sha=True)
+    index = {id(entry): n for n, entry in enumerate(host['mods'])}
+    # Un fichier de l'invite identique a un mod de l'hote (meme nom, meme SHA-256) reste en
+    # place, meme s'il porte le nom d'un autre mod de l'hote (doublons dans deux dossiers).
+    host_keys = {(e['nom'].casefold(), e['sha256']) for e in host['mods']}
+    todo = [(e, []) for e in result['manquants']]
+    for entry, candidates in result['differents']:
+        todo.append((entry, [g for g in candidates if (g['nom'].casefold(), g['sha256']) not in host_keys]))
+    copies, total, scripts = [], 0, 0
+    for entry, replaced in todo:
+        parts = _safe_rel_path(entry['chemin'])
+        if parts is None:
+            raise mods_cmp.ModsError('Chemin de mod inutilisable ici : {!r}'.format(entry['chemin'][:80]))
+        if entry['taille'] > MAX_SYNC_FILE:
+            raise mods_cmp.ModsError('Mod trop grand ({}, {:.1f} Go ; maximum {:.0f} Go par fichier).'.format(
+                entry['nom'], entry['taille'] / 1024 ** 3, MAX_SYNC_FILE / 1024 ** 3))
+        total += entry['taille']
+        scripts += entry['nom'].lower().endswith('.ts4script')
+        copies.append({'index': index[id(entry)], 'entree': entry, 'cible': mods_dir.joinpath(*parts),
+                       'remplaces': [mods_dir / g['chemin'] for g in replaced]})
+    if total > MAX_SYNC_TOTAL:
+        raise mods_cmp.ModsError('Trop de mods à copier : {:.1f} Go (maximum {:.0f} Go).'.format(
+            total / 1024 ** 3, MAX_SYNC_TOTAL / 1024 ** 3))
+    if copies and shutil.disk_usage(mods_dir).free < total + DISK_MARGIN:
+        raise mods_cmp.ModsError('Espace disque insuffisant pour copier {:.1f} Go de mods.'.format(total / 1e9))
+    if copies and is_running():
+        raise RoomError('Fermez Les Sims 4 avant de copier les mods.')
+    lines = mods_cmp.report_lines(result, '{}:{}'.format(ip, port))[:-1]
+    lines.append('À copier depuis l\'hôte : {} fichier(s), {:.1f} Mo, dont {} script(s) .ts4script.'.format(
+        len(copies), total / 1e6, scripts))
+    replaced = sum(len(c['remplaces']) for c in copies)
+    if replaced:
+        lines.append('{} de vos fichiers seront remplacés (rangés d\'abord dans sims4mp_backups).'.format(replaced))
+    if result['en_plus']:
+        lines.append('Vos {} mod(s) en plus ne sont pas touchés.'.format(len(result['en_plus'])))
+    plan = {'mods_dir': mods_dir, 'copier': copies, 'total': total, 'scripts': scripts}
+    return lines, plan
+
+
+def apply_mods_sync(ip, port, code, session, plan, backup_root, temp_dir, is_running=None):
+    """Copie les mods prevus : chaque fichier est telecharge et verifie (taille, SHA-256)
+    avant d'etre ecrit dans Mods ; les fichiers remplaces vont d'abord dans
+    sims4mp_backups/mods_AAAAMMJJ_HHMMSS/. Renvoie (lignes, statut_court)."""
+    code = validate_room_code(code)
+    is_running = is_running or core.game_is_running
+    mods_dir, copies = Path(plan['mods_dir']), plan['copier']
+    if not copies:
+        return ['Mods identiques à ceux de l\'hôte : rien à copier.'], 'Mods déjà identiques'
+    if is_running():
+        raise RoomError('Fermez Les Sims 4 avant de copier les mods.')
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup = Path(backup_root) / 'mods_{}'.format(stamp)
+    n = 2
+    while backup.exists():
+        backup = Path(backup_root) / 'mods_{}_{}'.format(stamp, n)
+        n += 1
+    done, saved = 0, 0
+    lines = []
+    try:
+        for copy in copies:
+            entry, target = copy['entree'], Path(copy['cible'])
+            received = _fetch_file(ip, port, code, session, '/modfile/{}'.format(copy['index']),
+                                   entry['taille'], entry['sha256'], temp_dir, entry['chemin'])
+            try:
+                if is_running():
+                    raise RoomError('Les Sims 4 a été lancé pendant la copie : arrêt.')
+                for old in copy['remplaces']:
+                    old = Path(old)
+                    if old.is_file():
+                        dest = backup / old.relative_to(mods_dir)
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(old), str(dest))
+                        saved += 1
+                if not target.resolve().is_relative_to(mods_dir.resolve()):
+                    raise RoomError('Chemin de mod hors du dossier Mods : refus.')
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    # Meme chemin qu'un fichier different (deja range ci-dessus si c'etait un mod).
+                    dest = backup / target.relative_to(mods_dir)
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(target), str(dest))
+                    saved += 1
+                part = target.with_name('.' + target.name + '.part')
+                shutil.copyfile(received, part)
+                if part.stat().st_size != entry['taille']:
+                    part.unlink()
+                    raise RoomError('Copie incomplète dans Mods : {}.'.format(entry['chemin']))
+                os.replace(part, target)
+                done += 1
+            finally:
+                try:
+                    received.unlink()
+                except OSError:
+                    pass
+    except BaseException as exc:
+        if isinstance(exc, core.LauncherError):
+            raise RoomError('{}\n{} mod(s) copié(s) avant l\'arrêt ; fichiers remplacés rangés dans {}.'.format(
+                str(exc), done, backup)) from None
+        raise
+    lines.append('{} mod(s) copié(s) depuis l\'hôte et vérifiés (taille et SHA-256).'.format(done))
+    if saved:
+        lines.append('{} fichier(s) remplacé(s), rangé(s) dans {}'.format(saved, backup))
+    lines.append('Relancez Les Sims 4 pour charger les nouveaux mods.')
+    return lines, 'Mods copiés ({})'.format(done)
+
+
 def plan_join(info, documents, is_running=None):
     """Ce qui serait fait, sans rien ecrire (« Verifier sans copier »).
     Renvoie (lignes, plan) ; refuse si le jeu tourne ou si les mods different."""
@@ -783,13 +955,20 @@ def plan_join(info, documents, is_running=None):
 
 
 def _download(ip, port, code, session, info, temp_dir, timeout_per_mb=2.0):
+    return _fetch_file(ip, port, code, session, '/save', info['taille'], info['sha256'], temp_dir,
+                       'la sauvegarde reçue', timeout_per_mb)
+
+
+def _fetch_file(ip, port, code, session, url_path, size, sha256, temp_dir, what, timeout_per_mb=2.0):
+    """Telecharge dans un fichier temporaire de temp_dir, verifie taille et SHA-256 ; renvoie son chemin."""
+    info = {'taille': size, 'sha256': sha256}
     deadline = time.monotonic() + 30 + timeout_per_mb * info['taille'] / 1e6
     headers = _session_headers(session)
     fd, tmp = tempfile.mkstemp(prefix='sims4mp_room_', suffix='.part', dir=str(temp_dir))
     tmp = Path(tmp)
     try:
         try:
-            conn, response = _request(ip, port, code, '/save', CONNECT_TIMEOUT, headers)
+            conn, response = _request(ip, port, code, url_path, CONNECT_TIMEOUT, headers)
         except (OSError, http.client.HTTPException) as exc:
             raise RoomError('Room injoignable pendant le téléchargement : {}'.format(exc)) from None
         try:
@@ -816,7 +995,7 @@ def _download(ip, port, code, session, info, temp_dir, timeout_per_mb=2.0):
             raise RoomError('Téléchargement incomplet : {} octets reçus, {} attendus.'.format(
                 total, info['taille']))
         if core.sha256_of(tmp) != info['sha256']:
-            raise RoomError('SHA-256 incorrect : la sauvegarde reçue est refusée.')
+            raise RoomError('SHA-256 incorrect, fichier refusé : {}.'.format(what))
     except BaseException:
         if fd is not None:
             os.close(fd)

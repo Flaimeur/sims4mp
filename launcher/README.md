@@ -62,6 +62,13 @@ une fois acceptée.
   toutes vos sauvegardes sont copiées dans `sims4mp_backups\saves_AAAAMMJJ_HHMMSS\`, puis la partie
   est installée dans un slot réservé Sims4MP (`Slot_534d5000.save`). Vos autres parties ne sont pas modifiées.
 
+- **Copier les mods de l'hôte** : compare vos mods (`.package`, `.ts4script`) à ceux de l'hôte
+  (SHA-256), puis, après confirmation, copie ceux qui manquent ou diffèrent. Chaque fichier est vérifié
+  (taille, SHA-256) avant d'être écrit dans Mods ; vos fichiers remplacés sont d'abord rangés dans
+  `sims4mp_backups/mods_AAAAMMJJ_HHMMSS/`. Vos mods en plus ne sont pas touchés. Le jeu doit être fermé.
+  **Attention** : les `.ts4script` sont du code qui s'exécutera dans votre jeu ; ne copiez que les mods
+  d'un hôte de confiance. Limites : 2 Go par fichier, 20 Go en tout.
+
 Ensuite, lancez le jeu et chargez cette partie. Les actions en jeu ne sont pas encore synchronisées :
 les deux parties évoluent séparément après le chargement. Sécurité : seulement des adresses de réseau
 privé avec le bon code ; la room se verrouille après 5 codes faux. Le transfert n'est pas chiffré.

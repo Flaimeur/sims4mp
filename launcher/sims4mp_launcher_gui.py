@@ -1588,6 +1588,8 @@ class LauncherApp:
         self.join_room_button = ttk.Button(buttons, text='Rejoindre la room', style='Accent.TButton',
                                            command=self._join_room)
         self.join_room_button.grid(row=0, column=1, sticky='ew', padx=(GAP // 2, 0))
+        self.sync_mods_button = ttk.Button(buttons, text='Copier les mods de l\'hôte', command=self._sync_mods)
+        self.sync_mods_button.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(GAP, 0))
         ttk.Label(join, style='Muted.TLabel', wraplength=400, justify='left',
                   text='La partie reçue va dans un slot réservé Sims4MP ; vos sauvegardes sont '
                        'copiées avant. Port : Options → Réseau (le même que l\'hôte).').grid(
@@ -2035,7 +2037,7 @@ class LauncherApp:
         self.save_box.configure(state='disabled' if opened else 'readonly')
         self.close_room_button.configure(state='normal' if opened else 'disabled')
         self.copy_room_button.configure(state='normal' if opened else 'disabled')
-        for button in (self.check_room_button, self.join_room_button):
+        for button in (self.check_room_button, self.join_room_button, self.sync_mods_button):
             button.configure(state='disabled' if busy else 'normal')
         # Room fermee : choix de la partie ; ouverte : le code en grand. Une seule vue
         # affichee (superposees, la plus grande depasserait de l'autre).
@@ -2073,8 +2075,10 @@ class LauncherApp:
             version = read_mod_version(mod) if mod.is_file() else None
             if version in (None, 'inconnue'):
                 raise LauncherError('Installez le mod Sims4MP (page Mod) avant de créer la room.')
+            # Liste des mods avec SHA-256 (cache a cote du lanceur) : l'invite peut comparer et copier.
             server = room.RoomServer(save, room.saves_dir(documents), base_dir() / 'sims4mp_room',
-                                     version, bind_ip, port)
+                                     version, bind_ip, port, mods_dir=find_mods_dir(documents), mods_sha=True,
+                                     mods_cache=base_dir() / 'sims4mp_mods_cache.json')
             info = server.prepare()
             try:
                 server.start()
@@ -2221,7 +2225,7 @@ class LauncherApp:
             self.show('L\'hôte a accepté votre demande.', 'ok')
         if agreement == 'accepte' and presence['pending']:
             action, presence['pending'] = presence['pending'], None
-            (self._run_check if action == 'check' else self._run_join)()
+            self._room_actions()[action]()
 
     def _presence_tick(self):
         """Toutes les 2 s : traite la derniere reponse, puis envoie la presence (tache de fond)."""
@@ -2351,7 +2355,7 @@ class LauncherApp:
             self._auto_save(ROLE_JOIN)
         self._start_presence(ip, port, code)
         if self.presence['accord'] == 'accepte':
-            (self._run_check if action == 'check' else self._run_join)()
+            self._room_actions()[action]()
             return
         self.presence['pending'] = action
         self.show('Demande envoyée à l\'hôte : en attente de son accord (rien n\'est lu avant).')
@@ -2363,6 +2367,46 @@ class LauncherApp:
 
     def _join_room(self):
         self._request_room('join')
+
+    def _sync_mods(self):
+        self._request_room('mods')
+
+    def _room_actions(self):
+        return {'check': self._run_check, 'join': self._run_join, 'mods': self._run_mods}
+
+    def _run_mods(self):
+        import sims4mp_room as room
+        p, documents = self.presence, self._documents()
+
+        def task():
+            lines, plan = room.plan_mods_sync(p['ip'], p['port'], p['code'], p['session'], documents, base_dir())
+            self._mods_plan = (p['ip'], p['port'], p['code'], p['session'], plan, lines)
+            if not plan['copier']:
+                return lines + ['Rien à copier : vos mods sont ceux de l\'hôte.'], 'Mods identiques à l\'hôte'
+            return lines, 'Mods comparés : confirmation demandée'
+        self._mods_plan = None
+        self._start_task('Comparaison des mods (SHA-256)...', lambda: self._run_worker(task),
+                         after=self._confirm_mods)
+
+    def _confirm_mods(self):
+        """Rien n'est copie dans Mods sans un « Oui » explicite."""
+        import sims4mp_room as room
+        ip, port, code, session, plan, lines = self._mods_plan
+        if not plan['copier']:
+            return
+        warning = ('\n\nATTENTION : {} script(s) .ts4script, c\'est du code qui s\'exécutera dans votre jeu. '
+                   'Ne copiez que les mods d\'un hôte de confiance.'.format(plan['scripts'])
+                   if plan['scripts'] else '')
+        text = ('{} fichier(s) à copier depuis l\'hôte ({:.1f} Mo).{}\n\nChaque fichier est vérifié '
+                '(taille, SHA-256) ; vos fichiers remplacés sont d\'abord rangés dans sims4mp_backups. '
+                'Vos mods en plus ne sont pas touchés.\n\nCopier les mods ?').format(
+            len(plan['copier']), plan['total'] / 1e6, warning)
+        if not self._confirm('Copier les mods de l\'hôte', text):
+            self.show('Copie des mods : annulée, rien n\'a été écrit.')
+            self.set_status('Annulé : rien n\'a été écrit')
+            return
+        self._start_task('Copie des mods...', lambda: self._run_worker(
+            lambda: room.apply_mods_sync(ip, port, code, session, plan, base_dir() / BACKUP_DIR_NAME, base_dir())))
 
     def _run_check(self):
         import sims4mp_room as room
