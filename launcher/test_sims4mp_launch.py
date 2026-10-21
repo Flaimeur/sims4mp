@@ -83,6 +83,9 @@ class LogoTest(unittest.TestCase):
         self.root.withdraw()
         self.addCleanup(self.root.destroy)
 
+    # sims4mp_assets.py (image d'EA) n'est pas dans le depot : test ignore sur une copie fraiche.
+    @unittest.skipUnless((Path(__file__).resolve().parent / 'sims4mp_assets.py').is_file(),
+                         'sims4mp_assets.py absent (non publie)')
     def test_embedded_plumbob_loads(self):
         app = gui.LauncherApp(self.root, documents=self.tmp)
         self.assertIsNotNone(app.logo_image)

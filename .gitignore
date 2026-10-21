@@ -13,3 +13,7 @@ sims4mp_settings.json
 sims4mp_launcher_config.json
 *.part
 *.save
+
+# Images d'EA : jamais dans le depot (le lanceur affiche alors son losange dessine)
+download_logo/
+sims4mp_assets.py

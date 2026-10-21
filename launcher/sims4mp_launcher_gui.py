@@ -12,6 +12,7 @@
 # Mods, une verification SHA-256 en plus de la taille, et un remplacement
 # atomique (l'ancien mod reste en place si une etape echoue).
 
+import collections
 import ctypes
 import datetime
 import hashlib
@@ -455,13 +456,306 @@ def run_install(source, documents, backup_dir, is_running=game_is_running):
     return lines
 
 
-def launch_game(is_running=game_is_running, start=os.startfile):
-    """Lance Les Sims 4 via Steam, sans attendre le jeu. Refuse s'il tourne deja."""
+def launch_game(is_running=game_is_running, start=os.startfile, target=STEAM_GAME_URL):
+    """Lance Les Sims 4 (Steam par defaut, ou le .exe detecte pour l'app EA),
+    sans attendre le jeu. Refuse s'il tourne deja."""
     if is_running():
         raise LauncherError('Les Sims 4 est deja lance ({} en cours d\'execution).'.format(GAME_PROCESS))
-    start(STEAM_GAME_URL)
-    return ['Lancement des Sims 4 via Steam ({}).'.format(STEAM_GAME_URL),
-            'Si rien ne s\'ouvre, verifiez que Steam est installe et connecte.']
+    start(target)
+    if target == STEAM_GAME_URL:
+        return ['Lancement des Sims 4 via Steam ({}).'.format(STEAM_GAME_URL),
+                'Si rien ne s\'ouvre, verifiez que Steam est installe et connecte.']
+    return ['Lancement des Sims 4 : {}'.format(target),
+            'Si rien ne s\'ouvre, ouvrez l\'app EA et lancez le jeu depuis celle-ci.']
+
+
+# --- Restauration d'un ancien mod (sims4mp_backups) -------------------------
+
+# Noms crees par install_mod : sims4mp_hello_AAAAMMJJ_HHMMSS[_n].ts4script
+BACKUP_PATTERN = re.compile(r'sims4mp_hello_(\d{8})_(\d{6})(?:_\d+)?\.ts4script')
+
+
+def list_backups(backup_dir):
+    """Sauvegardes du mod, de la plus recente a la plus ancienne."""
+    folder = Path(backup_dir)
+    if not folder.is_dir():
+        return []
+    found = [p for p in folder.iterdir()
+             if BACKUP_PATTERN.fullmatch(p.name) and p.is_file() and not p.is_symlink()]
+    return sorted(found, key=lambda p: p.name, reverse=True)
+
+
+def backup_label(path):
+    """'21/10/2026 18:36:38 · version 0.4.0 · 37429 octets'"""
+    match = BACKUP_PATTERN.fullmatch(Path(path).name)
+    day, hour = match.group(1), match.group(2)
+    when = '{}/{}/{} {}:{}:{}'.format(day[6:], day[4:6], day[:4], hour[:2], hour[2:4], hour[4:])
+    return '{} · version {} · {} octets'.format(when, read_mod_version(path), Path(path).stat().st_size)
+
+
+def run_restore(backup, documents, backup_dir, is_running=game_is_running):
+    """Remet une sauvegarde dans Mods (copie .part puis os.replace), apres
+    avoir sauvegarde le mod actuel. Renvoie (lignes, statut_court)."""
+    backup, backup_dir = Path(backup), Path(backup_dir)
+    # Uniquement un fichier de sims4mp_backups, avec un nom cree par le lanceur.
+    if (not BACKUP_PATTERN.fullmatch(backup.name) or not backup.is_file()
+            or backup.parent.resolve() != backup_dir.resolve()):
+        raise LauncherError('Sauvegarde invalide : {}'.format(backup))
+    if not zipfile.is_zipfile(backup):
+        raise LauncherError('Sauvegarde illisible (pas une archive .ts4script) : {}'.format(backup.name))
+    version = read_mod_version(backup)
+    lines = ['Sauvegarde choisie : {} (version {})'.format(backup.name, version)]
+    mods_dir = find_mods_dir(documents)
+    lines.append('Dossier Mods : {}'.format(mods_dir))
+    if is_running():
+        raise LauncherError('Fermez Les Sims 4 ({} est en cours d\'execution), '
+                            'puis recommencez.'.format(GAME_PROCESS))
+    current = mods_dir / MOD_FILE
+    if current.is_file() and sha256_of(current) == sha256_of(backup):
+        lines.append('Ce mod est deja en place (fichier identique) : rien a faire.')
+        return lines, 'Déjà en place ({})'.format(version)
+    target, saved, digest = install_mod(backup, mods_dir, backup_dir)
+    lines.append('Mod remis : {} ({} octets, SHA-256 {}...)'.format(
+        target, target.stat().st_size, digest[:16]))
+    lines.append('Mod remplace sauvegarde : {}'.format(saved or 'aucun (pas de mod en place)'))
+    lines.append('Version du mod installe : {}'.format(version))
+    return lines, 'Ancien mod restauré ({})'.format(version)
+
+
+# --- Detection de l'installation du jeu (lecture seule) ---------------------
+
+STEAM_APP_ID = '1222670'
+GameInstall = collections.namedtuple('GameInstall', 'kind exe')     # kind : 'steam', 'ea' ou None
+GAME_KIND_LABELS = {'steam': 'Steam', 'ea': 'EA app', None: 'introuvable'}
+_REGISTRY_HIVES = {'HKCU': 'HKEY_CURRENT_USER', 'HKLM': 'HKEY_LOCAL_MACHINE'}
+
+
+def read_registry_value(hive, key, name):
+    """Valeur texte du registre, ou None. Lecture seule."""
+    try:
+        import winreg
+        root = getattr(winreg, _REGISTRY_HIVES[hive])
+        with winreg.OpenKey(root, key, 0, winreg.KEY_READ) as handle:
+            value, kind = winreg.QueryValueEx(handle, name)
+    except (OSError, ImportError, KeyError):
+        return None
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _vdf_values(text, key):
+    """Valeurs d'une cle dans un fichier texte Steam (.vdf / .acf)."""
+    raw = re.findall(r'"{}"\s+"((?:[^"\\]|\\.)*)"'.format(re.escape(key)), text, re.IGNORECASE)
+    return [re.sub(r'\\(.)', r'\1', value) for value in raw]
+
+
+def _read_text(path):
+    try:
+        return Path(path).read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return ''
+
+
+def steam_libraries(reg=read_registry_value):
+    """Dossiers de bibliotheques Steam, d'apres le registre et libraryfolders.vdf."""
+    roots = [reg('HKCU', r'Software\Valve\Steam', 'SteamPath'),
+             reg('HKLM', r'SOFTWARE\WOW6432Node\Valve\Steam', 'InstallPath'),
+             reg('HKLM', r'SOFTWARE\Valve\Steam', 'InstallPath')]
+    libraries = []
+    for root in [r for r in roots if r]:
+        root = Path(root)
+        vdf = root / 'steamapps' / 'libraryfolders.vdf'
+        for folder in [root] + [Path(p) for p in _vdf_values(_read_text(vdf), 'path')]:
+            if folder.is_dir() and all(os.path.normcase(str(folder)) != os.path.normcase(str(f))
+                                       for f in libraries):
+                libraries.append(folder)
+    return libraries
+
+
+def _is_within(path, folder):
+    try:
+        Path(path).resolve().relative_to(Path(folder).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def detect_game(reg=read_registry_value):
+    """Cherche TS4_x64.exe : bibliotheques Steam d'abord, puis la cle Maxis
+    (installation EA app). Ne lance rien."""
+    libraries = steam_libraries(reg)
+    for library in libraries:
+        acf = library / 'steamapps' / 'appmanifest_{}.acf'.format(STEAM_APP_ID)
+        for installdir in _vdf_values(_read_text(acf), 'installdir'):
+            if not re.fullmatch(r'[^\\/:*?"<>|]+', installdir) or installdir.strip('. ') == '':
+                continue
+            exe = library / 'steamapps' / 'common' / installdir / 'Game' / 'Bin' / GAME_PROCESS
+            if exe.is_file():
+                return GameInstall('steam', exe)
+    for key in (r'SOFTWARE\Maxis\The Sims 4', r'SOFTWARE\WOW6432Node\Maxis\The Sims 4'):
+        folder = reg('HKLM', key, 'Install Dir')
+        if not folder:
+            continue
+        exe = Path(folder) / 'Game' / 'Bin' / GAME_PROCESS
+        if exe.is_file():
+            # La cle Maxis existe aussi pour Steam : on classe d'apres l'emplacement.
+            steam = any(_is_within(exe, library) for library in libraries)
+            return GameInstall('steam' if steam else 'ea', exe)
+    return GameInstall(None, None)
+
+
+def game_target(game):
+    """Ce que launch_game ouvre pour l'installation detectee."""
+    return str(game.exe) if game.kind == 'ea' else STEAM_GAME_URL
+
+
+# --- Diagnostic (lecture seule) ----------------------------------------------
+
+JOIN_HELP = ('le port ne répond pas : vérifiez que le host a lancé mp.host '
+             'et que le pare-feu autorise le réseau privé')
+
+
+def decode_console(data):
+    """Sortie d'une commande Windows : UTF-8 (netsh recent) sinon page de code OEM."""
+    try:
+        return data.decode('utf-8')
+    except UnicodeDecodeError:
+        return data.decode('oem', errors='replace')
+
+
+def _run_quiet(args):
+    """Commande Windows a arguments fixes (jamais construits depuis le reseau)."""
+    proc = subprocess.run(args, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW, timeout=15)
+    if proc.returncode != 0:
+        raise LauncherError('{} a echoue (code {}).'.format(args[0], proc.returncode))
+    return decode_console(proc.stdout)
+
+
+def listening_pids(port, run=_run_quiet):
+    """PID des programmes qui ecoutent deja en TCP sur ce port (netstat, sans ouvrir de port)."""
+    port = validate_port(port)
+    pids = []
+    for line in run(['netstat', '-ano', '-p', 'TCP']).splitlines():
+        parts = line.split()
+        # TCP <local> <distante> <etat> <pid> ; une ecoute a une adresse distante en :0.
+        if (len(parts) == 5 and parts[0].upper() == 'TCP' and parts[1].endswith(':{}'.format(port))
+                and parts[2].endswith(':0') and parts[4].isdigit() and int(parts[4]) not in pids):
+            pids.append(int(parts[4]))
+    return pids
+
+
+def process_name(pid, run=_run_quiet):
+    output = run(['tasklist', '/FI', 'PID eq {}'.format(int(pid)), '/FO', 'CSV', '/NH'])
+    match = re.match(r'\s*"([^"]+)"', output)
+    return match.group(1) if match else 'PID {}'.format(int(pid))
+
+
+def firewall_profiles(run=_run_quiet):
+    """[(profil, etat)] d'apres netsh advfirewall, quelle que soit la langue de Windows."""
+    profiles, current = [], None
+    for line in run(['netsh', 'advfirewall', 'show', 'allprofiles', 'state']).splitlines():
+        text = line.strip()
+        if not text or set(text) <= {'-'}:
+            continue
+        if text.endswith(':'):
+            current = text.rstrip(': ').strip()
+        elif current:
+            pieces = re.split(r'\s{2,}', text)
+            if len(pieces) >= 2:
+                profiles.append((current, pieces[-1]))
+                current = None
+    return profiles
+
+
+def tcp_probe(ip, port, timeout=3, connect=socket.create_connection):
+    """(True, 'Joignable') ou (False, message d'aide). Un seul essai, sans envoyer de donnees."""
+    try:
+        sock = connect((validate_ipv4(ip), validate_port(port)), timeout=timeout)
+    except (OSError, ValueError):
+        return False, JOIN_HELP
+    sock.close()
+    return True, 'Joignable'
+
+
+def run_diagnostic(documents, is_running=game_is_running, list_ips=local_ipv4_addresses,
+                   listeners=listening_pids, proc_name=process_name, firewall=firewall_profiles,
+                   probe=tcp_probe):
+    """Resume en lecture seule. Le test TCP n'a lieu qu'en mode Rejoindre."""
+    lines, warnings = [], 0
+
+    def warn(text):
+        nonlocal warnings
+        warnings += 1
+        lines.append('ATTENTION : ' + text)
+
+    try:
+        mods_dir = find_mods_dir(documents)
+        mod = mods_dir / MOD_FILE
+        if mod.is_file():
+            lines.append('Mod : present, version {} ({})'.format(read_mod_version(mod), mod))
+        else:
+            warn('mod absent du dossier Mods ({})'.format(mods_dir))
+    except LauncherError as exc:
+        warn('dossier Mods : {}'.format(str(exc).splitlines()[0]))
+
+    try:
+        lines.append('Jeu : {}'.format('ouvert' if is_running() else 'ferme'))
+    except LauncherError as exc:
+        warn(str(exc))
+
+    try:
+        settings = read_settings(settings_path(documents))
+    except ValueError as exc:
+        settings = None
+        warn('reglage invalide : {}'.format(exc))
+    else:
+        if settings is None:
+            warn('aucun reglage enregistre (page Connexion)')
+        else:
+            lines.append('Reglage : {}, IP {}, port {}'.format(
+                'Heberger' if settings['role'] == ROLE_HOST else 'Rejoindre',
+                settings['ip'] or '-', settings['port']))
+
+    ips = list_ips()
+    lines.append('IP locales : {}'.format(', '.join(ips) if ips else 'aucune'))
+
+    if settings and settings['role'] == ROLE_HOST:
+        try:
+            pids = listeners(settings['port'])
+        except (LauncherError, OSError, subprocess.SubprocessError) as exc:
+            warn('ecoute du port {} : verification impossible ({})'.format(settings['port'], exc))
+        else:
+            if not pids:
+                lines.append('Port {} : libre (aucune application n\'ecoute)'.format(settings['port']))
+            for pid in pids:
+                name = proc_name(pid)
+                if name.lower() == GAME_PROCESS.lower():
+                    lines.append('Port {} : ecoute par Les Sims 4 (mp.host actif)'.format(settings['port']))
+                else:
+                    warn('port {} deja utilise par {} (PID {})'.format(settings['port'], name, pid))
+
+    try:
+        profiles = firewall()
+    except (LauncherError, OSError, subprocess.SubprocessError) as exc:
+        warn('pare-feu : etat illisible ({})'.format(exc))
+    else:
+        for profile, state in profiles:
+            lines.append('Pare-feu, {} : {}'.format(profile, state))
+        if not profiles:
+            warn('pare-feu : etat illisible')
+
+    if settings and settings['role'] == ROLE_JOIN:
+        ok, message = probe(settings['ip'], settings['port'])
+        target = '{}:{}'.format(settings['ip'], settings['port'])
+        if ok:
+            lines.append('Hote {} : {}'.format(target, message))
+        else:
+            warn('hote {} : {}'.format(target, message))
+
+    if warnings:
+        lines.append('Resultat : {} point(s) a verifier.'.format(warnings))
+        return lines, 'Diagnostic : {} point(s) à vérifier'.format(warnings)
+    lines.append('Resultat : tout est en ordre.')
+    return lines, 'Diagnostic : tout est en ordre'
 
 
 # --- Mise a jour depuis une Release GitHub ----------------------------------
@@ -715,6 +1009,20 @@ LAN_PREFIXES = ('192.168.1.',)
 VIRTUAL_PREFIXES = ('192.168.147.', '192.168.49.')
 
 
+# Aide du bouton « ? » : 10 lignes au plus (le guide complet est launcher/README.md).
+HELP_TEXT = '\n'.join([
+    '1. Gardez l\'exe et sims4mp_hello.ts4script dans le même dossier (pas dans Program Files).',
+    '2. Mod → Installer le mod, jeu fermé. L\'ancien mod est sauvegardé.',
+    '3. Hôte : Connexion → Héberger → Enregistrer, puis copiez et envoyez votre IP.',
+    '4. Invité : Connexion → Rejoindre, IP et port de l\'hôte → Enregistrer.',
+    '5. Lancer Les Sims 4. En jeu (Ctrl+Maj+C) : l\'hôte tape mp.host, l\'invité mp.join <ip>.',
+    '6. Pare-feu : n\'autorisez le jeu que sur les réseaux privés.',
+    '7. Un souci ? Options → Diagnostic, puis Ouvrir le journal.',
+    '8. Revenir en arrière : Mod → Restaurer l\'ancien mod.',
+    'Projet de fan, non affilié à EA. Gardez une copie de vos sauvegardes.',
+])
+
+
 def ip_label(ip):
     if ip.startswith(VIRTUAL_PREFIXES):
         return LABEL_VIRTUAL
@@ -792,6 +1100,10 @@ def apply_style(root):
               background=[('disabled', COLOR_BUTTON), ('active', COLOR_ACCENT_HOVER)],
               foreground=[('disabled', COLOR_MUTED)],
               lightcolor=[('active', COLOR_ACCENT_HOVER)], darkcolor=[('active', COLOR_ACCENT_HOVER)])
+    style.configure('Help.TButton', background=COLOR_SIDEBAR, foreground=COLOR_MUTED, padding=(4, 1),
+                    bordercolor=COLOR_BORDER, lightcolor=COLOR_SIDEBAR, darkcolor=COLOR_SIDEBAR, font=bold)
+    style.map('Help.TButton', background=[('active', COLOR_NAV_ACTIVE)], foreground=[('active', COLOR_ACCENT)],
+              bordercolor=[('active', COLOR_ACCENT)])
     # Bouton Jouer : vert du losange, pour le distinguer des actions bleues.
     style.configure('Play.TButton', background='#2fa83a', foreground='#ffffff', padding=(14, 10),
                     bordercolor='#2fa83a', lightcolor='#2fa83a', darkcolor='#2fa83a', font=bold)
@@ -836,6 +1148,14 @@ def apply_style(root):
     style.map('TEntry', fieldbackground=[('disabled', '#eef2f6')], foreground=[('disabled', COLOR_MUTED)],
               bordercolor=[('focus', COLOR_ACCENT)], lightcolor=[('focus', COLOR_FIELD)])
 
+    style.configure('TCombobox', fieldbackground=COLOR_FIELD, foreground=COLOR_TEXT, background=COLOR_BUTTON,
+                    bordercolor=COLOR_BORDER, lightcolor=COLOR_FIELD, darkcolor=COLOR_FIELD,
+                    arrowcolor=COLOR_MUTED, padding=(8, 5))
+    style.map('TCombobox', fieldbackground=[('readonly', COLOR_FIELD), ('disabled', '#eef2f6')],
+              foreground=[('disabled', COLOR_MUTED)], bordercolor=[('focus', COLOR_ACCENT)],
+              selectbackground=[('readonly', COLOR_FIELD)], selectforeground=[('readonly', COLOR_TEXT)])
+    root.option_add('*TCombobox*Listbox.font', (FONT_FAMILY, FONT_SIZE))
+    root.option_add('*TCombobox*Listbox.selectBackground', COLOR_ACCENT)
     style.configure('Vertical.TScrollbar', background='#cbd5e1', troughcolor=COLOR_FIELD,
                     bordercolor=COLOR_FIELD, arrowcolor=COLOR_MUTED, lightcolor='#cbd5e1',
                     darkcolor='#cbd5e1', arrowsize=12)
@@ -912,7 +1232,12 @@ class LauncherApp:
         ttk.Label(titles, text='Sims4MP', style='SideTitle.TLabel').pack(anchor='w')
         ttk.Label(titles, text='Lanceur multijoueur', style='SideSub.TLabel').pack(anchor='w')
 
-        ttk.Label(side, text='MENU', style='SideSection.TLabel').pack(anchor='w', padx=PAD + 8, pady=(0, GAP))
+        menu_row = ttk.Frame(side, style='Side.TFrame')
+        menu_row.pack(fill='x', padx=(PAD + 8, PAD), pady=(0, GAP))
+        ttk.Label(menu_row, text='MENU', style='SideSection.TLabel').pack(side='left')
+        self.help_button = ttk.Button(menu_row, text='?', style='Help.TButton', width=2, takefocus=False,
+                                      command=self._show_help)
+        self.help_button.pack(side='right')
         self.nav = {}
         for key, text in [('connexion', 'Connexion'), ('mod', 'Mod'), ('options', 'Options')]:
             row = ttk.Frame(side, style='Side.TFrame')
@@ -928,9 +1253,13 @@ class LauncherApp:
             side='bottom', anchor='w', padx=PAD + 8, pady=(GAP, PAD + 4))
         quit_row = ttk.Frame(side, style='Side.TFrame')
         quit_row.pack(side='bottom', fill='x', padx=PAD - 2)
+        # Explication sous le bouton Jouer quand le jeu est introuvable (vide sinon).
+        self.play_hint = ttk.Label(side, style='SideMuted.TLabel', wraplength=SIDEBAR_WIDTH - 2 * PAD - 4,
+                                   justify='left')
+        self.play_hint.pack(side='bottom', fill='x', padx=PAD + 2, pady=(0, GAP))
         self.play_button = ttk.Button(side, text='▶  Lancer Les Sims 4', style='Play.TButton',
                                       command=self._launch_game)
-        self.play_button.pack(side='bottom', fill='x', padx=PAD + 2, pady=(0, PAD))
+        self.play_button.pack(side='bottom', fill='x', padx=PAD + 2, pady=(0, GAP))
         ttk.Frame(quit_row, style='NavBarOff.TFrame', width=3).pack(side='left', fill='y')
         ttk.Button(quit_row, text='Quitter', style='Nav.TButton', takefocus=False,
                    command=root.destroy).pack(side='left', fill='x', expand=True)
@@ -939,8 +1268,13 @@ class LauncherApp:
         # Zone de droite : barre d'etat en bas, contenu au-dessus.
         right = ttk.Frame(root, style='Bg.TFrame')
         right.pack(side='left', fill='both', expand=True)
-        self.status = ttk.Label(right, text='Prêt', style='Status.TLabel', anchor='w')
-        self.status.pack(side='bottom', fill='x')
+        status_bar = ttk.Frame(right, style='Bg.TFrame')
+        status_bar.pack(side='bottom', fill='x')
+        # A droite : l'installation du jeu detectee au demarrage.
+        self.game_status = ttk.Label(status_bar, style='Status.TLabel', anchor='e')
+        self.game_status.pack(side='right')
+        self.status = ttk.Label(status_bar, text='Prêt', style='Status.TLabel', anchor='w')
+        self.status.pack(side='left', fill='x', expand=True)
         ttk.Separator(right, orient='horizontal').pack(side='bottom', fill='x')
 
         content = ttk.Frame(right, style='Bg.TFrame', padding=PAD + 6)
@@ -1024,6 +1358,15 @@ class LauncherApp:
         ttk.Checkbutton(update, text='Autoriser le retour à une version plus ancienne',
                         variable=self.allow_downgrade).grid(row=4, column=0, sticky='w', pady=(GAP, 0))
 
+        restore = self._card(page, 'Restaurer l\'ancien mod', row=2)
+        restore.columnconfigure(0, weight=1)
+        self.backup_choice = tk.StringVar()
+        self.backup_box = ttk.Combobox(restore, textvariable=self.backup_choice, state='readonly')
+        self.backup_box.grid(row=1, column=0, sticky='ew', padx=(0, GAP))
+        self.restore_button = ttk.Button(restore, text='Restaurer', command=self._restore)
+        self.restore_button.grid(row=1, column=1, sticky='e')
+        self.backups = []              # chemins, dans l'ordre de la liste deroulante
+
         # Page OPTIONS : depot GitHub d'ou vient la mise a jour, et dossiers.
         page = self.pages['options']
         gh = self._card(page, 'GitHub', row=0)
@@ -1066,16 +1409,21 @@ class LauncherApp:
         for var in (self.repo, self.tag, self.tag_mode):
             var.trace_add('write', lambda *args: self._refresh_manifest_preview())
 
-        folders = self._card(page, 'Dossiers', row=1)
-        folders.columnconfigure(0, weight=1)
-        folders.columnconfigure(1, weight=1)
-        ttk.Button(folders, text='Dossier du lanceur', command=self._open_launcher_dir).grid(
-            row=1, column=0, sticky='ew', padx=(0, GAP // 2))
-        ttk.Button(folders, text='Dossier Mods', command=self._open_mods_dir).grid(
-            row=1, column=1, sticky='ew', padx=(GAP // 2, 0))
-        ttk.Label(folders, style='Muted.TLabel', wraplength=400, justify='left',
-                  text='Le dossier du lanceur contient launcher.log, sims4mp_backups et les options.').grid(
-            row=2, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
+        tools = self._card(page, 'Outils', row=1)
+        tools.columnconfigure(0, weight=1)
+        tools.columnconfigure(1, weight=1)
+        self.diag_button = ttk.Button(tools, text='Diagnostic', command=self._diagnostic)
+        self.diag_button.grid(row=1, column=0, sticky='ew', padx=(0, GAP // 2), pady=(0, GAP))
+        ttk.Button(tools, text='Ouvrir le journal', command=self._open_log).grid(
+            row=1, column=1, sticky='ew', padx=(GAP // 2, 0), pady=(0, GAP))
+        ttk.Button(tools, text='Dossier du lanceur', command=self._open_launcher_dir).grid(
+            row=2, column=0, sticky='ew', padx=(0, GAP // 2))
+        ttk.Button(tools, text='Dossier Mods', command=self._open_mods_dir).grid(
+            row=2, column=1, sticky='ew', padx=(GAP // 2, 0))
+        ttk.Label(tools, style='Muted.TLabel', wraplength=400, justify='left',
+                  text='Le diagnostic ne modifie rien. En mode Rejoindre, il tente une connexion '
+                       'de 3 s vers l\'hôte enregistré.').grid(
+            row=3, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
 
         # Journal, toujours visible a droite.
         box = ttk.Frame(content, style='Card.TFrame', padding=PAD + 2)
@@ -1102,7 +1450,10 @@ class LauncherApp:
         self._load_config()
         self._on_role()
         self._on_tag_mode()
-        center_window(root, 1040, 660)
+        self._refresh_backups()
+        self.game = detect_game()
+        self._apply_game_state()
+        center_window(root, 1040, 700)
 
     def _card(self, parent, title, row):
         """Carte sombre avec un titre vert ; renvoie le cadre interieur (grid)."""
@@ -1114,6 +1465,8 @@ class LauncherApp:
 
     def _show_page(self, key):
         self.pages[key].tkraise()
+        if key == 'mod' and hasattr(self, 'backups'):
+            self._refresh_backups()
         for name, (bar, button) in self.nav.items():
             active = name == key
             bar.configure(style='NavBarOn.TFrame' if active else 'NavBarOff.TFrame')
@@ -1247,8 +1600,80 @@ class LauncherApp:
         self._start_task('Lecture du manifeste...', lambda: self._run_worker(task))
 
     def _launch_game(self):
+        if self.game.kind is None:
+            return
+        target = game_target(self.game)
+        summary = 'Jeu lancé via {}'.format(GAME_KIND_LABELS[self.game.kind])
+        if target == STEAM_GAME_URL:
+            start = launch_game                     # cible par defaut : Steam
+        else:
+            def start():
+                return launch_game(target=target)
         self._start_task('Lancement des Sims 4...',
-                         lambda: self._run_worker(lambda: (launch_game(), 'Jeu lancé via Steam')))
+                         lambda: self._run_worker(lambda: (start(), summary)))
+
+    # -- installation du jeu --
+    def _apply_game_state(self):
+        """Barre d'etat et bouton Jouer d'apres l'installation detectee."""
+        found = self.game.kind is not None
+        self.game_status.configure(text='Jeu : {}'.format(
+            GAME_KIND_LABELS[self.game.kind] if found else 'introuvable'))
+        self.play_button.configure(state='normal' if found and not self.installing else 'disabled')
+        self.play_hint.configure(text='' if found else
+                                 'Jeu introuvable : installez Les Sims 4 avec Steam ou l\'app EA, '
+                                 'puis rouvrez le lanceur.')
+
+    # -- restauration --
+    def _refresh_backups(self):
+        try:
+            self.backups = list_backups(base_dir() / BACKUP_DIR_NAME)
+            labels = [backup_label(p) for p in self.backups]
+        except OSError as exc:
+            self.backups, labels = [], []
+            self.show('Sauvegardes illisibles : {}'.format(exc), 'error')
+        self.backup_box.configure(values=labels)
+        self.backup_choice.set(labels[0] if labels else '')
+        self.restore_button.configure(state='normal' if labels and not self.installing else 'disabled')
+
+    def _show_help(self):
+        from tkinter import messagebox
+        messagebox.showinfo('Aide Sims4MP', HELP_TEXT, parent=self.root)
+
+    def _confirm(self, title, text):
+        from tkinter import messagebox
+        return messagebox.askyesno(title, text, parent=self.root, icon='warning')
+
+    def _restore(self):
+        index = self.backup_box.current()
+        if index < 0 or index >= len(self.backups):
+            self.show('Choisissez une sauvegarde dans la liste.', 'error')
+            self.set_status('Aucune sauvegarde choisie', 'error')
+            return
+        backup = self.backups[index]
+        if not self._confirm('Restaurer l\'ancien mod',
+                             'Remettre ce mod dans le dossier Mods ?\n\n{}\n\n'
+                             'Le mod actuel sera d\'abord sauvegardé.'.format(self.backup_choice.get())):
+            self.show('Restauration annulee.')
+            return
+        documents = self._documents()
+        self._start_task('Restauration du mod...', lambda: self._run_worker(
+            lambda: run_restore(backup, documents, base_dir() / BACKUP_DIR_NAME)))
+
+    # -- outils --
+    def _diagnostic(self):
+        documents = self._documents()
+        self._start_task('Diagnostic en cours...',
+                         lambda: self._run_worker(lambda: run_diagnostic(documents)))
+
+    def _open_log(self):
+        path = base_dir() / LOG_NAME
+        if not path.exists():
+            log('Journal cree.')
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            self.show('Impossible d\'ouvrir le journal : {}'.format(exc), 'error')
+            self.set_status('Impossible d\'ouvrir le journal', 'error')
 
     def _open_launcher_dir(self):
         os.startfile(str(base_dir()))
@@ -1298,7 +1723,8 @@ class LauncherApp:
         if self.installing:
             return
         self.installing = True
-        for button in (self.install_button, self.update_button, self.check_button, self.play_button):
+        for button in (self.install_button, self.update_button, self.check_button, self.play_button,
+                       self.restore_button, self.diag_button):
             button.configure(state='disabled')
         self.show(message)
         self.set_status(message)
@@ -1357,8 +1783,11 @@ class LauncherApp:
         else:
             self.set_status(lines[0] if lines else 'Échec', 'error')
         self.installing = False
-        for button in (self.install_button, self.update_button, self.check_button, self.play_button):
+        for button in (self.install_button, self.update_button, self.check_button, self.diag_button):
             button.configure(state='normal')
+        # Ces deux boutons dependent d'un etat : jeu detecte, sauvegardes presentes.
+        self._apply_game_state()
+        self._refresh_backups()
 
 
 def main():

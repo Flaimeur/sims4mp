@@ -37,5 +37,6 @@ publiées en pré-version : dans le lanceur, choisir « Tag précis » dans Opti
 
 ## Mentions
 
-Le losange (plumbob) affiché par le lanceur (`launcher/sims4mp_assets.py`) est une image
-d'Electronic Arts, issue de luniversims.fr. Les Sims est une marque d'Electronic Arts.
+Aucune image d'Electronic Arts n'est fournie dans ce dépôt. Sans le fichier local
+`launcher/sims4mp_assets.py` (non publié), le lanceur affiche un losange qu'il dessine lui-même.
+Les Sims est une marque d'Electronic Arts. Guide d'utilisation : [launcher/README.md](launcher/README.md).
