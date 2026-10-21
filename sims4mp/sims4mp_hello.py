@@ -1,10 +1,13 @@
-# Sims 4 Multiplayer - etape M1 : role lu depuis le lanceur, connexion
-# automatique, notifications ; etat en lecture seule (mp.state).
+# Sims 4 Multiplayer - etape M3 : chaque joueur envoie la position de son Sim
+# actif (lecture seule, mp.positions). M2 : pause imposee tant que les deux
+# joueurs ne sont pas en jeu, file d'attente bloquee pendant l'attente. M1 : role lu
+# depuis le lanceur, connexion automatique, notifications ; etat en lecture
+# seule (mp.state).
 # Compatible Python 3.7 (version embarquee par Les Sims 4) : pas de walrus,
 # pas de match, pas d'annotations avancees.
 #
 # Commandes : mp.hello, mp.host [port], mp.join <ip> [port], mp.status,
-#             mp.ping, mp.state, mp.disconnect
+#             mp.ping, mp.state, mp.positions, mp.disconnect
 #
 # Connexion automatique (M1) : a la fin de chaque chargement de partie
 # (zone.Zone.on_loading_screen_animation_finished, verifie dans simulation.zip),
@@ -30,6 +33,35 @@
 # acces au jeu passent par la section "Pont vers le jeu" : lecture de l'heure
 # et affichage de notifications, sans modifier l'etat du jeu. Aucun thread :
 # la pompe tourne dans Zone.update, donc sur le thread principal.
+#
+# Attente de l'autre joueur (M2). Chaque mod envoie EVENT {"kind": "presence"}
+# toutes les PRESENCE_INTERVAL s pendant qu'il est en jeu (la pompe ne tourne
+# que dans Zone.update : un ecran de chargement ou le menu principal coupent
+# donc la presence). Tant qu'une partie a deux est prevue (session ou reglage
+# du lanceur) et que la presence de l'autre manque depuis PRESENCE_TIMEOUT s :
+#   - pause : services.game_clock_service().push_speed(ClockSpeedMode.PAUSED,
+#     source=GameSpeedChangeSource.SITUATION, ...) puis remove_request(...) a
+#     la fin. Verifie dans clock.pyc : game_speed_requests_gen parcourt les
+#     sources par valeur croissante (SITUATION=0 d'abord) ; le bouton Play
+#     passe par set_speed_internal (source GAMEPLAY=2) et les fenetres par
+#     UI_MODAL=1, donc la pause du mod l'emporte. Si une autre demande
+#     SITUATION la masque, elle est reposee au tick suivant.
+#   - file : interactions.interaction_queue.InteractionQueue.append est
+#     enveloppe ; une interaction is_user_directed (choix du joueur) est
+#     refusee avec TestResult(False, ...), comme append le fait lui-meme quand
+#     la file est verrouillee (verifie dans interaction_queue.pyc). Les actions
+#     autonomes et celles deja en file ne sont pas touchees.
+# mp.disconnect leve l'attente (jeu en solo).
+#
+# Positions (M3, lecture seule). Toutes les POSITION_INTERVAL s, chaque mod lit
+# le Sim actif et l'envoie s'il a bouge (EVENT {"kind": "position", ...}).
+# API verifiees dans simulation.zip : services.client_manager()
+# .get_first_client().active_sim ; ClientObjectMixin.position (.x/.y/.z) et
+# .level (routing_surface.secondary_id) ; sim.sim_info.sim_id ; sim.queue
+# (InteractionQueue, pose dans Sim.__init__) et queue.running -> .affordance
+# .__name__ ; services.sim_info_manager().get(sim_id). L'autre cote valide et
+# garde la derniere position ; mp.positions la compare au meme Sim local.
+# Rien n'est deplace.
 
 import functools
 import json
@@ -40,7 +72,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.5.0'
+MOD_VERSION = '0.7.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -55,6 +87,13 @@ SETTINGS_KEYS = frozenset(['role', 'ip', 'port'])
 SETTINGS_MAX_SIZE = 4096
 AUTO_PORT_MIN = 1024                      # memes bornes que le lanceur
 AUTO_RETRY_INTERVAL = 30.0                # secondes reelles entre deux tentatives
+PRESENCE_INTERVAL = 2.0                   # secondes reelles entre deux « je suis en jeu »
+PRESENCE_TIMEOUT = 8.0                    # sans nouvelles depuis : l'autre n'est plus en jeu
+QUEUE_NOTICE_INTERVAL = 5.0               # au plus une notification « action refusee » par 5 s
+POSITION_INTERVAL = 1.0                   # secondes reelles entre deux lectures de la position
+POSITION_MIN_MOVE = 0.05                  # deplacement minimal (unites du jeu) pour renvoyer
+POSITION_MAX_COORD = 100000.0
+POSITION_LEVELS = (-16, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +348,93 @@ def bridge_read_state():
     return state
 
 
+def _active_sim():
+    import services
+    client = services.client_manager().get_first_client()
+    return client.active_sim if client is not None else None
+
+
+def _running_action(sim):
+    running = sim.queue.running
+    if running is None:
+        return None
+    return running.affordance.__name__
+
+
+def bridge_read_position():
+    """Position du Sim actif (lecture seule), ou None s'il n'y en a pas."""
+    sim = _read('active_sim', _active_sim)
+    if sim is None:
+        return None
+    position = _read('position', lambda: sim.position)
+    sim_id = _read('sim_id', lambda: sim.sim_info.sim_id)
+    if position is None or sim_id is None:
+        return None
+    return {
+        'kind': 'position',
+        'sim_id': sim_id,
+        'name': _read('sim_name', lambda: _sim_name(sim.sim_info)),
+        'zone_id': bridge_current_zone_id(),
+        'x': round(float(position.x), 3),
+        'y': round(float(position.y), 3),
+        'z': round(float(position.z), 3),
+        'level': _read('level', lambda: sim.level),
+        'action': _read('action', lambda: _running_action(sim)),
+    }
+
+
+def _local_sim_position(sim_id):
+    import services
+    from objects import ALL_HIDDEN_REASONS
+    sim_info = services.sim_info_manager().get(sim_id)
+    if sim_info is None:
+        return 'inconnu', None
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS)
+    if sim is None:
+        return 'absent', None
+    position = sim.position
+    return 'present', (float(position.x), float(position.y), float(position.z), sim.level)
+
+
+def bridge_local_sim_position(sim_id):
+    """('present', (x, y, z, niveau)), ('absent', None) : pas sur ce lot,
+    ('inconnu', None) : ce Sim n'existe pas dans cette partie. None si erreur."""
+    return _read('local_sim', lambda: _local_sim_position(sim_id))
+
+
+# Seules ecritures du mod dans le jeu : la demande de pause (horloge) et le
+# refus d'une action du joueur (file d'attente), voir l'en-tete.
+PAUSE_REASON = 'Sims4MP : attente de l\'autre joueur'
+
+
+def bridge_push_pause():
+    """Pose une demande de pause prioritaire et la renvoie (pour la retirer)."""
+    import services
+    from clock import ClockSpeedMode, GameSpeedChangeSource
+    return services.game_clock_service().push_speed(
+        ClockSpeedMode.PAUSED, source=GameSpeedChangeSource.SITUATION,
+        validity_check=None, reason=PAUSE_REASON, immediate=True)
+
+
+def bridge_remove_pause(request):
+    import services
+    from clock import GameSpeedChangeSource
+    services.game_clock_service().remove_request(
+        request, source=GameSpeedChangeSource.SITUATION, reason=PAUSE_REASON, immediate=True)
+
+
+def bridge_is_paused():
+    import services
+    from clock import ClockSpeedMode
+    return services.game_clock_service().clock_speed == ClockSpeedMode.PAUSED
+
+
+def bridge_refused_action():
+    """Resultat renvoye par InteractionQueue.append pour une action refusee."""
+    from event_testing.results import TestResult
+    return TestResult(False, 'Sims4MP : en attente de l\'autre joueur.')
+
+
 # ---------------------------------------------------------------------------
 # Session reseau (aucun objet du jeu ici)
 # ---------------------------------------------------------------------------
@@ -336,6 +462,14 @@ class NetSession(object):
         self.state_received = None
         self.state_received_at = None
         self.state_warning = None
+        # Presence (M2) : derniere presence recue de l'autre, dernier envoi.
+        self.peer_seen_at = None
+        self.presence_sent_at = 0.0
+        # Positions (M3) : derniere envoyee, derniere recue de l'autre joueur.
+        self.position_checked_at = 0.0
+        self.position_sent = None
+        self.remote_position = None
+        self.remote_position_at = None
 
 
 # ---------------------------------------------------------------------------
@@ -452,9 +586,14 @@ def _handle_host_event(session, kind, value):
         # Nouveau client : il recevra l'etat complet des le handshake.
         session.state_sent_to_peer = None
         session.state_checked_at = 0.0
+        session.peer_seen_at = None
+        session.presence_sent_at = 0.0
+        session.position_sent = None
+        session.remote_position = None
     elif kind == 'disconnected':
         if session.handshake_done:
             bridge_notify('L\'autre joueur a quitté la partie. En attente d\'une nouvelle connexion…')
+        session.peer_seen_at = None
         session.peer = None
         session.handshake_done = False
         session.close_after_flush = False
@@ -467,6 +606,11 @@ def _handle_host_event(session, kind, value):
                 session.handshake_done = True
                 peer = session.peer[0] if isinstance(session.peer, tuple) and session.peer else '?'
                 bridge_notify('Un joueur a rejoint la partie ({}).'.format(peer))
+                if data.get('mod_version') != MOD_VERSION:
+                    # Un mod plus ancien n'envoie pas de presence : la pause durerait.
+                    bridge_notify('Versions du mod différentes (vous {}, l\'autre joueur {!s:.16}). '
+                                  'Installez la même version des deux côtés.'.format(
+                                      MOD_VERSION, data.get('mod_version')))
             else:
                 _send(session, protocol.reject('protocole {} attendu, recu {}'.format(
                     protocol.PROTOCOL_VERSION, data.get('protocol'))))
@@ -479,8 +623,13 @@ def _handle_host_event(session, kind, value):
                                          {'game_time': game_time}))
             bridge_notify('Ping reçu du client')
         elif msg_type == protocol.EVENT:
-            # Le host est la seule source d'etat : rien n'est accepte du client.
-            log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
+            if data.get('kind') == 'presence':
+                session.peer_seen_at = time.monotonic()
+            elif data.get('kind') == 'position':
+                _handle_position(session, data)
+            else:
+                # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
+                log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
         elif msg_type == protocol.BYE:
             server.disconnect_client()
             session.peer = None
@@ -519,6 +668,10 @@ def _handle_client_event(session, kind, value):
         elif msg_type == protocol.EVENT:
             if value['data'].get('kind') == 'state':
                 _handle_state(session, value['data'])
+            elif value['data'].get('kind') == 'presence':
+                session.peer_seen_at = time.monotonic()
+            elif value['data'].get('kind') == 'position':
+                _handle_position(session, value['data'])
             else:
                 log('[client] EVENT ignore (kind {!r})'.format(value['data'].get('kind')))
         elif msg_type == protocol.BYE:
@@ -598,17 +751,19 @@ def pump_tick():
     now = time.monotonic()
     _auto_tick(now)                       # connexion automatique, au plus toutes les 30 s
     session = _session
-    if session is None:
-        return
-    if now - _pump['last_poll'] < PUMP_INTERVAL:
-        return
-    _pump['last_poll'] = now
+    if session is not None and now - _pump['last_poll'] >= PUMP_INTERVAL:
+        _pump['last_poll'] = now
+        _poll_session(session, now)
+    _gate_tick(time.monotonic())          # pause et file : a chaque tick, meme sans session
+
+
+def _poll_session(session, now):
     session.polls += 1
 
     for kind, value in session.endpoint.poll():
         if kind == 'message':
-            # Les etats sont journalises en resume par _handle_state.
-            if value['type'] != protocol.EVENT or value['data'].get('kind') != 'state':
+            # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
+            if value['type'] != protocol.EVENT or value['data'].get('kind') not in ('state', 'presence', 'position'):
                 log('[{}] recu : {}'.format(session.role, _describe(value)))
         else:
             log('[{}] {} : {}'.format(session.role, kind, value))
@@ -627,6 +782,256 @@ def pump_tick():
 
     if session.role == 'host' and _session is session:
         _maybe_send_state(session, now)
+    if _session is session:
+        _maybe_send_presence(session, now)
+        _maybe_send_position(session, now)
+
+
+# ---------------------------------------------------------------------------
+# Positions (M3, lecture seule)
+# ---------------------------------------------------------------------------
+
+def _clean_float(value, limit):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if value != value or not -limit <= value <= limit:      # NaN ou hors bornes
+        return None
+    return value
+
+
+def validate_position(data):
+    """Copie propre d'une position recue, ou None si elle est inutilisable."""
+    if not isinstance(data, dict):
+        return None
+    sim_id = _clean_int(data.get('sim_id'), 1, 2 ** 64)
+    coords = [_clean_float(data.get(axis), POSITION_MAX_COORD) for axis in ('x', 'y', 'z')]
+    if sim_id is None or None in coords:
+        return None
+    return {
+        'sim_id': sim_id,
+        'name': _clean_text(data.get('name')),
+        'zone_id': _clean_int(data.get('zone_id'), 0, 2 ** 64),
+        'x': coords[0], 'y': coords[1], 'z': coords[2],
+        'level': _clean_int(data.get('level'), POSITION_LEVELS[0], POSITION_LEVELS[1]),
+        'action': _clean_text(data.get('action')),
+    }
+
+
+def _moved(old, new):
+    if old is None:
+        return True
+    if any(old.get(k) != new.get(k) for k in ('sim_id', 'zone_id', 'level', 'action')):
+        return True
+    return any(abs(old[k] - new[k]) >= POSITION_MIN_MOVE for k in ('x', 'y', 'z'))
+
+
+def _maybe_send_position(session, now):
+    """Lit le Sim actif au plus toutes les POSITION_INTERVAL s et l'envoie s'il a change."""
+    if not (session.endpoint.is_connected and session.handshake_done):
+        return
+    if now - session.position_checked_at < POSITION_INTERVAL:
+        return
+    session.position_checked_at = now
+    position = bridge_read_position()
+    if position is None or not _moved(session.position_sent, position):
+        return
+    if session.endpoint.send(protocol.make_message(protocol.EVENT, position)):
+        if session.position_sent is None or session.position_sent.get('sim_id') != position['sim_id']:
+            log('[{}] envoi position : Sim {} ({})'.format(session.role, position['name'], position['sim_id']))
+        session.position_sent = position
+
+
+def _handle_position(session, data):
+    position = validate_position(data)
+    if position is None:
+        log('[{}] position invalide ignoree'.format(session.role))
+        return
+    previous = session.remote_position
+    session.remote_position = position
+    session.remote_position_at = time.monotonic()
+    if previous is None or previous['sim_id'] != position['sim_id']:
+        log('[{}] l\'autre joueur controle {} ({})'.format(session.role, position['name'], position['sim_id']))
+        bridge_notify('L\'autre joueur contrôle {}.'.format(position['name'] or 'un Sim'))
+
+
+def _position_text(position):
+    level = position.get('level')
+    return 'x {:.2f} , y {:.2f} , z {:.2f}{}'.format(
+        position['x'], position['y'], position['z'], '' if level is None else ' , niveau {}'.format(level))
+
+
+def position_lines(session, now):
+    """Texte de mp.positions (aucun objet du jeu ici, sauf la recherche du Sim local)."""
+    lines = []
+    sent = session.position_sent
+    if sent is None:
+        lines.append('Mon Sim : aucune position envoyee')
+    else:
+        lines.append('Mon Sim : {} ({}) , {} , action {}'.format(
+            sent['name'], sent['sim_id'], _position_text(sent), sent['action'] or 'aucune'))
+    remote = session.remote_position
+    if remote is None:
+        lines.append('Sim de l\'autre joueur : aucune position recue')
+        return lines
+    lines.append('Sim de l\'autre joueur : {} ({}) , {} , action {} (il y a {:.0f} s)'.format(
+        remote['name'], remote['sim_id'], _position_text(remote), remote['action'] or 'aucune',
+        now - session.remote_position_at))
+    if sent is not None and sent['sim_id'] == remote['sim_id']:
+        lines.append('  Vous controlez tous les deux ce Sim')
+    local_zone = bridge_current_zone_id()
+    if local_zone is None or remote['zone_id'] != local_zone:
+        lines.append('  Zone differente (autre {} , ici {}) : comparaison impossible'.format(
+            remote['zone_id'], local_zone))
+        return lines
+    found = bridge_local_sim_position(remote['sim_id'])
+    if found is None:
+        lines.append('  Lecture du meme Sim ici impossible (voir le journal)')
+    elif found[0] == 'inconnu':
+        lines.append('  Ce Sim n\'existe pas dans cette partie : ce n\'est pas la meme sauvegarde')
+    elif found[0] == 'absent':
+        lines.append('  Ce Sim existe ici mais n\'est pas sur le lot')
+    else:
+        x, y, z, level = found[1]
+        gap = ((x - remote['x']) ** 2 + (z - remote['z']) ** 2) ** 0.5
+        lines.append('  Ici : x {:.2f} , y {:.2f} , z {:.2f} , niveau {} -> ecart {:.2f}'.format(
+            x, y, z, level, gap))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Attente de l'autre joueur : presence, pause imposee, file bloquee (M2)
+# ---------------------------------------------------------------------------
+
+_gate = {
+    'waiting': False,        # attente en cours (pause imposee, actions du joueur refusees)
+    'request': None,         # demande de pause posee dans l'horloge du jeu
+    'repushed': 0,           # demande reposee parce qu'une autre la masquait
+    'refused': 0,            # actions du joueur refusees
+    'notice_at': None,       # derniere notification « action refusee »
+    'error': None,           # derniere erreur de l'horloge (journalisee une fois par message)
+}
+
+
+def _maybe_send_presence(session, now):
+    """« Je suis en jeu », toutes les PRESENCE_INTERVAL s une fois le handshake fait."""
+    if not (session.endpoint.is_connected and session.handshake_done):
+        return
+    if now - session.presence_sent_at < PRESENCE_INTERVAL:
+        return
+    session.presence_sent_at = now
+    # Pas de journal a chaque envoi : une ligne toutes les 2 s noierait le reste.
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'presence'}))
+
+
+def multiplayer_expected():
+    """Une partie a deux est prevue : session ouverte ou reglage du lanceur actif."""
+    return _session is not None or _auto['target'] is not None
+
+
+def peer_in_game(now):
+    session = _session
+    return (session is not None and session.handshake_done and session.endpoint.is_connected
+            and session.peer_seen_at is not None and now - session.peer_seen_at <= PRESENCE_TIMEOUT)
+
+
+def _clock_error(where):
+    text = traceback.format_exc()
+    last = text.strip().splitlines()[-1]
+    if _gate['error'] != last:
+        log('attente : {} impossible :\n{}'.format(where, text))
+    _gate['error'] = last
+
+
+def _hold_pause():
+    try:
+        if _gate['request'] is None:
+            _gate['request'] = bridge_push_pause()
+            log('attente : pause imposee')
+        elif not bridge_is_paused():
+            # Une autre demande prioritaire masque la notre : on la repose au-dessus.
+            bridge_remove_pause(_gate['request'])
+            _gate['request'] = bridge_push_pause()
+            _gate['repushed'] += 1
+            log('attente : pause reposee ({})'.format(_gate['repushed']))
+    except Exception:
+        _clock_error('pause')
+
+
+def _release_pause():
+    request = _gate['request']
+    _gate['request'] = None
+    if request is None:
+        return
+    try:
+        bridge_remove_pause(request)
+        log('attente : pause levee')
+    except Exception:
+        _clock_error('levee de la pause')
+
+
+def _gate_tick(now):
+    """Appele a chaque tick : pose ou leve la pause selon la presence de l'autre."""
+    if multiplayer_expected() and not peer_in_game(now):
+        if not _gate['waiting']:
+            _gate['waiting'] = True
+            log('attente : l\'autre joueur n\'est pas en jeu')
+            bridge_notify('En attente de l\'autre joueur : la partie reste en pause. '
+                          '(mp.disconnect pour jouer seul)')
+        _hold_pause()
+    elif _gate['waiting']:
+        _gate['waiting'] = False
+        _release_pause()
+        if multiplayer_expected():
+            log('attente : les deux joueurs sont en jeu')
+            bridge_notify('Les deux joueurs sont en jeu : la partie peut reprendre.')
+        else:
+            log('attente : partie a deux annulee')
+            bridge_notify('Partie à deux arrêtée : vous jouez seul.')
+
+
+def _is_user_directed(interaction):
+    try:
+        return bool(interaction.is_user_directed)
+    except Exception:
+        return False
+
+
+def queue_refuses(interaction):
+    """Vrai si l'action doit etre refusee : attente en cours et choix du joueur."""
+    if not _gate['waiting'] or not _is_user_directed(interaction):
+        return False
+    _gate['refused'] += 1
+    now = time.monotonic()
+    if _gate['notice_at'] is None or now - _gate['notice_at'] >= QUEUE_NOTICE_INTERVAL:
+        _gate['notice_at'] = now
+        bridge_notify('Action refusée : l\'autre joueur n\'est pas encore en jeu.')
+    return True
+
+
+def _install_queue_hook():
+    from interactions.interaction_queue import InteractionQueue
+    original = InteractionQueue.append
+    if getattr(original, '_sims4mp_hook', False):
+        log('attente : file d\'attente deja enveloppee')
+        return
+
+    @functools.wraps(original)
+    def append(self, interaction, *args, **kwargs):
+        refused = None
+        try:
+            if queue_refuses(interaction):
+                refused = bridge_refused_action()
+        except Exception:
+            # En cas d'erreur du mod, le jeu garde son comportement normal.
+            log('ERREUR file d\'attente :\n' + traceback.format_exc())
+        if refused is not None:
+            return refused
+        return original(self, interaction, *args, **kwargs)
+
+    append._sims4mp_hook = True
+    InteractionQueue.append = append
+    log('attente : interactions.interaction_queue.InteractionQueue.append enveloppe')
 
 
 def _safe_pump_tick():
@@ -1032,6 +1437,13 @@ def mp_status(_connection=None):
             output('Connexion automatique : {} (tentatives {}){}'.format(
                 'host port {}'.format(target[1]) if target[0] == 'host' else 'join {}:{}'.format(target[1], target[2]),
                 _auto['attempts'], ' , derniere erreur : ' + _auto['last_error'] if _auto['last_error'] else ''))
+        if _gate['waiting']:
+            output('Attente de l\'autre joueur : pause imposee, actions du joueur refusees ({})'.format(
+                _gate['refused']))
+        elif multiplayer_expected():
+            output('Autre joueur : en jeu')
+        if _gate['error']:
+            output('Derniere erreur horloge : ' + _gate['error'])
         output('Reglage du lanceur : {}'.format(settings_path()))
         output('Journal : ' + LOG_PATH)
     except Exception:
@@ -1103,6 +1515,21 @@ def mp_state(_connection=None):
         output('Erreur dans mp.state (voir le journal).')
 
 
+@sims4.commands.Command('mp.positions', command_type=sims4.commands.CommandType.Live)
+def mp_positions(_connection=None):
+    output = sims4.commands.CheatOutput(_connection)
+    try:
+        session = _session
+        if session is None or not session.handshake_done:
+            output('Aucune partie a deux connectee (mp.status).')
+            return
+        for line in position_lines(session, time.monotonic()):
+            output(line)
+    except Exception:
+        log('ERREUR mp.positions :\n' + traceback.format_exc())
+        output('Erreur dans mp.positions (voir le journal).')
+
+
 @sims4.commands.Command('mp.disconnect', command_type=sims4.commands.CommandType.Live)
 def mp_disconnect(_connection=None):
     output = sims4.commands.CheatOutput(_connection)
@@ -1111,9 +1538,11 @@ def mp_disconnect(_connection=None):
         stopped_auto = _auto['target'] is not None
         _auto['target'] = None
         if _session is None:
+            _gate_tick(time.monotonic())          # leve la pause tout de suite
             output('Aucune session active.' + (' Connexion automatique arretee.' if stopped_auto else ''))
             return
         _close_session(send_bye=True)
+        _gate_tick(time.monotonic())
         output('Session fermee.' + (' Connexion automatique arretee.' if stopped_auto else ''))
     except Exception:
         log('ERREUR mp.disconnect :\n' + traceback.format_exc())
@@ -1142,3 +1571,9 @@ try:
 except Exception:
     # Sans ce hook, mp.host / mp.join restent utilisables a la main.
     log('ERREUR installation connexion automatique :\n' + traceback.format_exc())
+
+try:
+    _install_queue_hook()
+except Exception:
+    # Sans ce hook, la pause reste imposee mais la file n'est pas bloquee.
+    log('ERREUR installation blocage de la file :\n' + traceback.format_exc())
