@@ -422,6 +422,9 @@ report('differences invalides ou autre foyer ignorees', HOUSEHOLD.funds.money ==
 pump_until(lambda: events('clock'), extra=presence)
 clock_msg = events('clock')[-1] if events('clock') else {}
 report('hote : heure et vitesse envoyees', clock_msg.get('seconds') == 100000.0 and clock_msg.get('speed') == 1)
+pump_until(lambda: any('rate' in e for e in events('clock')), extra=presence)
+report('hote : rythme exact de son horloge joint au message',
+       any(e.get('rate') == 0.0 for e in events('clock')))           # horloge de test immobile : 0
 send({'kind': 'clock', 'seconds': 1.0, 'speed': 3})
 pump_for(0.1, extra=presence)
 report('hote : l\'heure envoyee par l\'invite est ignoree', GAME_CLOCK.advanced == [] and GAME_CLOCK.clock_speed == 1)
@@ -599,6 +602,7 @@ for bad in ({'seconds': 'x', 'speed': 1}, {'seconds': 1.0, 'speed': 9}, {'second
 pump_for(0.15, extra=host_side)
 report('heures invalides ignorees', GAME_CLOCK.clock_speed == 3 and GAME_CLOCK.advanced == [600])
 
+session.clock_grace_until = 0.0                                     # changement de vitesse termine
 GAME_CLOCK.seconds = 100580.0 - 120.0                               # 2 min de jeu de retard
 send({'kind': 'clock', 'seconds': 100580.0, 'speed': 3})
 pump_for(0.1, extra=host_side)

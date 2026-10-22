@@ -66,7 +66,7 @@ class InteractionContext(object):
 
 module('interactions')
 module('interactions.context', InteractionContext=InteractionContext)
-module('interactions.priority', Priority=types.SimpleNamespace(High='High'))
+module('interactions.priority', Priority=types.SimpleNamespace(Low='Low', High='High'))
 
 
 class TestResult(object):
@@ -210,8 +210,10 @@ class FakeClient(object):
 CLIENT = FakeClient()
 SIM_INFOS = {}
 OBJECTS = {}
+INSTANCED = []
 module('services', client_manager=lambda: types.SimpleNamespace(get_first_client=lambda: CLIENT),
-       sim_info_manager=lambda: types.SimpleNamespace(get=SIM_INFOS.get),
+       sim_info_manager=lambda: types.SimpleNamespace(
+           get=SIM_INFOS.get, instanced_sims_gen=lambda allow_hidden_flags=None: list(INSTANCED)),
        object_manager=lambda zone_id=None: types.SimpleNamespace(get=OBJECTS.get),
        get_instance_manager=lambda kind: types.SimpleNamespace(get=AFFORDANCES.get),
        current_zone_id=lambda: 555, active_household=lambda: None)
@@ -294,9 +296,12 @@ def send(data):
 
 mine = FakeSimInfo(1001, 'Elise')
 other = FakeSimInfo(2002, 'Alex')
-SIM_INFOS.update({1001: mine, 2002: other})
+npc_info = FakeSimInfo(3003, 'Voisin')
+SIM_INFOS.update({1001: mine, 2002: other, 3003: npc_info})
 my_sim = FakeSim(mine, 0.0)
 double = FakeSim(other, 5.0)
+npc = FakeSim(npc_info, 20.0)
+INSTANCED.extend([my_sim, double, npc])
 CLIENT.active_sim = my_sim
 chair, sofa, bed = GameObject(77), GameObject(88), GameObject(99)
 OBJECTS.update({77: chair, 88: sofa, 99: bed})
@@ -313,6 +318,10 @@ session = mod._session
 send({'kind': 'position', 'sim_id': 2002, 'name': 'Alex', 'zone_id': 555, 'x': 5.0, 'y': 0.0, 'z': 0.0,
       'level': 0, 'action': None})
 pump_until(lambda: session.remote_position is not None)
+pump_for(0.1)
+del inbox[:]                       # avant de connaitre le Sim de l'invite, l'hote faisait foi pour tous
+session.needs_sent.clear()
+session.sims_sent.clear()
 
 # --- 1. Clics du joueur envoyes au moment du clic -----------------------------------------
 my_sim.queue.append(Interaction(SIT, chair))
@@ -330,11 +339,15 @@ report('cible partie d\'objet -> objet entier, cible Sim, point de terrain',
        targets == [{'t': 'obj', 'id': 88}, {'t': 'sim', 'id': 2002},
                    {'t': 'terrain', 'x': 3.0, 'y': 0.5, 'z': 4.0, 'level': 0}], str(targets))
 count = len(events('order'))
-my_sim.queue.append(Interaction(SIT, chair, source=InteractionContext.SOURCE_AUTONOMY))
 my_sim.queue.append(Interaction(SIT, chair, source=InteractionContext.SOURCE_SCRIPT_WITH_USER_INTENT))
 my_sim.queue.append(Interaction(MIXER, double))
 pump_for(0.15)
-report('autonomie, ordres de script et mixers non envoyes', len(events('order')) == count)
+report('ordres de script et mixers non envoyes', len(events('order')) == count)
+my_sim.queue.append(Interaction(SIT, chair, source=InteractionContext.SOURCE_AUTONOMY))
+pump_until(lambda: len(events('order')) > count)
+auto = events('order')[-1] if len(events('order')) > count else {}
+report('M6 : autonomie d\'un Sim dont l\'hote fait foi envoyee (marquee autonomie)',
+       auto.get('auto') is True and auto.get('sim_id') == 1001 and auto.get('affordance') == 500)
 
 # --- 2. Ordres recus de l'autre joueur, rejoues --------------------------------------------
 before = len(events('order'))
@@ -376,10 +389,13 @@ report('apres une action rejouee : le double n\'est pas recale pendant {:.0f} s'
        'pas de recalage' in session.walk_status, session.walk_status)
 
 # --- 3. Besoins ------------------------------------------------------------------------------
-pump_until(lambda: events('needs'))
-needs = events('needs')[-1] if events('needs') else {}
+pump_until(lambda: {e['sim_id'] for e in events('needs')} >= {1001, 3003})
+by_sim = {e['sim_id']: e for e in events('needs')}
+needs = by_sim.get(1001, {})
 report('hote : besoins visibles de son Sim envoyes (pas les caches, pas les competences)',
-       needs.get('sim_id') == 1001 and needs.get('values') == {'1': 50.0, '2': -20.0}, str(needs))
+       needs.get('values') == {'1': 50.0, '2': -20.0}, str(needs))
+report('M6 : besoins du PNJ aussi (l\'hote fait foi), pas ceux du Sim de l\'invite',
+       3003 in by_sim and 2002 not in by_sim)
 count = len(events('needs'))
 pump_for(0.2)
 report('besoins inchanges : pas de renvoi avant {:.0f} s'.format(mod.NEEDS_RESEND), len(events('needs')) == count)
@@ -400,10 +416,59 @@ report('invite : meme Sim que l\'hote -> l\'hote fait foi ; Sim different -> l\'
        not mod._needs_authority(client, 1001, 1001)
        and mod._needs_authority(types.SimpleNamespace(role='client', remote_position={'sim_id': 2002}), 1001, 1001))
 
+# --- 4. M6 : l'hote fait foi pour tous les Sims que personne ne controle ------------------------
+report('qui fait foi : hote pour son Sim et le PNJ, invite pour le sien',
+       [mod.sim_owner(session, s, 1001) for s in (1001, 3003, 2002)] == ['host', 'host', 'client'])
+refused = double.queue.append(Interaction(SIT, chair, source=InteractionContext.SOURCE_AUTONOMY))
+report('autonomie du Sim de l\'invite refusee chez l\'hote (l\'invite fait foi)',
+       not refused and session.autonomy_refused == 1)
+before = len(events('order'))
+npc.queue.append(Interaction(SLEEP, bed, source=InteractionContext.SOURCE_AUTONOMY))
+pump_until(lambda: len(events('order')) > before)
+sent = events('order')[-1]
+report('autonomie du PNJ envoyee a l\'invite', sent.get('sim_id') == 3003 and sent.get('auto') is True)
+pump_until(lambda: any(e['sim_id'] == 3003 for s in events('sims') for e in s['list']))
+listed = {e['sim_id'] for s in events('sims') for e in s['list']}
+report('positions des autres Sims envoyees (PNJ ; ni mon Sim, ni celui de l\'invite)', listed == {3003}, str(listed))
+replayed = session.orders_replayed
+send({'kind': 'order', 'id': 'client-9', 'sim_id': 1001, 'affordance': 500, 'name': 'sit_Chair',
+      'target': {'t': 'obj', 'id': 77}, 'auto': True})
+send({'kind': 'order', 'id': 'client-10', 'sim_id': 2002, 'affordance': 500, 'name': 'sit_Chair',
+      'target': {'t': 'obj', 'id': 77}, 'auto': True})
+pump_until(lambda: session.orders_replayed > replayed)
+pump_for(0.1)
+last = double.pushed[-1]
+report('autonomie recue : ignoree pour un Sim dont je fais foi, rejouee en priorite basse sinon',
+       session.orders_replayed == replayed + 1 and last[0] is SIT
+       and last[2].source == InteractionContext.SOURCE_SCRIPT and last[2].priority == 'Low',
+       '{} -> {} ; {} {} {} ; {} ; echecs {}'.format(replayed, session.orders_replayed, last[0].__name__,
+                                                     last[2].source, last[2].priority, session.last_order,
+                                                     session.orders_failed))
+guest = mod.NetSession('client', types.SimpleNamespace(is_connected=True))
+guest.handshake_done = True
+guest.remote_position = {'sim_id': 5005}                        # l'hote controle un autre Sim
+npc.position = Vector3(20.0, 0.0, 0.0)
+count = len(npc.pushed)
+mod._handle_sims(guest, {'list': [{'sim_id': 3003, 'name': 'Voisin', 'zone_id': 555, 'x': 30.0, 'y': 0.0,
+                                   'z': 0.0, 'level': 0, 'action': None},
+                                  {'sim_id': 1001, 'name': 'Elise', 'zone_id': 555, 'x': 99.0, 'y': 0.0,
+                                   'z': 0.0, 'level': 0, 'action': None}]})
+report('invite : PNJ suivi (marche vers la position de l\'hote), son propre Sim ignore',
+       len(npc.pushed) == count + 1 and npc.pushed[-1][1].position.x == 30.0 and 1001 not in guest.sims_remote)
+npc.position = Vector3(29.0, 0.0, 0.0)
+guest.sims_walk.clear()
+real_push = npc.push_super_affordance
+npc.push_super_affordance = lambda *a: TestResult(False)       # occupe (assis...) : marche refusee
+mod._follow_sim(guest, 3003, time.monotonic())
+npc.push_super_affordance = real_push
+report('marche refusee a faible ecart : laisse en place, pas de pose directe',
+       guest.sims_status[3003].startswith('occupe') and npc.position.x == 29.0)
+
 del _CheatOutput.lines[:]
 mod.mp_positions()
 text = '\n'.join(_CheatOutput.lines)
-report('mp.positions : actions et besoins', 'Actions : 4 envoyee(s), 2 rejouee(s), 2 non rejouee(s)' in text
+report('mp.positions : actions et besoins', 'Actions : 6 envoyee(s), 3 rejouee(s), 2 non rejouee(s)' in text
+       and 'Autres Sims (ce PC fait foi)' in text and 'autonomie refusee ici 1 fois' in text
        and 'Besoins : 1 valeur' in text, text[-300:])
 report('aucune erreur de pompe', mod._pump['error'] is None, str(mod._pump['error']))
 

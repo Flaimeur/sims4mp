@@ -1,4 +1,11 @@
-# Sims 4 Multiplayer - etape M5 : chaque action choisie au menu par un joueur
+# Sims 4 Multiplayer - etape M6 : chaque Sim a un PC qui fait foi (l'invite pour
+# le Sim qu'il controle, l'hote pour tous les autres : famille, PNJ). Ce PC envoie
+# ses positions, ses besoins et aussi les actions choisies par son autonomie
+# (SOURCE_AUTONOMY) ; l'autre PC refuse l'autonomie de ce Sim et rejoue ces actions
+# (SOURCE_SCRIPT, Priority.Low). Sims presents : services.sim_info_manager()
+# .instanced_sims_gen() (verifie dans simulation.zip). Les PNJ presents d'un seul
+# cote ne sont pas crees chez l'autre.
+# Etape M5 : chaque action choisie au menu par un joueur
 # (marcher, s'asseoir, dormir, discuter...) est envoyee au clic et rejouee sur
 # l'autre PC ; besoins du Sim controle recopies chez l'autre (le PC qui
 # controle le Sim fait foi, l'hote si les deux controlent le meme).
@@ -131,7 +138,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.9.0'
+MOD_VERSION = '0.10.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -161,6 +168,7 @@ CLOCK_MIN_TOLERANCE = 20.0                # ... et au moins 20 s de jeu
 CLOCK_DEFAULT_RATE = 60.0                 # s de jeu par s reelle tant que le rythme n'est pas mesure
 PLAYER_SPEEDS = (0, 1, 2, 3)              # ClockSpeedMode : pause, normale, 2, 3 (boutons du joueur)
 CLOCK_CONFIRM = 2                         # messages de suite au-dela de la tolerance avant correction
+CLOCK_GRACE = 3.0                         # s reelles sans correction apres un changement de vitesse
 SPEED_REQUEST_DEDUP = 1.0                 # meme vitesse demandee a moins d'1 s d'intervalle : une seule
 WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
 WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
@@ -169,6 +177,8 @@ WALK_TIMEOUT = 15.0                       # toujours loin apres : teleportation
 TELEPORT_DIST = 40.0                      # plus loin, ou autre niveau : teleportation directe
 ORDER_MAX_AGE = 3600.0                    # ordre plus ancien : comme s'il n'y en avait pas
 ACTION_HOLD = 20.0                        # apres une action rejouee, le double n'est pas recale
+PLACE_MIN = 5.0                           # pose directe seulement au-dela de cet ecart
+SIMS_MAX = 32                             # Sims par message de positions (M6)
 ORDERS_SEEN_MAX = 500                     # identifiants d'ordres deja rejoues gardes en memoire
 NEEDS_INTERVAL = 5.0                      # secondes reelles entre deux envois des besoins
 NEEDS_RESEND = 30.0                       # renvoi complet meme sans changement
@@ -581,11 +591,46 @@ def bridge_set_player_speed(value):
 
 # --- Ordres des joueurs (M5) et besoins ----------------------------------------
 
-def bridge_order_from_interaction(queue, interaction):
-    """Description d'un clic du joueur (menu d'actions) pour le rejouer ailleurs, ou None.
-    Seules les super-interactions choisies au menu (SOURCE_PIE_MENU) sont prises."""
+def bridge_interaction_kind(interaction):
+    """'pie' : choisie au menu par le joueur ; 'auto' : decidee par l'autonomie ; None : autre."""
     from interactions.context import InteractionContext
-    if interaction.source != InteractionContext.SOURCE_PIE_MENU:
+    source = interaction.source
+    if source == InteractionContext.SOURCE_PIE_MENU:
+        return 'pie'
+    if source == InteractionContext.SOURCE_AUTONOMY:
+        return 'auto'
+    return None
+
+
+def bridge_instanced_sim_ids():
+    """Identifiants des Sims presents (instancies, visibles) dans la zone."""
+    import services
+    return [sim.sim_info.sim_id for sim in services.sim_info_manager().instanced_sims_gen()]
+
+
+def bridge_sim_snapshot(sim_id):
+    """Position et action en cours d'un Sim present, comme bridge_read_position, ou None."""
+    import services
+    from objects import ALL_HIDDEN_REASONS
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    if sim is None:
+        return None
+    position = sim.position
+    return {
+        'sim_id': sim_id,
+        'name': _read('sim_name', lambda: _sim_name(sim_info)),
+        'zone_id': bridge_current_zone_id(),
+        'x': round(float(position.x), 3), 'y': round(float(position.y), 3), 'z': round(float(position.z), 3),
+        'level': _read('level', lambda: sim.level),
+        'action': _read('action', lambda: _running_action(sim)),
+    }
+
+
+def bridge_order_from_interaction(queue, interaction, kind='pie'):
+    """Description d'une action pour la rejouer ailleurs, ou None. kind 'pie' : choisie au menu
+    (SOURCE_PIE_MENU) ; 'auto' : decidee par l'autonomie (SOURCE_AUTONOMY). Super-interactions seules."""
+    if bridge_interaction_kind(interaction) != kind:
         return None
     affordance = interaction.affordance
     if not getattr(affordance, 'is_super', False):
@@ -604,11 +649,13 @@ def bridge_order_from_interaction(queue, interaction):
             target = target.part_owner                 # le jeu choisit la place (canape, lit double...)
         where = {'t': 'obj', 'id': target.id}
     return {'sim_id': queue.sim.sim_info.sim_id, 'affordance': affordance.guid64,
-            'name': affordance.__name__, 'target': where}
+            'name': affordance.__name__, 'target': where, 'auto': kind == 'auto'}
 
 
-def bridge_replay_order(sim_id, affordance_id, where):
-    """Rejoue l'ordre : meme Sim, meme action, meme cible. Renvoie (True, None) ou (False, raison)."""
+def bridge_replay_order(sim_id, affordance_id, where, auto=False):
+    """Rejoue l'ordre : meme Sim, meme action, meme cible. Renvoie (True, None) ou (False, raison).
+    Ordre du joueur : contexte SOURCE_SCRIPT_WITH_USER_INTENT, priorite haute ; action de
+    l'autonomie : SOURCE_SCRIPT, priorite basse (comme une decision du Sim, pas un ordre)."""
     import services
     import sims4.resources
     from interactions.context import InteractionContext
@@ -634,7 +681,10 @@ def bridge_replay_order(sim_id, affordance_id, where):
             target = services.object_manager().get(where['id'])
         if kind != 'none' and target is None:
             return False, 'cible absente ici (objet cree apres le chargement ?)'
-        context = InteractionContext(sim, InteractionContext.SOURCE_SCRIPT_WITH_USER_INTENT, Priority.High)
+        if auto:
+            context = InteractionContext(sim, InteractionContext.SOURCE_SCRIPT, Priority.Low)
+        else:
+            context = InteractionContext(sim, InteractionContext.SOURCE_SCRIPT_WITH_USER_INTENT, Priority.High)
     result = sim.push_super_affordance(affordance, target, context)
     return (True, None) if result else (False, 'refusee par le jeu ({})'.format(result))
 
@@ -775,6 +825,9 @@ class NetSession(object):
         self.clock_jumps = 0
         self.last_gap = None
         self.clock_strikes = 0          # messages de suite avec un ecart au-dela de la tolerance
+        self.clock_grace_until = 0.0    # pas de correction d'heure avant (changement de vitesse)
+        self.clock_prev = None          # hote : (secondes, moment, vitesse) de la derniere mesure
+        self.clock_rate = None          # hote : rythme mesure de son horloge
         self.speed_requests = 0         # demandes de vitesse envoyees (invite) ou appliquees (hote)
         self.last_speed_request = None  # invite : (vitesse, moment) de la derniere demande envoyee
         self.walk = None                # dernier ordre de marche donne au double
@@ -790,8 +843,16 @@ class NetSession(object):
         self.last_order = None          # texte du dernier ordre rejoue ou refuse
         self.action_hold = {}           # sim_id -> moment jusqu'auquel le double n'est pas recale
         self.needs_checked_at = 0.0
-        self.needs_sent = None          # (sim_id, valeurs, moment) du dernier envoi
+        self.needs_sent = {}            # sim_id -> (valeurs, moment) du dernier envoi
         self.needs_written = 0
+        # Autres Sims (M6) : l'hote fait foi pour tous ceux que personne ne controle.
+        self.autonomy_refused = 0       # actions autonomes refusees ici (l'autre PC fait foi)
+        self.sims_checked_at = 0.0
+        self.sims_sent = {}             # sim_id -> derniere position envoyee
+        self.sims_remote = {}           # sim_id -> derniere position recue
+        self.sims_walk = {}             # sim_id -> marche en cours
+        self.sims_status = {}           # sim_id -> dernier etat
+        self.sims_followed_at = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -958,6 +1019,8 @@ def _handle_host_event(session, kind, value):
                 _handle_order(session, data)
             elif data.get('kind') == 'needs':
                 _handle_needs(session, data)
+            elif data.get('kind') == 'sims':
+                _handle_sims(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -1011,6 +1074,8 @@ def _handle_client_event(session, kind, value):
                 _handle_order(session, value['data'])
             elif value['data'].get('kind') == 'needs':
                 _handle_needs(session, value['data'])
+            elif value['data'].get('kind') == 'sims':
+                _handle_sims(session, value['data'])
             else:
                 log('[client] EVENT ignore (kind {!r})'.format(value['data'].get('kind')))
         elif msg_type == protocol.BYE:
@@ -1104,8 +1169,10 @@ def _poll_session(session, now):
     for kind, value in session.endpoint.poll():
         if kind == 'message':
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
-            if value['type'] != protocol.EVENT or value['data'].get('kind') not in ('state', 'presence', 'position',
-                                                                                    'clock', 'needs'):
+            quiet = (value['type'] == protocol.EVENT
+                     and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims')
+                          or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
+            if not quiet:
                 log('[{}] recu : {}'.format(session.role, _describe(value)))
         else:
             log('[{}] {} : {}'.format(session.role, kind, value))
@@ -1131,6 +1198,7 @@ def _poll_session(session, now):
         _clock_tick(session, now)
         _walk_tick(session, now)
         _needs_tick(session, now)
+        _maybe_send_sims(session, now)
 
 
 # ---------------------------------------------------------------------------
@@ -1382,9 +1450,21 @@ def _clock_tick(session, now):
         return
     session.clock_sent_at = now
     read = _safe('lecture heure', bridge_clock)
-    if read is not None:
-        session.endpoint.send(protocol.make_message(protocol.EVENT, {
-            'kind': 'clock', 'seconds': read[0], 'speed': read[1]}))
+    if read is None:
+        return
+    # Rythme exact de l'horloge de l'hote (s de jeu par s reelle) depuis le dernier envoi,
+    # pour que l'invite ait la bonne tolerance meme juste apres un changement de vitesse.
+    previous = session.clock_prev
+    if previous is None or previous[2] != read[1]:
+        session.clock_prev = (read[0], now, read[1])     # nouvelle vitesse : rythme a remesurer
+        session.clock_rate = None
+    elif now - previous[1] >= 0.2:
+        session.clock_rate = max(0.0, (read[0] - previous[0]) / (now - previous[1]))
+        session.clock_prev = (read[0], now, read[1])
+    message = {'kind': 'clock', 'seconds': read[0], 'speed': read[1]}
+    if session.clock_rate is not None:
+        message['rate'] = round(session.clock_rate, 3)
+    session.endpoint.send(protocol.make_message(protocol.EVENT, message))
 
 
 def _set_clock_request(value):
@@ -1410,12 +1490,17 @@ def _handle_clock(session, data):
         return
     now = time.monotonic()
     previous = session.host_clock
+    sent_rate = _clean_float(data.get('rate'), 100000.0)
     if previous is None or previous[1] != speed:
         session.host_rate = None                     # nouvelle vitesse : rythme a remesurer
+        if previous is not None:
+            session.clock_grace_until = now + CLOCK_GRACE
     elif now - previous[2] >= 0.2:
         rate = (seconds - previous[0]) / (now - previous[2])
         if 0.0 <= rate <= 10000.0:
             session.host_rate = rate if session.host_rate is None else 0.7 * session.host_rate + 0.3 * rate
+    if sent_rate is not None and sent_rate >= 0.0:
+        session.host_rate = sent_rate                # mesure exacte faite par l'hote
     session.host_clock = (seconds, speed, now)
     if _gate['waiting']:
         return                                       # la pause d'attente passe avant
@@ -1431,6 +1516,9 @@ def _handle_clock(session, data):
     session.clock_strikes = session.clock_strikes + 1 if abs(gap) > tolerance else 0
     if session.clock_strikes < CLOCK_CONFIRM and not session.clock_ahead:
         gap = 0.0
+    if now < session.clock_grace_until:
+        # Changement de vitesse en cours : les deux horloges n'ont pas encore la meme vitesse.
+        gap = 0.0 if not session.clock_ahead else min(gap, tolerance)
     if gap < -tolerance:
         try:
             bridge_advance_clock(-gap)
@@ -1482,6 +1570,7 @@ def on_player_speed_change():
         return                                       # meme demande juste avant (push puis pop)
     if session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'speed_request', 'speed': speed})):
         session.last_speed_request = (speed, now)
+        session.clock_grace_until = now + CLOCK_GRACE  # l'hote change de vitesse : pas de correction
         session.speed_requests += 1
         log('[client] vitesse {} demandee a l\'hote'.format(speed))
 
@@ -1556,53 +1645,62 @@ def _maybe_walk(session, now):
     if hold is not None and now < hold:
         return _walk_status(session, 'action de l\'autre joueur rejouee : pas de recalage pendant {:.0f} s'.format(
             ACTION_HOLD))
+    status, session.walk = _move_toward(session, remote, now, session.walk)
+    if status is not None:
+        _walk_status(session, status)
+
+
+def _move_toward(session, remote, now, walk):
+    """Rapproche l'exemplaire local du Sim de la position recue. Renvoie (etat ou None, marche en cours)."""
     found = bridge_local_sim_position(remote['sim_id'])
     if found is None:
-        return _walk_status(session, 'lecture du Sim impossible (voir le journal)')
+        return 'lecture du Sim impossible (voir le journal)', walk
     if found[0] == 'inconnu':
-        return _walk_status(session, 'Sim inconnu ici : ce n\'est pas la meme sauvegarde')
+        return 'Sim inconnu ici : ce n\'est pas la meme sauvegarde', walk
     if found[0] != 'present':
-        return _walk_status(session, 'Sim absent du lot ici')
+        return 'Sim absent du lot ici', walk
     x, y, z, level = found[1]
     gap = ((x - remote['x']) ** 2 + (z - remote['z']) ** 2) ** 0.5
     target = (remote['x'], remote['z'], remote['level'])
-    walk = session.walk
     if gap < WALK_MIN and (remote['level'] is None or level == remote['level']):
-        session.walk = None
-        return _walk_status(session, 'en place')
+        return 'en place', None
     same = (walk is not None and walk['target'][2] == target[2]
             and ((walk['target'][0] - target[0]) ** 2 + (walk['target'][1] - target[1]) ** 2) ** 0.5 < WALK_RETARGET)
     teleport = ((remote['level'] is not None and level is not None and level != remote['level'])
                 or gap > TELEPORT_DIST or (same and now - walk['started'] > WALK_TIMEOUT))
     if same and not teleport:
-        return                                       # deja en route vers ce point
+        return None, walk                            # deja en route vers ce point
     if walk is not None and not same and not teleport and now - walk['at'] < 1.0:
-        return                                       # au plus un nouvel ordre par seconde
+        return None, walk                            # au plus un nouvel ordre par seconde
     args = (remote['sim_id'], remote['x'], remote['y'], remote['z'], remote['level'])
+    placed = None
     _sync['pushing'] = True                          # ces ordres ne sont pas ceux du joueur
     try:
         ok = _safe('marche', bridge_move_sim, *(args + (teleport,)))
         if not ok and not teleport:
             teleport = True
             ok = _safe('teleportation', bridge_move_sim, *(args + (True,)))
-        placed = None if ok else _safe('placement', bridge_place_sim, *args)
+        # Pose directe seulement si le Sim est vraiment loin : refuser la marche veut souvent dire
+        # qu'il est occupe (assis, au lit...), et le poser l'arracherait a son action.
+        if not ok and gap > PLACE_MIN:
+            placed = _safe('placement', bridge_place_sim, *args)
     finally:
         _sync['pushing'] = False
     if not ok:
-        # Ordres du jeu refuses ou en erreur : le double est pose directement a la position.
         if placed:
             session.teleports += 1
-            session.walk = None
-            return _walk_status(session, 'pose directement (ordres de marche refuses, voir le journal)')
-        return _walk_status(session, 'impossible de le deplacer (voir le journal)')
+            return 'pose directement (ordres de marche refuses, voir le journal)', None
+        if gap <= PLACE_MIN:
+            return 'occupe : laisse en place ({:.1f} d\'ecart)'.format(gap), {
+                'target': target, 'started': now, 'at': now}
+        return 'impossible de le deplacer (voir le journal)', walk
     if teleport:
         session.teleports += 1
-        log('[{}] double teleporte ({:.1f} d\'ecart)'.format(session.role, gap))
-        session.walk = None
-        return _walk_status(session, 'teleporte')
+        log('[{}] Sim {} teleporte ({:.1f} d\'ecart)'.format(session.role, remote['sim_id'], gap))
+        return 'teleporte', None
     session.walks += 1
-    session.walk = {'target': target, 'started': now if not same else walk['started'], 'at': now}
-    _walk_status(session, 'marche vers l\'autre joueur')
+    return 'marche vers l\'autre joueur', {'target': target, 'started': now if not same else walk['started'],
+                                           'at': now}
 
 
 # -- ordres des joueurs (M5) --
@@ -1616,8 +1714,9 @@ def send_player_order(order):
     message = dict(order, kind='order', id='{}-{}'.format(session.role, session.order_counter))
     if session.endpoint.send(protocol.make_message(protocol.EVENT, message)):
         session.orders_sent += 1
-        log('[{}] ordre envoye : {} -> {} ({})'.format(session.role, order['name'], order['target']['t'],
-                                                        message['id']))
+        if not order.get('auto'):
+            log('[{}] ordre envoye : {} -> {} ({})'.format(session.role, order['name'], order['target']['t'],
+                                                            message['id']))
 
 
 def validate_order(data):
@@ -1646,7 +1745,8 @@ def validate_order(data):
     else:
         return None
     return {'id': order_id, 'sim_id': sim_id, 'affordance': affordance,
-            'name': _clean_text(data.get('name')) or str(affordance), 'target': clean}
+            'name': _clean_text(data.get('name')) or str(affordance), 'target': clean,
+            'auto': data.get('auto') is True}
 
 
 def _handle_order(session, data):
@@ -1661,21 +1761,29 @@ def _handle_order(session, data):
     if _gate['waiting']:
         session.last_order = '{} : ignore (attente de l\'autre joueur)'.format(order['name'])
         return
+    if order['auto'] and _needs_authority(session, order['sim_id'], _my_active_id()):
+        return                                       # action autonome d'un Sim dont ce PC fait foi
     _sync['pushing'] = True                          # pas un ordre du joueur de ce PC
     try:
-        result = _safe('ordre rejoue', bridge_replay_order, order['sim_id'], order['affordance'], order['target'])
+        result = _safe('ordre rejoue', bridge_replay_order, order['sim_id'], order['affordance'], order['target'],
+                       order['auto'])
     finally:
         _sync['pushing'] = False
     ok, reason = result if result is not None else (False, 'erreur (voir le journal)')
+    label = '{}{}'.format(order['name'], ' (autonomie)' if order['auto'] else '')
     if ok:
         session.orders_replayed += 1
         session.action_hold[order['sim_id']] = time.monotonic() + ACTION_HOLD
-        session.walk = None
-        session.last_order = '{} : rejouee'.format(order['name'])
+        if not order['auto']:
+            session.walk = None
+        session.sims_walk.pop(order['sim_id'], None)
+        session.last_order = '{} : rejouee'.format(label)
     else:
         session.orders_failed += 1
-        session.last_order = '{} : non rejouee, {}'.format(order['name'], reason)
-    log('[{}] ordre {} {}'.format(session.role, order['id'], session.last_order))
+        session.last_order = '{} : non rejouee, {}'.format(label, reason)
+    if not order['auto'] or not ok:
+        # Les actions autonomes reussies sont nombreuses : seules les refusees vont au journal.
+        log('[{}] ordre {} {}'.format(session.role, order['id'], session.last_order))
 
 
 def on_player_order(queue, interaction):
@@ -1685,16 +1793,112 @@ def on_player_order(queue, interaction):
         send_player_order(order)
 
 
-# -- besoins : chaque joueur fait foi pour le Sim qu'il controle --
+# -- qui fait foi pour chaque Sim (M6) --
+# L'invite fait foi pour le Sim qu'il controle (sauf si l'hote controle le meme) ;
+# l'hote fait foi pour tous les autres : sa famille, les PNJ, le Sim qu'il controle.
+
+def _my_active_id():
+    mine = _read('active_sim', _active_sim)
+    return _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
+
+
+def sim_owner(session, sim_id, mine_id):
+    """'host' ou 'client' : le PC qui fait foi pour ce Sim."""
+    other_id = session.remote_position['sim_id'] if session.remote_position else None
+    host_active, client_active = (mine_id, other_id) if session.role == 'host' else (other_id, mine_id)
+    if sim_id is not None and sim_id == client_active and client_active != host_active:
+        return 'client'
+    return 'host'
+
 
 def _needs_authority(session, sim_id, mine_id):
-    """Vrai si ce PC fait foi pour les besoins de ce Sim."""
-    if sim_id != mine_id:
+    """Vrai si ce PC fait foi pour ce Sim (besoins, autonomie, position)."""
+    return sim_owner(session, sim_id, mine_id) == session.role
+
+
+def _connected(session):
+    return (session is not None and session.handshake_done and session.endpoint.is_connected
+            and not _gate['waiting'])
+
+
+def autonomy_refused(queue, interaction):
+    """Vrai si l'autonomie de ce Sim est refusee ici : l'autre PC fait foi et envoie ses actions."""
+    session = _session
+    if _sync['pushing'] or not _connected(session) or bridge_interaction_kind(interaction) != 'auto':
         return False
-    if session.role == 'host':
-        return True
-    remote = session.remote_position
-    return remote is None or remote['sim_id'] != sim_id    # meme Sim des deux cotes : l'hote
+    sim_id = queue.sim.sim_info.sim_id
+    if _needs_authority(session, sim_id, _my_active_id()):
+        return False
+    session.autonomy_refused += 1
+    return True
+
+
+def on_autonomy_action(queue, interaction):
+    """Action decidee par l'autonomie d'un Sim dont ce PC fait foi : envoyee a l'autre PC."""
+    session = _session
+    if not _connected(session):
+        return
+    sim_id = queue.sim.sim_info.sim_id
+    if not _needs_authority(session, sim_id, _my_active_id()):
+        return
+    order = _safe('lecture de l\'action autonome', bridge_order_from_interaction, queue, interaction, 'auto')
+    if order is not None:
+        send_player_order(order)
+
+
+# -- positions de tous les Sims dont ce PC fait foi (M6) --
+
+def _maybe_send_sims(session, now):
+    if not (session.endpoint.is_connected and session.handshake_done):
+        return
+    if now - session.sims_checked_at < POSITION_INTERVAL:
+        return
+    session.sims_checked_at = now
+    mine_id = _my_active_id()
+    ids = _safe('liste des Sims', bridge_instanced_sim_ids) or []
+    changed = []
+    for sim_id in ids:
+        if sim_id == mine_id or not _needs_authority(session, sim_id, mine_id):
+            continue                                 # mon Sim part deja par « position »
+        snapshot = _safe('position d\'un Sim', bridge_sim_snapshot, sim_id)
+        if snapshot is None or not _moved(session.sims_sent.get(sim_id), snapshot):
+            continue
+        changed.append(snapshot)
+        if len(changed) >= SIMS_MAX:
+            break
+    if changed and session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'sims', 'list': changed})):
+        for snapshot in changed:
+            session.sims_sent[snapshot['sim_id']] = snapshot
+
+
+def _follow_sim(session, sim_id, now):
+    entry = session.sims_remote.get(sim_id)
+    if entry is None or _gate['waiting']:
+        return
+    position = entry
+    if position['zone_id'] is None or position['zone_id'] != bridge_current_zone_id():
+        return
+    hold = session.action_hold.get(sim_id)
+    if hold is not None and now < hold:
+        return
+    status, session.sims_walk[sim_id] = _move_toward(session, position, now, session.sims_walk.get(sim_id))
+    if status is not None:
+        session.sims_status[sim_id] = status
+
+
+def _handle_sims(session, data):
+    entries = data.get('list')
+    if not isinstance(entries, list) or len(entries) > SIMS_MAX:
+        log('[{}] positions des Sims invalides ignorees'.format(session.role))
+        return
+    mine_id = _my_active_id()
+    now = time.monotonic()
+    for entry in entries:
+        position = validate_position(entry)
+        if position is None or _needs_authority(session, position['sim_id'], mine_id):
+            continue
+        session.sims_remote[position['sim_id']] = position
+        _follow_sim(session, position['sim_id'], now)
 
 
 def _needs_tick(session, now):
@@ -1703,21 +1907,23 @@ def _needs_tick(session, now):
     if now - session.needs_checked_at < NEEDS_INTERVAL:
         return
     session.needs_checked_at = now
-    mine = _read('active_sim', _active_sim)
-    mine_id = _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
-    if mine_id is None or not _needs_authority(session, mine_id, mine_id):
-        return
-    values = _safe('lecture des besoins', bridge_read_needs, mine_id)
-    if not values:
-        return
-    last = session.needs_sent
-    if (last is not None and last[0] == mine_id and now - last[2] < NEEDS_RESEND
-            and all(abs(last[1].get(k, NEEDS_LIMIT) - v) <= NEEDS_EPSILON for k, v in values.items())):
-        return
-    payload = {str(k): round(v, 2) for k, v in list(values.items())[:NEEDS_MAX]}
-    if session.endpoint.send(protocol.make_message(protocol.EVENT, {
-            'kind': 'needs', 'sim_id': mine_id, 'values': payload})):
-        session.needs_sent = (mine_id, values, now)
+    mine_id = _my_active_id()
+    # Tous les Sims presents dont ce PC fait foi (M6) ; a defaut de liste, le Sim controle.
+    ids = _safe('liste des Sims', bridge_instanced_sim_ids) or ([mine_id] if mine_id is not None else [])
+    for sim_id in ids:
+        if not _needs_authority(session, sim_id, mine_id):
+            continue
+        values = _safe('lecture des besoins', bridge_read_needs, sim_id)
+        if not values:
+            continue
+        last = session.needs_sent.get(sim_id)
+        if (last is not None and now - last[1] < NEEDS_RESEND
+                and all(abs(last[0].get(k, NEEDS_LIMIT) - v) <= NEEDS_EPSILON for k, v in values.items())):
+            continue
+        payload = {str(k): round(v, 2) for k, v in list(values.items())[:NEEDS_MAX]}
+        if session.endpoint.send(protocol.make_message(protocol.EVENT, {
+                'kind': 'needs', 'sim_id': sim_id, 'values': payload})):
+            session.needs_sent[sim_id] = (values, now)
 
 
 def _handle_needs(session, data):
@@ -1733,9 +1939,7 @@ def _handle_needs(session, data):
         number = _clean_float(value, NEEDS_LIMIT)
         if guid is not None and number is not None:
             values[guid] = number
-    mine = _read('active_sim', _active_sim)
-    mine_id = _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
-    if _needs_authority(session, sim_id, mine_id):
+    if _needs_authority(session, sim_id, _my_active_id()):
         return                                       # ce PC fait foi pour ce Sim
     written = _safe('ecriture des besoins', bridge_write_needs, sim_id, values)
     if written:
@@ -1746,6 +1950,11 @@ def _walk_tick(session, now):
     # Reessaie de temps en temps : double arrive, bloque ou ordre refuse.
     if session.walk is not None and now - session.walk['at'] >= WALK_RETRY:
         _maybe_walk(session, now)
+    # Autres Sims (M6) : recalage periodique sur la derniere position recue.
+    if session.sims_remote and now - session.sims_followed_at >= WALK_RETRY:
+        session.sims_followed_at = now
+        for sim_id in list(session.sims_remote):
+            _follow_sim(session, sim_id, now)
 
 
 def sync_lines(session):
@@ -1769,6 +1978,10 @@ def sync_lines(session):
         session.orders_sent, session.orders_replayed, session.orders_failed,
         ' ; derniere : {}'.format(session.last_order) if session.last_order else ''))
     lines.append('Besoins : {} valeur(s) recopiee(s) depuis l\'autre PC'.format(session.needs_written))
+    moving = sum(1 for status in session.sims_status.values() if status.startswith('marche'))
+    lines.append('Autres Sims ({}) : {} suivi(s), {} en marche ; autonomie refusee ici {} fois'.format(
+        'l\'hote fait foi' if session.role == 'client' else 'ce PC fait foi',
+        len(session.sims_remote), moving, session.autonomy_refused))
     return lines
 
 
@@ -2003,7 +2216,7 @@ def _install_queue_hook():
     def append(self, interaction, *args, **kwargs):
         refused = None
         try:
-            if queue_refuses(interaction):
+            if queue_refuses(interaction) or autonomy_refused(self, interaction):
                 refused = bridge_refused_action()
         except Exception:
             # En cas d'erreur du mod, le jeu garde son comportement normal.
@@ -2012,10 +2225,13 @@ def _install_queue_hook():
             return refused
         try:
             # Ordre du joueur de ce PC (pas un ordre donne par le mod) : « le dernier ordre gagne »,
-            # et l'action part tout de suite vers l'autre PC (M5).
+            # et l'action part tout de suite vers l'autre PC (M5). Action autonome d'un Sim dont
+            # ce PC fait foi : envoyee aussi (M6).
             if not _sync['pushing'] and _is_user_directed(interaction):
                 record_local_order(self.sim.sim_info.sim_id)
                 on_player_order(self, interaction)
+            elif not _sync['pushing']:
+                on_autonomy_action(self, interaction)
         except Exception:
             _sync_error('suivi des ordres du joueur')
         return original(self, interaction, *args, **kwargs)
