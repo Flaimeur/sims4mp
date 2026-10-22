@@ -1,4 +1,7 @@
-# Sims 4 Multiplayer - correctif menu (0.14.2) : tests regles de la base remplaces par des
+# Sims 4 Multiplayer - diagnostic menu (0.14.3) : ChoiceMenu.add_potential_aops / add_aop
+# sont suivis pour noter dans le journal si l'entree est proposee a la roue Maj + clic et
+# la raison d'un refus du jeu (une ligne par situation differente).
+# Correctif menu (0.14.2) : tests regles de la base remplaces par des
 # listes vides (event_testing.tests.TestList) au lieu de couper _tunable_tests_enabled, qui
 # faisait planter Interaction.test (UnboundLocalError target_result, entree cachee en 0.14.1).
 # Correctif menu (0.14.1) : la base de « Sims4MP… » n'est plus un
@@ -169,7 +172,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.14.2'
+MOD_VERSION = '0.14.3'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -2569,7 +2572,8 @@ MENU_CHOICES = (
     (5, 'Jouer seul (se déconnecter)'),
     (6, 'Fermer'),
 )
-_menu = {'affordance': None, 'error': None, 'opened': 0}
+_menu = {'affordance': None, 'error': None, 'opened': 0, 'seen': set()}
+MENU_SEEN_MAX = 20                                    # diagnostics de roue differents notes au plus
 
 
 def _raw(text):
@@ -2948,6 +2952,52 @@ def write_report():
     except Exception:
         log('ERREUR rapport :\n' + traceback.format_exc())
         return None
+
+
+def _menu_diag(text):
+    """Note une fois chaque situation de la roue pour l'entree Sims4MP (diagnostic)."""
+    if text in _menu['seen'] or len(_menu['seen']) >= MENU_SEEN_MAX:
+        return
+    _menu['seen'].add(text)
+    log('menu (roue) : ' + text)
+
+
+def _install_menu_diag_hook():
+    """Roue du jeu (server_commands.interaction_commands.generate_choices ->
+    ChoiceMenu.add_potential_aops -> ChoiceMenu.add_aop, verifie dans simulation.zip) :
+    note si l'entree Sims4MP est proposee et le resultat du test du jeu."""
+    from interactions.choices import ChoiceMenu
+    original_potential = ChoiceMenu.add_potential_aops
+    original_add = ChoiceMenu.add_aop
+    if getattr(original_add, '_sims4mp_hook', False):
+        return
+
+    @functools.wraps(original_potential)
+    def add_potential_aops(self, target, context, potential_aops, *args, **kwargs):
+        try:
+            menu = _menu['affordance']
+            if menu is not None and getattr(context, 'shift_held', False):
+                present = any(getattr(aop, 'affordance', None) is menu for aop in potential_aops)
+                _menu_diag('entree {} parmi les {} actions de {}'.format(
+                    'presente' if present else 'ABSENTE', len(potential_aops), type(target).__name__))
+        except Exception:
+            _menu_diag('erreur diagnostic : ' + traceback.format_exc().strip().splitlines()[-1])
+        return original_potential(self, target, context, potential_aops, *args, **kwargs)
+
+    @functools.wraps(original_add)
+    def add_aop(self, aop, *args, **kwargs):
+        result = original_add(self, aop, *args, **kwargs)
+        try:
+            if _menu['affordance'] is not None and getattr(aop, 'affordance', None) is _menu['affordance']:
+                _menu_diag('test du jeu : {} ({})'.format('OK' if result else 'REFUSE',
+                                                          getattr(result, 'reason', None)))
+        except Exception:
+            _menu_diag('erreur diagnostic : ' + traceback.format_exc().strip().splitlines()[-1])
+        return result
+
+    add_aop._sims4mp_hook = True
+    ChoiceMenu.add_potential_aops = add_potential_aops
+    ChoiceMenu.add_aop = add_aop
 
 
 def _install_cancel_hook():
@@ -3586,6 +3636,11 @@ try:
     _install_cancel_hook()
 except Exception:
     log('ERREUR installation suivi des annulations :\n' + traceback.format_exc())
+
+try:
+    _install_menu_diag_hook()
+except Exception:
+    log('ERREUR installation diagnostic de la roue :\n' + traceback.format_exc())
 
 try:
     _install_speed_hook()

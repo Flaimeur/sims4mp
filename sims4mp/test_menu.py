@@ -143,6 +143,26 @@ class PickerSuperInteractionMixin(object):
 module('interactions.base.picker_interaction', PickerSuperInteractionMixin=PickerSuperInteractionMixin)
 
 
+class ChoiceMenu(object):
+    """Comme interactions.choices.ChoiceMenu : add_potential_aops appelle add_aop."""
+
+    def __init__(self):
+        self.items = []
+
+    def add_potential_aops(self, target, context, potential_aops, scoring_gsi_handler=None):
+        for aop in potential_aops:
+            self.add_aop(aop, context, user_pick_target=target)
+
+    def add_aop(self, aop, context, user_pick_target=None, result_override=None, do_test=True):
+        result = aop.affordance.test(aop.target, context)
+        if result:
+            self.items.append(aop)
+        return result
+
+
+module('interactions.choices', ChoiceMenu=ChoiceMenu)
+
+
 class TravelWithPicker(PickerSuperInteractionMixin, ImmediateSuperInteraction):
     # Comme « Voyager avec » : selecteur, sa roue liste des Sims (vide = cachee).
     pass
@@ -264,6 +284,21 @@ report('ajoutee a la roue du sol', TerrainClass._super_affordances[-1] is menu
 mod._safe_on_zone_loaded()                            # deuxieme chargement
 report('deuxieme chargement : ni recreee ni ajoutee deux fois',
        len(MANAGER.registered) == 1 and TerrainClass._super_affordances.count(menu) == 1)
+
+# --- 1b. Diagnostic de la roue (Maj + clic) -------------------------------------------
+pie = ChoiceMenu()
+shift = types.SimpleNamespace(shift_held=True)
+aops = [types.SimpleNamespace(affordance=a, target=TERRAIN) for a in (TerrainTeleportCheat, menu)]
+pie.add_potential_aops(TERRAIN, shift, aops)
+pie.add_potential_aops(TERRAIN, shift, aops)          # meme situation : notee une seule fois
+with open(mod.LOG_PATH, encoding='utf-8') as handle:
+    diag = [line for line in handle if 'menu (roue)' in line]
+report('roue : entree proposee et acceptee, raison notee une seule fois dans le journal',
+       pie.items.count(aops[1]) == 2 and len(diag) == 2 and 'presente parmi les 2' in diag[0]
+       and 'test du jeu : OK' in diag[1], str(diag))
+ChoiceMenu().add_potential_aops(TERRAIN, types.SimpleNamespace(shift_held=False), aops[:1])
+with open(mod.LOG_PATH, encoding='utf-8') as handle:
+    report('roue sans Maj : rien de note', sum('menu (roue)' in line for line in handle) == 2)
 
 # --- 2. La fenetre ----------------------------------------------------------------------
 result = menu()._run_interaction_gen(None)
