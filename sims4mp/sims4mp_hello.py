@@ -1,5 +1,8 @@
-# Sims 4 Multiplayer - etape M3 : chaque joueur envoie la position de son Sim
-# actif (lecture seule, mp.positions). M2 : pause imposee tant que les deux
+# Sims 4 Multiplayer - etape M4 : synchro en jeu de l'argent (gains et depenses
+# des deux cotes), de l'heure et de la vitesse (celles de l'hote) et des
+# positions (le double du Sim de l'autre joueur marche jusqu'a lui).
+# M3 : chaque joueur envoie la position de son Sim
+# actif (mp.positions). M2 : pause imposee tant que les deux
 # joueurs ne sont pas en jeu, file d'attente bloquee pendant l'attente. M1 : role lu
 # depuis le lanceur, connexion automatique, notifications ; etat en lecture
 # seule (mp.state).
@@ -61,7 +64,28 @@
 # (InteractionQueue, pose dans Sim.__init__) et queue.running -> .affordance
 # .__name__ ; services.sim_info_manager().get(sim_id). L'autre cote valide et
 # garde la derniere position ; mp.positions la compare au meme Sim local.
-# Rien n'est deplace.
+#
+# Synchro (M4). API verifiees dans simulation.zip :
+#   argent  household.funds (FamilyFunds) : .money, .add(montant, raison, sim),
+#           .try_remove(montant, raison, sim, require_full_amount) ; raison
+#           Consts_pb2.TELEMETRY_MONEY_CHEAT, comme sims.modify_funds / motherlode.
+#           Chaque PC envoie la difference de solde vue depuis la derniere
+#           lecture (EVENT money, delta) ; l'autre l'applique. A la connexion,
+#           l'hote envoie son solde et l'invite s'y aligne une fois.
+#   heure   services.game_clock_service().now().absolute_seconds() (secondes de
+#           jeu), .advance_game_time(hours, minutes, seconds), .clock_speed ;
+#           ClockSpeedMode(valeur) et ClockSpeedMode.values comme
+#           clock_commands.set_speed_internal / set_clock_speed. L'hote envoie
+#           heure et vitesse ; l'invite avance son heure s'il est en retard,
+#           se met en pause s'il est en avance, et prend la vitesse de l'hote
+#           (demande SITUATION, comme la pause de M2).
+#   marche  comme la commande du jeu sims.gohere (server_commands/sim_commands) :
+#           sims4.math.Vector3, routing.SurfaceIdentifier(zone, niveau,
+#           SurfaceType.SURFACETYPE_WORLD), _build_terrain_interaction_target_and_context
+#           (sim, pos, surface, PickType.PICK_TERRAIN, objects.terrain.TerrainPoint)
+#           puis sim.push_super_affordance(CommandTuning.TERRAIN_GOHERE_AFFORDANCE,
+#           cible, contexte) ; teleportation : TERRAIN_TELEPORT_AFFORDANCE (sims.teleport).
+#           Le Sim que ce joueur controle n'est jamais deplace par l'autre.
 
 import functools
 import json
@@ -72,7 +96,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.7.0'
+MOD_VERSION = '0.8.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -94,6 +118,17 @@ POSITION_INTERVAL = 1.0                   # secondes reelles entre deux lectures
 POSITION_MIN_MOVE = 0.05                  # deplacement minimal (unites du jeu) pour renvoyer
 POSITION_MAX_COORD = 100000.0
 POSITION_LEVELS = (-16, 64)
+MONEY_INTERVAL = 0.5                      # secondes reelles entre deux lectures de l'argent
+MONEY_MAX_DELTA = 10 ** 9
+CLOCK_INTERVAL = 1.0                      # host : envoi de l'heure et de la vitesse
+CLOCK_BEHIND = 300.0                      # invite en retard de plus (secondes de jeu) : avance
+CLOCK_AHEAD = 300.0                       # invite en avance de plus : pause jusqu'a etre rattrape
+CLOCK_AHEAD_RESUME = 60.0                 # ... et reprise sous cet ecart
+WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
+WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
+WALK_RETRY = 3.0                          # secondes reelles avant de redonner le meme ordre
+WALK_TIMEOUT = 15.0                       # toujours loin apres : teleportation
+TELEPORT_DIST = 40.0                      # plus loin, ou autre niveau : teleportation directe
 
 
 # ---------------------------------------------------------------------------
@@ -402,8 +437,84 @@ def bridge_local_sim_position(sim_id):
     return _read('local_sim', lambda: _local_sim_position(sim_id))
 
 
-# Seules ecritures du mod dans le jeu : la demande de pause (horloge) et le
-# refus d'une action du joueur (file d'attente), voir l'en-tete.
+# --- Synchro (M4) : lectures et ecritures, voir l'en-tete -------------------
+
+def bridge_funds():
+    """(id du foyer actif, solde) ou None."""
+    household = _active_household()
+    if household is None:
+        return None
+    return household.id, int(household.funds.money)
+
+
+def bridge_apply_funds(delta):
+    """Ajoute (delta > 0) ou retire (delta < 0) de l'argent au foyer actif ; renvoie le nouveau solde."""
+    from protocolbuffers import Consts_pb2
+    household = _active_household()
+    funds = household.funds
+    sim = _active_sim()
+    if delta > 0:
+        funds.add(delta, Consts_pb2.TELEMETRY_MONEY_CHEAT, sim)
+    elif delta < 0:
+        funds.try_remove(-delta, Consts_pb2.TELEMETRY_MONEY_CHEAT, sim, require_full_amount=False)
+    return int(funds.money)
+
+
+def bridge_clock():
+    """(secondes de jeu depuis le debut, vitesse) de l'horloge locale."""
+    import services
+    clock = services.game_clock_service()
+    return float(clock.now().absolute_seconds()), int(clock.clock_speed)
+
+
+def bridge_advance_clock(seconds):
+    import services
+    services.game_clock_service().advance_game_time(0, 0, int(seconds))
+
+
+def bridge_valid_speed(value):
+    from clock import ClockSpeedMode
+    return value in ClockSpeedMode.values
+
+
+def bridge_push_speed(value):
+    import services
+    from clock import ClockSpeedMode, GameSpeedChangeSource
+    return services.game_clock_service().push_speed(
+        ClockSpeedMode(value), source=GameSpeedChangeSource.SITUATION,
+        validity_check=None, reason='Sims4MP : vitesse de l\'hote', immediate=True)
+
+
+def _terrain_target(sim, x, y, z, level):
+    import routing
+    import services
+    import sims4.math
+    from objects.terrain import TerrainPoint
+    from server.pick_info import PickType
+    from server_commands.sim_commands import _build_terrain_interaction_target_and_context
+    position = sims4.math.Vector3(x, y, z)
+    surface = routing.SurfaceIdentifier(services.current_zone_id(), level or 0,
+                                        routing.SurfaceType.SURFACETYPE_WORLD)
+    return _build_terrain_interaction_target_and_context(sim, position, surface, PickType.PICK_TERRAIN,
+                                                         TerrainPoint)
+
+
+def bridge_move_sim(sim_id, x, y, z, level, teleport):
+    """Fait marcher (ou teleporte) le Sim sim_id vers la position. Renvoie True si l'ordre est accepte."""
+    import services
+    from objects import ALL_HIDDEN_REASONS
+    from server_commands.sim_commands import CommandTuning
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    if sim is None:
+        return False
+    target, context = _terrain_target(sim, x, y, z, level)
+    affordance = CommandTuning.TERRAIN_TELEPORT_AFFORDANCE if teleport else CommandTuning.TERRAIN_GOHERE_AFFORDANCE
+    return bool(sim.push_super_affordance(affordance, target, context))
+
+
+# Attente (M2) : la demande de pause (horloge) et le refus d'une action du
+# joueur (file d'attente), voir l'en-tete.
 PAUSE_REASON = 'Sims4MP : attente de l\'autre joueur'
 
 
@@ -427,6 +538,11 @@ def bridge_is_paused():
     import services
     from clock import ClockSpeedMode
     return services.game_clock_service().clock_speed == ClockSpeedMode.PAUSED
+
+
+def bridge_paused_value():
+    from clock import ClockSpeedMode
+    return int(ClockSpeedMode.PAUSED)
 
 
 def bridge_refused_action():
@@ -470,6 +586,24 @@ class NetSession(object):
         self.position_sent = None
         self.remote_position = None
         self.remote_position_at = None
+        self._reset_sync()
+
+    def _reset_sync(self):
+        # Synchro (M4) : remise a zero a chaque nouvel autre joueur.
+        self.money_checked_at = 0.0
+        self.money_household = None     # foyer dont le solde est suivi
+        self.money_known = None         # solde a la derniere lecture (ou apres application)
+        self.money_total_sent = False   # host : solde envoye pour l'alignement initial
+        self.money_aligned = False      # invite : aligne sur le solde de l'hote
+        self.money_sent = 0             # nombre de differences envoyees / appliquees
+        self.money_applied = 0
+        self.clock_sent_at = 0.0
+        self.host_clock = None          # invite : (secondes, vitesse) recues de l'hote
+        self.clock_ahead = False
+        self.clock_jumps = 0
+        self.walk = None                # dernier ordre de marche donne au double
+        self.walks = 0
+        self.teleports = 0
 
 
 # ---------------------------------------------------------------------------
@@ -590,6 +724,7 @@ def _handle_host_event(session, kind, value):
         session.presence_sent_at = 0.0
         session.position_sent = None
         session.remote_position = None
+        session._reset_sync()
     elif kind == 'disconnected':
         if session.handshake_done:
             bridge_notify('L\'autre joueur a quitté la partie. En attente d\'une nouvelle connexion…')
@@ -627,6 +762,8 @@ def _handle_host_event(session, kind, value):
                 session.peer_seen_at = time.monotonic()
             elif data.get('kind') == 'position':
                 _handle_position(session, data)
+            elif data.get('kind') == 'money':
+                _handle_money(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -672,6 +809,10 @@ def _handle_client_event(session, kind, value):
                 session.peer_seen_at = time.monotonic()
             elif value['data'].get('kind') == 'position':
                 _handle_position(session, value['data'])
+            elif value['data'].get('kind') == 'money':
+                _handle_money(session, value['data'])
+            elif value['data'].get('kind') == 'clock':
+                _handle_clock(session, value['data'])
             else:
                 log('[client] EVENT ignore (kind {!r})'.format(value['data'].get('kind')))
         elif msg_type == protocol.BYE:
@@ -755,6 +896,7 @@ def pump_tick():
         _pump['last_poll'] = now
         _poll_session(session, now)
     _gate_tick(time.monotonic())          # pause et file : a chaque tick, meme sans session
+    _release_clock_if_unused(_session)    # vitesse de l'hote retiree hors session d'invite
 
 
 def _poll_session(session, now):
@@ -763,7 +905,8 @@ def _poll_session(session, now):
     for kind, value in session.endpoint.poll():
         if kind == 'message':
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
-            if value['type'] != protocol.EVENT or value['data'].get('kind') not in ('state', 'presence', 'position'):
+            if value['type'] != protocol.EVENT or value['data'].get('kind') not in ('state', 'presence', 'position',
+                                                                                    'clock'):
                 log('[{}] recu : {}'.format(session.role, _describe(value)))
         else:
             log('[{}] {} : {}'.format(session.role, kind, value))
@@ -785,6 +928,9 @@ def _poll_session(session, now):
     if _session is session:
         _maybe_send_presence(session, now)
         _maybe_send_position(session, now)
+        _money_tick(session, now)
+        _clock_tick(session, now)
+        _walk_tick(session, now)
 
 
 # ---------------------------------------------------------------------------
@@ -853,6 +999,8 @@ def _handle_position(session, data):
     if previous is None or previous['sim_id'] != position['sim_id']:
         log('[{}] l\'autre joueur controle {} ({})'.format(session.role, position['name'], position['sim_id']))
         bridge_notify('L\'autre joueur contrôle {}.'.format(position['name'] or 'un Sim'))
+        session.walk = None
+    _maybe_walk(session, session.remote_position_at)
 
 
 def _position_text(position):
@@ -896,6 +1044,244 @@ def position_lines(session, now):
         gap = ((x - remote['x']) ** 2 + (z - remote['z']) ** 2) ** 0.5
         lines.append('  Ici : x {:.2f} , y {:.2f} , z {:.2f} , niveau {} -> ecart {:.2f}'.format(
             x, y, z, level, gap))
+    return lines
+
+
+# ---------------------------------------------------------------------------
+# Synchro en jeu (M4) : argent, heure et vitesse, marche du double
+# ---------------------------------------------------------------------------
+
+_sync = {
+    'clock_request': None,   # invite : demande de vitesse posee dans l'horloge
+    'clock_value': None,     # ... et sa valeur
+    'errors': {},            # derniere erreur par sujet (journalisee une fois par message)
+}
+
+
+def _sync_error(where):
+    text = traceback.format_exc()
+    last = text.strip().splitlines()[-1]
+    if _sync['errors'].get(where) != last:
+        log('synchro : {} impossible :\n{}'.format(where, text))
+    _sync['errors'][where] = last
+
+
+def _safe(where, func, *args):
+    try:
+        return func(*args)
+    except Exception:
+        _sync_error(where)
+        return None
+
+
+# -- argent --
+
+def _money_flush(session):
+    """Envoie la difference de solde vue depuis la derniere lecture. Renvoie le solde lu."""
+    read = _safe('lecture argent', bridge_funds)
+    if read is None:
+        return None
+    household_id, money = read
+    if session.money_household != household_id:
+        session.money_household = household_id      # nouveau foyer : simple point de depart
+        session.money_known = money
+        return money
+    delta = money - session.money_known
+    if delta and session.endpoint.send(protocol.make_message(
+            protocol.EVENT, {'kind': 'money', 'delta': delta, 'household_id': household_id})):
+        session.money_known = money
+        session.money_sent += 1
+        log('[{}] argent : {:+d} envoye (solde {})'.format(session.role, delta, money))
+    return money
+
+
+def _money_tick(session, now):
+    if not (session.endpoint.is_connected and session.handshake_done):
+        return
+    if now - session.money_checked_at < MONEY_INTERVAL:
+        return
+    session.money_checked_at = now
+    money = _money_flush(session)
+    if session.role == 'host' and money is not None and not session.money_total_sent:
+        # Alignement initial : l'invite prend une fois le solde de l'hote.
+        if session.endpoint.send(protocol.make_message(protocol.EVENT, {
+                'kind': 'money', 'total': money, 'household_id': session.money_household})):
+            session.money_total_sent = True
+
+
+def _apply_money(session, delta, reason):
+    _money_flush(session)                               # ne pas perdre une depense locale en cours
+    if session.money_household is None:
+        return False
+    money = _safe('argent', bridge_apply_funds, delta)
+    if money is None:
+        return False
+    session.money_known = money
+    session.money_applied += 1
+    log('[{}] argent : {:+d} applique ({}), solde {}'.format(session.role, delta, reason, money))
+    return True
+
+
+def _handle_money(session, data):
+    household_id = _clean_int(data.get('household_id'), 0, 2 ** 64)
+    local = _safe('lecture argent', bridge_funds)
+    if household_id is None or local is None or local[0] != household_id:
+        log('[{}] argent ignore : foyer different (recu {} , ici {})'.format(
+            session.role, household_id, local[0] if local else None))
+        return
+    if 'total' in data:
+        total = _clean_int(data.get('total'), -STATE_MAX_FUNDS, STATE_MAX_FUNDS)
+        if session.role != 'client' or total is None or session.money_aligned:
+            return
+        session.money_aligned = True
+        _money_flush(session)
+        delta = total - (session.money_known if session.money_known is not None else local[1])
+        if delta and _apply_money(session, delta, 'alignement sur l\'hote'):
+            bridge_notify('Argent aligné sur l\'hôte : {} simflouz.'.format(total))
+        return
+    delta = _clean_int(data.get('delta'), -MONEY_MAX_DELTA, MONEY_MAX_DELTA)
+    if not delta:
+        log('[{}] argent : difference invalide ignoree'.format(session.role))
+        return
+    _apply_money(session, delta, 'autre joueur')
+
+
+# -- heure et vitesse (celles de l'hote) --
+
+def _clock_tick(session, now):
+    if not (session.endpoint.is_connected and session.handshake_done):
+        return
+    if session.role != 'host' or now - session.clock_sent_at < CLOCK_INTERVAL:
+        return
+    session.clock_sent_at = now
+    read = _safe('lecture heure', bridge_clock)
+    if read is not None:
+        session.endpoint.send(protocol.make_message(protocol.EVENT, {
+            'kind': 'clock', 'seconds': read[0], 'speed': read[1]}))
+
+
+def _set_clock_request(value):
+    """Pose (ou remplace) la demande de vitesse de l'invite ; None la retire."""
+    old = _sync['clock_request']
+    if old is not None and value is not None and value == _sync['clock_value']:
+        current = _safe('lecture vitesse', bridge_clock)
+        if current is not None and current[1] == value:
+            return                                   # deja a la bonne vitesse
+    if old is not None:
+        _sync['clock_request'] = None
+        _safe('vitesse', bridge_remove_pause, old)
+    _sync['clock_value'] = value
+    if value is not None:
+        _sync['clock_request'] = _safe('vitesse', bridge_push_speed, value)
+
+
+def _handle_clock(session, data):
+    seconds = _clean_float(data.get('seconds'), 10.0 ** 13)
+    speed = _clean_int(data.get('speed'), 0, 16)
+    if seconds is None or seconds < 0 or speed is None or not _safe('vitesse', bridge_valid_speed, speed):
+        log('[client] heure de l\'hote invalide ignoree')
+        return
+    session.host_clock = (seconds, speed)
+    if _gate['waiting']:
+        return                                       # la pause d'attente passe avant
+    local = _safe('lecture heure', bridge_clock)
+    if local is None:
+        return
+    gap = local[0] - seconds                         # > 0 : l'invite est en avance
+    if gap < -CLOCK_BEHIND:
+        try:
+            bridge_advance_clock(-gap)
+        except Exception:
+            _sync_error('avance de l\'heure')
+        else:
+            session.clock_jumps += 1
+            log('[client] heure : en retard de {:.0f} s de jeu, avancee'.format(-gap))
+            gap = 0.0
+    if gap > CLOCK_AHEAD and not session.clock_ahead:
+        session.clock_ahead = True
+        log('[client] heure : en avance de {:.0f} s de jeu, pause jusqu\'a etre rattrape'.format(gap))
+    elif gap < CLOCK_AHEAD_RESUME and session.clock_ahead:
+        session.clock_ahead = False
+        log('[client] heure : rattrapee par l\'hote')
+    paused = _safe('vitesse', bridge_paused_value)
+    _set_clock_request(paused if session.clock_ahead and paused is not None else speed)
+
+
+def _release_clock_if_unused(session):
+    if _sync['clock_request'] is not None and (
+            session is None or session.role != 'client' or not session.handshake_done):
+        _set_clock_request(None)
+        log('synchro : vitesse de l\'hote retiree')
+
+
+# -- marche du double --
+
+def _maybe_walk(session, now):
+    """Fait marcher le double du Sim de l'autre joueur vers sa derniere position."""
+    remote = session.remote_position
+    if remote is None or _gate['waiting']:
+        return
+    if remote['zone_id'] is None or remote['zone_id'] != bridge_current_zone_id():
+        return
+    mine = _read('active_sim', _active_sim)
+    mine_id = _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
+    if mine_id == remote['sim_id']:
+        return                                       # le Sim de ce joueur n'est jamais deplace
+    found = bridge_local_sim_position(remote['sim_id'])
+    if found is None or found[0] != 'present':
+        return
+    x, y, z, level = found[1]
+    gap = ((x - remote['x']) ** 2 + (z - remote['z']) ** 2) ** 0.5
+    target = (remote['x'], remote['z'], remote['level'])
+    walk = session.walk
+    if gap < WALK_MIN and (remote['level'] is None or level == remote['level']):
+        session.walk = None
+        return
+    same = (walk is not None and walk['target'][2] == target[2]
+            and ((walk['target'][0] - target[0]) ** 2 + (walk['target'][1] - target[1]) ** 2) ** 0.5 < WALK_RETARGET)
+    teleport = ((remote['level'] is not None and level is not None and level != remote['level'])
+                or gap > TELEPORT_DIST or (same and now - walk['started'] > WALK_TIMEOUT))
+    if same and not teleport:
+        return                                       # deja en route vers ce point
+    if walk is not None and not same and not teleport and now - walk['at'] < 1.0:
+        return                                       # au plus un nouvel ordre par seconde
+    ok = _safe('marche', bridge_move_sim, remote['sim_id'], remote['x'], remote['y'], remote['z'],
+               remote['level'], teleport)
+    if not ok and not teleport:
+        teleport = True
+        ok = _safe('teleportation', bridge_move_sim, remote['sim_id'], remote['x'], remote['y'], remote['z'],
+                   remote['level'], True)
+    if not ok:
+        return
+    if teleport:
+        session.teleports += 1
+        log('[{}] double teleporte ({:.1f} d\'ecart)'.format(session.role, gap))
+        session.walk = None
+        return
+    session.walks += 1
+    session.walk = {'target': target, 'started': now if not same else walk['started'], 'at': now}
+
+
+def _walk_tick(session, now):
+    # Reessaie de temps en temps : double arrive, bloque ou ordre refuse.
+    if session.walk is not None and now - session.walk['at'] >= WALK_RETRY:
+        _maybe_walk(session, now)
+
+
+def sync_lines(session):
+    lines = ['Argent : {} difference(s) envoyee(s), {} appliquee(s){}'.format(
+        session.money_sent, session.money_applied,
+        ' , solde suivi {}'.format(session.money_known) if session.money_known is not None else '')]
+    if session.role == 'client':
+        clock = session.host_clock
+        lines.append('Heure : {}{}{}'.format(
+            'vitesse de l\'hote {}'.format(clock[1]) if clock else 'rien recu de l\'hote',
+            ' , en avance : pause' if session.clock_ahead else '',
+            ' , {} avance(s) d\'heure'.format(session.clock_jumps) if session.clock_jumps else ''))
+    else:
+        lines.append('Heure : envoyee a l\'invite (l\'heure et la vitesse de l\'hote font foi)')
+    lines.append('Double de l\'autre joueur : {} ordre(s) de marche, {} teleportation(s)'.format(
+        session.walks, session.teleports))
     return lines
 
 
@@ -1523,7 +1909,7 @@ def mp_positions(_connection=None):
         if session is None or not session.handshake_done:
             output('Aucune partie a deux connectee (mp.status).')
             return
-        for line in position_lines(session, time.monotonic()):
+        for line in position_lines(session, time.monotonic()) + sync_lines(session):
             output(line)
     except Exception:
         log('ERREUR mp.positions :\n' + traceback.format_exc())
@@ -1543,6 +1929,7 @@ def mp_disconnect(_connection=None):
             return
         _close_session(send_bye=True)
         _gate_tick(time.monotonic())
+        _release_clock_if_unused(None)
         output('Session fermee.' + (' Connexion automatique arretee.' if stopped_auto else ''))
     except Exception:
         log('ERREUR mp.disconnect :\n' + traceback.format_exc())
