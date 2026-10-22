@@ -468,7 +468,7 @@ double.accept = True
 count_mine = len(my_sim.pushed)
 send(position(sim_id=1001, name='Élise Petrova', x=30.0, z=30.0))
 pump_for(0.2, extra=presence)
-report('le Sim que ce joueur controle n\'est jamais deplace', len(my_sim.pushed) == count_mine)
+report('meme Sim des deux cotes, aucun ordre recent : l\'hote garde la main', len(my_sim.pushed) == count_mine)
 count = len(double.pushed)
 ZONE['id'] = 777
 send(position(x=5.0, z=5.0))
@@ -482,11 +482,24 @@ mod.mp_positions()
 report('mp.positions dit pourquoi le double ne bouge pas', 'autre lot (zone 555 , ici 555)' in
        '\n'.join(_CheatOutput.lines) or 'autre lot' in session.walk_status,
        session.walk_status)
-del notes[:]
-send(position(sim_id=1001, name='Élise Petrova', x=40.0, z=40.0))
-pump_until(lambda: 'meme Sim' in session.walk_status, extra=presence)
-report('meme Sim controle des deux cotes : notification une fois',
-       sum('même Sim' in n for n in notes) == 1)
+count_mine = len(my_sim.pushed)
+send(position(sim_id=1001, name='Élise Petrova', x=40.0, z=40.0, order_age=0.5, order_seq=1))
+pump_until(lambda: len(my_sim.pushed) > count_mine, extra=presence)
+report('meme Sim : l\'autre joueur vient de lui donner un ordre, mon Sim le suit',
+       len(my_sim.pushed) > count_mine and my_sim.pushed[-1][1].location[0].x == 40.0)
+mod.record_local_order(1001)                                   # je donne un ordre ensuite
+my_sim.position = Vector3(1.0, 0.0, 1.0)
+count_mine = len(my_sim.pushed)
+before = len(events('position'))
+send(position(sim_id=1001, name='Élise Petrova', x=50.0, z=50.0, order_age=5.0, order_seq=1))
+pump_until(lambda: len(events('position')) > before, extra=presence)
+pump_for(0.15, extra=presence)
+mine_sent = [e for e in events('position')[before:] if e['sim_id'] == 1001]
+report('mon ordre est plus recent : mon Sim garde mon ordre',
+       len(my_sim.pushed) == count_mine and 'votre dernier ordre' in session.walk_status)
+report('mon ordre part avec ma position (numero et age)',
+       mine_sent and mine_sent[-1]['order_seq'] == 1 and 0 <= mine_sent[-1]['order_age'] < 1.0,
+       str(mine_sent[-1:]))
 double.position = Vector3(18.0, 0.0, 12.0)
 double.level = 0
 double.broken = True                                         # ordres du jeu en erreur

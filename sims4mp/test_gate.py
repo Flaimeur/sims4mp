@@ -276,6 +276,20 @@ report('presence recue : pause levee, le jeu reprend la vitesse du joueur',
        released and GAME_CLOCK.clock_speed == ClockSpeedMode.NORMAL
        and any('Les deux joueurs sont en jeu' in n for n in notes))
 report('actions du joueur de nouveau acceptees', bool(queue.append(player_action)))
+
+# Ordres du joueur notes pour « le dernier ordre gagne » (pas ceux du mod ni l'autonomie).
+queue.sim = types.SimpleNamespace(sim_info=types.SimpleNamespace(sim_id=777))
+mod._sync['orders'].clear()
+queue.append(autonomous)
+no_auto = 777 not in mod._sync['orders']
+mod._sync['pushing'] = True
+queue.append(player_action)
+mod._sync['pushing'] = False
+no_mod = 777 not in mod._sync['orders']
+queue.append(player_action)
+queue.append(player_action)
+report('ordres du joueur notes par Sim (pas l\'autonomie, pas les ordres du mod)',
+       no_auto and no_mod and mod._sync['orders'].get(777, (0, 0))[1] == 2)
 got_presence = pump_until(lambda: any(k == 'message' and v['type'] == protocol.EVENT
                                       and v['data'].get('kind') == 'presence' for k, v in inbox),
                           extra=peer_side)

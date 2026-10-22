@@ -90,7 +90,12 @@
 #           (sim, pos, surface, PickType.PICK_TERRAIN, objects.terrain.TerrainPoint)
 #           puis sim.push_super_affordance(CommandTuning.TERRAIN_GOHERE_AFFORDANCE,
 #           cible, contexte) ; teleportation : TERRAIN_TELEPORT_AFFORDANCE (sims.teleport).
-#           Le Sim que ce joueur controle n'est jamais deplace par l'autre.
+#           Les deux joueurs peuvent controler le meme Sim : le dernier ordre donne
+#           gagne. Les ordres du joueur sont notes dans InteractionQueue.append
+#           (interaction.is_user_directed, file de queue.sim) ; chaque position part
+#           avec l'age du dernier ordre local a ce Sim. Le double ne suit l'autre que
+#           si son ordre est plus recent ; sans ordre de part et d'autre, l'autre
+#           joueur mene son Sim, et pour un Sim controle des deux cotes c'est l'hote.
 #
 # Prototype P1 (simulation unique, lecture seule) : mp.traffic on mesure ce que
 # la simulation envoie a l'affichage. Verifie dans simulation.zip :
@@ -109,7 +114,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.8.2'
+MOD_VERSION = '0.8.3'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -142,6 +147,7 @@ WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge
 WALK_RETRY = 3.0                          # secondes reelles avant de redonner le meme ordre
 WALK_TIMEOUT = 15.0                       # toujours loin apres : teleportation
 TELEPORT_DIST = 40.0                      # plus loin, ou autre niveau : teleportation directe
+ORDER_MAX_AGE = 3600.0                    # ordre plus ancien : comme s'il n'y en avait pas
 
 
 # ---------------------------------------------------------------------------
@@ -1015,13 +1021,32 @@ def validate_position(data):
         'x': coords[0], 'y': coords[1], 'z': coords[2],
         'level': _clean_int(data.get('level'), POSITION_LEVELS[0], POSITION_LEVELS[1]),
         'action': _clean_text(data.get('action')),
+        # Age (s reelles) du dernier ordre donne a ce Sim par l'autre joueur, ou None.
+        'order_age': _clean_float(data.get('order_age'), ORDER_MAX_AGE),
+        'order_seq': _clean_int(data.get('order_seq'), 0, 2 ** 31),
     }
+
+
+def record_local_order(sim_id):
+    """Le joueur de ce PC vient de donner un ordre a ce Sim (file d'attente du jeu)."""
+    orders = _sync['orders']
+    seq = orders[sim_id][1] + 1 if sim_id in orders else 1
+    orders[sim_id] = (time.monotonic(), seq)
+
+
+def _with_order(position, now):
+    """Ajoute a la position l'age et le numero du dernier ordre local donne a ce Sim."""
+    order = _sync['orders'].get(position['sim_id'])
+    age = now - order[0] if order is not None else None
+    position['order_age'] = round(age, 2) if age is not None and age <= ORDER_MAX_AGE else None
+    position['order_seq'] = order[1] if order is not None else 0
+    return position
 
 
 def _moved(old, new):
     if old is None:
         return True
-    if any(old.get(k) != new.get(k) for k in ('sim_id', 'zone_id', 'level', 'action')):
+    if any(old.get(k) != new.get(k) for k in ('sim_id', 'zone_id', 'level', 'action', 'order_seq')):
         return True
     return any(abs(old[k] - new[k]) >= POSITION_MIN_MOVE for k in ('x', 'y', 'z'))
 
@@ -1034,7 +1059,10 @@ def _maybe_send_position(session, now):
         return
     session.position_checked_at = now
     position = bridge_read_position()
-    if position is None or not _moved(session.position_sent, position):
+    if position is None:
+        return
+    _with_order(position, now)
+    if not _moved(session.position_sent, position):
         return
     if session.endpoint.send(protocol.make_message(protocol.EVENT, position)):
         if session.position_sent is None or session.position_sent.get('sim_id') != position['sim_id']:
@@ -1050,6 +1078,9 @@ def _handle_position(session, data):
     previous = session.remote_position
     session.remote_position = position
     session.remote_position_at = time.monotonic()
+    # Moment (horloge locale) du dernier ordre de l'autre joueur a ce Sim.
+    position['order_time'] = (session.remote_position_at - position['order_age']
+                              if position['order_age'] is not None else None)
     if previous is None or previous['sim_id'] != position['sim_id']:
         log('[{}] l\'autre joueur controle {} ({})'.format(session.role, position['name'], position['sim_id']))
         bridge_notify('L\'autre joueur contrôle {}.'.format(position['name'] or 'un Sim'))
@@ -1106,6 +1137,8 @@ def position_lines(session, now):
 # ---------------------------------------------------------------------------
 
 _sync = {
+    'orders': {},            # sim_id -> (moment, numero) du dernier ordre du joueur de ce PC
+    'pushing': False,        # vrai pendant un ordre donne par le mod (pas un ordre du joueur)
     'clock_request': None,   # invite : demande de vitesse posee dans l'horloge
     'clock_value': None,     # ... et sa valeur
     'errors': {},            # derniere erreur par sujet (journalisee une fois par message)
@@ -1358,13 +1391,15 @@ def _maybe_walk(session, now):
         return _walk_status(session, 'autre lot (zone {} , ici {})'.format(remote['zone_id'], local_zone))
     mine = _read('active_sim', _active_sim)
     mine_id = _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
-    if mine_id == remote['sim_id']:
-        # Le Sim de ce joueur n'est jamais deplace par l'autre.
-        text = 'vous controlez le meme Sim que l\'autre joueur : choisissez-en un autre'
-        if session.walk_status != text:
-            bridge_notify('Vous contrôlez le même Sim que l\'autre joueur : choisissez-en un autre '
-                          'pour voir son Sim se déplacer.')
-        return _walk_status(session, text)
+    # Le dernier ordre donne a ce Sim gagne ; sans ordre de part et d'autre, l'autre joueur
+    # mene son Sim, et pour un Sim controle des deux cotes c'est l'hote.
+    local_order = _sync['orders'].get(remote['sim_id'])
+    local_time = local_order[0] if local_order is not None and now - local_order[0] <= ORDER_MAX_AGE else None
+    remote_time = remote.get('order_time')
+    if local_time is not None and (remote_time is None or local_time >= remote_time):
+        return _walk_status(session, 'votre dernier ordre a ce Sim est le plus recent : il le suit')
+    if local_time is None and remote_time is None and mine_id == remote['sim_id'] and session.role == 'host':
+        return _walk_status(session, 'meme Sim des deux cotes, aucun ordre recent : l\'hote garde la main')
     found = bridge_local_sim_position(remote['sim_id'])
     if found is None:
         return _walk_status(session, 'lecture du Sim impossible (voir le journal)')
@@ -1388,13 +1423,18 @@ def _maybe_walk(session, now):
     if walk is not None and not same and not teleport and now - walk['at'] < 1.0:
         return                                       # au plus un nouvel ordre par seconde
     args = (remote['sim_id'], remote['x'], remote['y'], remote['z'], remote['level'])
-    ok = _safe('marche', bridge_move_sim, *(args + (teleport,)))
-    if not ok and not teleport:
-        teleport = True
-        ok = _safe('teleportation', bridge_move_sim, *(args + (True,)))
+    _sync['pushing'] = True                          # ces ordres ne sont pas ceux du joueur
+    try:
+        ok = _safe('marche', bridge_move_sim, *(args + (teleport,)))
+        if not ok and not teleport:
+            teleport = True
+            ok = _safe('teleportation', bridge_move_sim, *(args + (True,)))
+        placed = None if ok else _safe('placement', bridge_place_sim, *args)
+    finally:
+        _sync['pushing'] = False
     if not ok:
         # Ordres du jeu refuses ou en erreur : le double est pose directement a la position.
-        if _safe('placement', bridge_place_sim, *args):
+        if placed:
             session.teleports += 1
             session.walk = None
             return _walk_status(session, 'pose directement (ordres de marche refuses, voir le journal)')
@@ -1673,6 +1713,12 @@ def _install_queue_hook():
             log('ERREUR file d\'attente :\n' + traceback.format_exc())
         if refused is not None:
             return refused
+        try:
+            # Ordre du joueur de ce PC (pas un ordre donne par le mod) : « le dernier ordre gagne ».
+            if not _sync['pushing'] and _is_user_directed(interaction):
+                record_local_order(self.sim.sim_info.sim_id)
+        except Exception:
+            _sync_error('suivi des ordres du joueur')
         return original(self, interaction, *args, **kwargs)
 
     append._sims4mp_hook = True
