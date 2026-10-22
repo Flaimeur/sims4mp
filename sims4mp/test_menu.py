@@ -76,6 +76,21 @@ module('event_testing')
 module('event_testing.results', TestResult=TestResult)
 
 
+class TestList(tuple):
+    """Comme event_testing.tests.TestList : run_tests renvoie TRUE si tous les tests passent."""
+
+    def run_tests(self, resolver, skip_safe_tests=False, search_for_tooltip=False):
+        for test in self:
+            result = test(resolver)
+            if not result:
+                return result
+        return TestResult.TRUE
+
+
+module('event_testing.tests', TestList=TestList)
+BASE_TESTS_FAIL = TestList((lambda resolver: TestResult(False),))
+
+
 class TunedMeta(type):
     """Comme HashedTunedInstanceMetaclass : les sous-classes heritent des reglages."""
     created = []
@@ -94,9 +109,26 @@ class ImmediateSuperInteraction(object, metaclass=TunedMeta):
     visible = True
     guid64 = 111
 
+    tests = BASE_TESTS_FAIL                           # tests regles de la base : echouent ici
+    test_globals = BASE_TESTS_FAIL
+    allow_while_save_locked = False
+    _tunable_tests_enabled = staticmethod(lambda: True)
+
     @classmethod
     def _test(cls, *args, **kwargs):
         return TestResult(False)
+
+    @classmethod
+    def test(cls, target=None, context=None):
+        # Resume d'Interaction.test (bytecode) : _test, puis si _tunable_tests_enabled()
+        # test_globals et tests ; sinon target_result n'existe pas (UnboundLocalError).
+        result = cls._test(target, context)
+        if cls._tunable_tests_enabled():
+            target_result = cls.test_globals.run_tests(None, False, search_for_tooltip=True)
+            target_result = target_result and cls.tests.run_tests(None, False, search_for_tooltip=True)
+        if not result:
+            return result
+        return target_result
 
 
 module('interactions')
@@ -214,9 +246,16 @@ report('reglages : roue Maj + clic, choisie par le joueur, jamais par l\'autonom
        menu.cheat is True and menu.debug is False and menu.allow_user_directed and not menu.allow_autonomous
        and menu.visible and menu.display_name() == 'Sims4MP…' and isinstance(menu.display_name(), RawText))
 report('tests du jeu contournes (toujours disponible)', bool(menu._test(None, None)))
-report('selecteur ignore comme base ; tests regles de la base sautes ; visible meme sauvegarde verrouillee',
-       not issubclass(menu, TravelWithPicker) and menu._tunable_tests_enabled() is False
-       and menu.allow_while_save_locked is True)
+report('selecteur ignore comme base ; visible meme sauvegarde verrouillee',
+       not issubclass(menu, TravelWithPicker) and menu.allow_while_save_locked is True)
+try:
+    menu_test = menu.test()
+    menu_test_error = ''
+except Exception as exc:                              # 0.14.1 : UnboundLocalError ici
+    menu_test, menu_test_error = None, repr(exc)
+report('test du jeu reussi malgre les tests regles de la base, sans erreur',
+       bool(menu_test) and menu._tunable_tests_enabled() is True and not TerrainTeleportCheat.test(),
+       menu_test_error)
 report('enregistree aupres du gestionnaire avec sa propre cle',
        MANAGER.registered and MANAGER.registered[0][0] is menu and menu.guid64 == MANAGER.registered[0][1].instance
        and menu.guid64 != TerrainTeleportCheat.guid64)

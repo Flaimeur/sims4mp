@@ -1,7 +1,9 @@
-# Sims 4 Multiplayer - correctif menu (0.14.1) : la base de « Sims4MP… » n'est plus un
-# selecteur (PickerSuperInteractionMixin.potential_interactions : roue vide = entree cachee),
-# les tests regles de la base sont sautes (_tunable_tests_enabled) et l'entree reste
-# disponible quand la sauvegarde est verrouillee (allow_while_save_locked).
+# Sims 4 Multiplayer - correctif menu (0.14.2) : tests regles de la base remplaces par des
+# listes vides (event_testing.tests.TestList) au lieu de couper _tunable_tests_enabled, qui
+# faisait planter Interaction.test (UnboundLocalError target_result, entree cachee en 0.14.1).
+# Correctif menu (0.14.1) : la base de « Sims4MP… » n'est plus un
+# selecteur (PickerSuperInteractionMixin.potential_interactions : roue vide = entree cachee)
+# et l'entree reste disponible quand la sauvegarde est verrouillee (allow_while_save_locked).
 # Annulation (0.14.0) : chaque ordre envoye ou rejoue est relie a
 # l'action du jeu correspondante ; la croix du joueur (Interaction.cancel_user, appele
 # par interaction_commands.cancel_common) sur une action reliee envoie l'annulation,
@@ -167,7 +169,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.14.1'
+MOD_VERSION = '0.14.2'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -2650,6 +2652,7 @@ def open_menu():
 def _menu_affordance_class(base):
     """Sous-classe de base (action reglee du jeu) : seule la presentation et l'effet changent."""
     from event_testing.results import TestResult
+    from event_testing.tests import TestList
 
     def _run_interaction_gen(self, timeline):
         try:
@@ -2672,9 +2675,13 @@ def _menu_affordance_class(base):
         'allow_autonomous': False,
         'visible': True,
         '_test': _test,
-        # Interaction.test : sans ceci, les tests regles de la base (ex. « Voyager avec »)
-        # cachent l'entree ; le verrou de sauvegarde de l'invite la griserait.
-        '_tunable_tests_enabled': staticmethod(lambda: False),
+        # Interaction.test lance test_globals.run_tests puis tests.run_tests : listes vides
+        # (TestList(()).run_tests renvoie TestResult.TRUE), pour que les tests regles de la
+        # base ne cachent pas l'entree. Ne pas couper _tunable_tests_enabled : Interaction.test
+        # plante alors (target_result non defini, 0.14.1). Le verrou de sauvegarde de
+        # l'invite griserait l'entree sans allow_while_save_locked.
+        'tests': TestList(()),
+        'test_globals': TestList(()),
         'allow_while_save_locked': True,
         '_run_interaction_gen': _run_interaction_gen,
     }
