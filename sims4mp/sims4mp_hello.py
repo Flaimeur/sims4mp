@@ -1,4 +1,7 @@
-# Sims 4 Multiplayer - etape M6 : chaque Sim a un PC qui fait foi (l'invite pour
+# Sims 4 Multiplayer - menu Sims4MP (0.11.0) : Maj + clic sur le sol (triches du
+# jeu actives) -> « Sims4MP… » : niveau des notifications, etat de la partie,
+# jouer seul. Les commandes mp.* restent en secours.
+# Etape M6 : chaque Sim a un PC qui fait foi (l'invite pour
 # le Sim qu'il controle, l'hote pour tous les autres : famille, PNJ). Ce PC envoie
 # ses positions, ses besoins et aussi les actions choisies par son autonomie
 # (SOURCE_AUTONOMY) ; l'autre PC refuse l'autonomie de ce Sim et rejoue ces actions
@@ -138,7 +141,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.10.0'
+MOD_VERSION = '0.11.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -315,8 +318,18 @@ def show_notification(title, text):
     dialog.show_dialog()
 
 
-def bridge_notify(text):
-    """Notification protegee : une erreur est journalisee, jamais propagee."""
+NOTIFY_LEVELS = ('tout', 'important', 'rien')
+_notify = {'level': 'tout', 'hidden': 0}
+
+
+def bridge_notify(text, important=True):
+    """Notification protegee : une erreur est journalisee, jamais propagee. Le niveau choisi
+    dans le menu Sims4MP filtre : « important » cache les secondaires, « rien » cache tout."""
+    level = _notify['level']
+    if level == 'rien' or (level == 'important' and not important):
+        _notify['hidden'] += 1
+        log('notification masquee ({}) : {}'.format(level, text))
+        return False
     try:
         show_notification('Sims4MP', text)
         return True
@@ -1005,7 +1018,7 @@ def _handle_host_event(session, kind, value):
             game_time = bridge_game_time()
             _send(session, protocol.pong(data.get('seq'), data.get('sent_at'),
                                          {'game_time': game_time}))
-            bridge_notify('Ping reçu du client')
+            bridge_notify('Ping reçu du client', important=False)
         elif msg_type == protocol.EVENT:
             if data.get('kind') == 'presence':
                 session.peer_seen_at = time.monotonic()
@@ -1099,7 +1112,7 @@ def _handle_pong(session, data):
     result = 'Pong du host : {:.0f} ms, heure de jeu du host : {}'.format(latency_ms, game_time)
     session.last_ping = result
     log('[client] ' + result)
-    bridge_notify(result)
+    bridge_notify(result, important=False)
 
 
 def _handle_state(session, data):
@@ -1291,7 +1304,7 @@ def _handle_position(session, data):
                               if position['order_age'] is not None else None)
     if previous is None or previous['sim_id'] != position['sim_id']:
         log('[{}] l\'autre joueur controle {} ({})'.format(session.role, position['name'], position['sim_id']))
-        bridge_notify('L\'autre joueur contrôle {}.'.format(position['name'] or 'un Sim'))
+        bridge_notify('L\'autre joueur contrôle {}.'.format(position['name'] or 'un Sim'), important=False)
         session.walk = None
     _maybe_walk(session, session.remote_position_at)
 
@@ -1432,7 +1445,7 @@ def _handle_money(session, data):
         _money_flush(session)
         delta = total - (session.money_known if session.money_known is not None else local[1])
         if delta and _apply_money(session, delta, 'alignement sur l\'hote'):
-            bridge_notify('Argent aligné sur l\'hôte : {} simflouz.'.format(total))
+            bridge_notify('Argent aligné sur l\'hôte : {} simflouz.'.format(total), important=False)
         return
     delta = _clean_int(data.get('delta'), -MONEY_MAX_DELTA, MONEY_MAX_DELTA)
     if not delta:
@@ -2091,7 +2104,7 @@ def queue_refuses(interaction):
     now = time.monotonic()
     if _gate['notice_at'] is None or now - _gate['notice_at'] >= QUEUE_NOTICE_INTERVAL:
         _gate['notice_at'] = now
-        bridge_notify('Action refusée : l\'autre joueur n\'est pas encore en jeu.')
+        bridge_notify('Action refusée : l\'autre joueur n\'est pas encore en jeu.', important=False)
     return True
 
 
@@ -2203,6 +2216,178 @@ def _install_traffic_hook():
     omega.send = send
     _traffic['installed'] = True
     log('trafic : omega.send enveloppe (mesure arretee par defaut, mp.traffic on)')
+
+
+# ---------------------------------------------------------------------------
+# Menu Sims4MP dans la roue d'actions (Maj + clic sur le sol)
+# ---------------------------------------------------------------------------
+# Verifie dans simulation.zip : la roue liste les super_affordances de la cible
+# (ScriptObject.super_affordances lit cls._super_affordances) ; le sol est
+# services.terrain_service.terrain_object(). L'action est creee a l'execution comme
+# le jeu le fait pour ses statistiques (statistics/runtime_statistic.RuntimeStatistic
+# .generate) : sous-classe d'une ImmediateSuperInteraction reglee (type(base)(nom,
+# (base,), {...})), cle sims4.resources.get_resource_key(nom, manager.TYPE), puis
+# manager.register_tuned_class. Reglages surcharges : display_name, cheat (roue
+# Maj + clic), allow_user_directed, allow_autonomous, visible. Fenetre :
+# ui.ui_dialog.UiDialog + UiDialogResponse(dialog_response_id, text,
+# ui_request=UiDialogUiRequest.NO_REQUEST), set_responses, show_dialog(on_response),
+# reponse lue dans dialog.response.
+
+MENU_NAME = 'sims4mp_menu'
+MENU_LABEL = 'Sims4MP…'
+MENU_CHOICES = (
+    (1, 'Notifications : toutes'),
+    (2, 'Notifications : importantes seulement'),
+    (3, 'Notifications : aucune'),
+    (4, 'État de la partie'),
+    (5, 'Jouer seul (se déconnecter)'),
+    (6, 'Fermer'),
+)
+_menu = {'affordance': None, 'error': None, 'opened': 0}
+
+
+def _raw(text):
+    from sims4.localization import LocalizationHelperTuning
+    return lambda *args, **kwargs: LocalizationHelperTuning.get_raw_text(text)
+
+
+def menu_status_lines():
+    """Resume court pour la fenetre « Etat de la partie »."""
+    session = _session
+    lines = ['Sims4MP {} , notifications : {}'.format(MOD_VERSION, _notify['level'])]
+    if session is None:
+        target = _auto['target']
+        lines.append('Aucune partie à deux en cours.' if target is None else
+                     'Connexion automatique prévue : {}.'.format('hôte' if target[0] == 'host' else
+                                                                 'invité vers {}'.format(target[1])))
+        return lines
+    lines.append('Rôle : {} , autre joueur : {}'.format(
+        'hôte' if session.role == 'host' else 'invité',
+        'connecté' if session.handshake_done and session.endpoint.is_connected else 'non connecté'))
+    if _gate['waiting']:
+        lines.append('En attente de l\'autre joueur (pause).')
+    return lines + sync_lines(session)
+
+
+def on_menu_choice(choice):
+    """Reponse de la fenetre du menu."""
+    if choice in (1, 2, 3):
+        _notify['level'] = NOTIFY_LEVELS[choice - 1]
+        log('menu : notifications {}'.format(_notify['level']))
+        if choice != 3:
+            bridge_notify('Notifications : {}.'.format('toutes' if choice == 1 else 'importantes seulement'))
+    elif choice == 4:
+        bridge_show_dialog('État de la partie', '\n'.join(menu_status_lines()), ((6, 'Fermer'),), None)
+    elif choice == 5:
+        stopped = _auto['target'] is not None or _session is not None
+        _auto['target'] = None
+        if _session is not None:
+            _close_session(send_bye=True)
+        _gate_tick(time.monotonic())
+        _release_clock_if_unused(None)
+        log('menu : jouer seul ({})'.format('partie a deux arretee' if stopped else 'deja seul'))
+
+
+def bridge_show_dialog(title, text, choices, on_choice):
+    """Fenetre du jeu avec un bouton par choix ; on_choice(id) a la reponse."""
+    import services
+    from ui.ui_dialog import UiDialog, UiDialogResponse
+    client = services.client_manager().get_first_client()
+    owner = client.active_sim if client is not None else None
+    dialog = UiDialog.TunableFactory().default(owner, text=_raw(text), title=_raw(title))
+    dialog.set_responses(tuple(
+        UiDialogResponse(dialog_response_id=choice_id, text=_raw(label),
+                         ui_request=UiDialogResponse.UiDialogUiRequest.NO_REQUEST)
+        for choice_id, label in choices))
+
+    def on_response(shown):
+        try:
+            if on_choice is not None:
+                on_choice(shown.response)
+        except Exception:
+            log('ERREUR menu :\n' + traceback.format_exc())
+    dialog.show_dialog(on_response=on_response)
+
+
+def open_menu():
+    _menu['opened'] += 1
+    bridge_show_dialog('Sims4MP', '\n'.join(menu_status_lines()[:2]), MENU_CHOICES, on_menu_choice)
+
+
+def _menu_affordance_class(base):
+    """Sous-classe de base (action reglee du jeu) : seule la presentation et l'effet changent."""
+    from event_testing.results import TestResult
+
+    def _run_interaction_gen(self, timeline):
+        try:
+            open_menu()
+        except Exception:
+            log('ERREUR ouverture du menu :\n' + traceback.format_exc())
+        return True
+        yield                                         # generateur, comme les autres interactions
+
+    @classmethod
+    def _test(cls, *args, **kwargs):
+        return TestResult.TRUE
+
+    return {
+        'INSTANCE_SUBCLASSES_ONLY': True,
+        'display_name': staticmethod(_raw(MENU_LABEL)),
+        'cheat': True,                                # roue Maj + clic (triches du jeu actives)
+        'debug': False,
+        'allow_user_directed': True,
+        'allow_autonomous': False,
+        'visible': True,
+        '_test': _test,
+        '_run_interaction_gen': _run_interaction_gen,
+    }
+
+
+def bridge_create_menu_affordance():
+    """Cree (une fois) et enregistre l'action « Sims4MP… »."""
+    import services
+    import sims4.resources
+    from interactions.base.immediate_interaction import ImmediateSuperInteraction
+    manager = services.get_instance_manager(sims4.resources.Types.INTERACTION)
+    terrain = services.terrain_service.terrain_object()
+    candidates = [a for a in type(terrain)._super_affordances if issubclass(a, ImmediateSuperInteraction)]
+    if not candidates:
+        candidates = [a for a in manager.types.values() if issubclass(a, ImmediateSuperInteraction)]
+    if not candidates:
+        raise RuntimeError('aucune action immediate du jeu a reprendre')
+    base = candidates[0]
+    key = sims4.resources.get_resource_key(MENU_NAME, manager.TYPE)
+    attributes = _menu_affordance_class(base)
+    attributes['guid64'] = key.instance
+    menu = type(base)(MENU_NAME, (base,), attributes)
+    menu.reloadable = False
+    manager.register_tuned_class(menu, key)
+    log('menu : action creee (base {} , cle {})'.format(base.__name__, key.instance))
+    return menu
+
+
+def bridge_inject_menu(affordance):
+    """Ajoute l'action a la roue du sol (une seule fois). Renvoie True si ajoutee."""
+    import services
+    terrain_class = type(services.terrain_service.terrain_object())
+    current = tuple(terrain_class._super_affordances)
+    if affordance in current:
+        return False
+    terrain_class._super_affordances = current + (affordance,)
+    return True
+
+
+def install_menu():
+    """Appele a chaque fin de chargement : cree l'action une fois et la remet sur le sol."""
+    try:
+        if _menu['affordance'] is None:
+            _menu['affordance'] = bridge_create_menu_affordance()
+        if bridge_inject_menu(_menu['affordance']):
+            log('menu : « {} » ajoute a la roue Maj + clic du sol'.format(MENU_LABEL))
+        _menu['error'] = None
+    except Exception:
+        _menu['error'] = traceback.format_exc().strip().splitlines()[-1]
+        log('ERREUR menu Sims4MP :\n' + traceback.format_exc())
 
 
 def _install_queue_hook():
@@ -2503,6 +2688,7 @@ def on_zone_loaded():
 
 def _safe_on_zone_loaded():
     # Aucune exception ne doit remonter dans le chargement du jeu.
+    install_menu()                                   # protege lui-meme ses erreurs
     try:
         on_zone_loaded()
     except Exception:
