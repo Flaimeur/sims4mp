@@ -1,4 +1,10 @@
-# Sims 4 Multiplayer - notifications plus claires (0.12.0) : role de l'autre joueur
+# Sims 4 Multiplayer - fiabilite (0.13.0) : chez l'invite connecte, la sauvegarde est
+# verrouillee par le verrou du jeu (persistence_service.lock_save) ; resynchro
+# complete depuis le menu (et d'office a chaque nouvelle connexion) ; toutes les
+# 30 s l'hote envoie un resume (argent, heure, Sims presents et positions) que
+# l'invite compare, alerte et rapport des ecarts aux deux ; journal tourne au-dela
+# de 2 Mo (sims4mp.old.log) ; menu « Enregistrer un rapport » (sims4mp_rapport.txt).
+# Notifications plus claires (0.12.0) : role de l'autre joueur
 # (hote / invite) et portrait du Sim concerne, regroupement des notifications
 # repetees, resume a la connexion (role, version, ping, Sim de l'autre), ping
 # silencieux toutes les 10 s ; alertes de desynchro (titre « Sims4MP · alerte »,
@@ -147,7 +153,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.12.0'
+MOD_VERSION = '0.13.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -182,6 +188,13 @@ AUTO_PING_INTERVAL = 10.0                 # invite : ping silencieux pour mesure
 SLOW_RTT_MS = 400.0                       # au-dela : alerte « connexion lente »
 SUMMARY_DELAY = 4.0                       # resume de connexion, une fois les premieres infos recues
 ALERT_CLOCK_JUMP = 300.0                  # heure recalee de plus (s de jeu) : alerte
+DIGEST_INTERVAL = 30.0                    # hote : resume de la partie pour le detecteur d'ecarts
+DIGEST_MAX_SIMS = 64
+DIGEST_TIME_GAP = 600.0                   # ecart d'heure signale au-dela (s de jeu)
+DIGEST_FAR = 3.0                          # Sim « loin de sa place » au-dela
+LOG_MAX_SIZE = 2 * 1024 * 1024            # journal plus gros au chargement : sims4mp.old.log
+REPORT_NAME = 'sims4mp_rapport.txt'
+REPORT_LOG_LINES = 200
 SPEED_REQUEST_DEDUP = 1.0                 # meme vitesse demandee a moins d'1 s d'intervalle : une seule
 WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
 WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
@@ -859,6 +872,10 @@ class NetSession(object):
         self.auto_pings = set()
         self.auto_ping_at = 0.0
         self.summary_due = None
+        # Fiabilite (0.13.0) : resynchro, detecteur d'ecarts.
+        self.resyncs = 0
+        self.digest_sent_at = 0.0
+        self.last_gaps = None
         # Positions (M3) : derniere envoyee, derniere recue de l'autre joueur.
         self.position_checked_at = 0.0
         self.position_sent = None
@@ -1082,6 +1099,10 @@ def _handle_host_event(session, kind, value):
                 _handle_needs(session, data)
             elif data.get('kind') == 'sims':
                 _handle_sims(session, data)
+            elif data.get('kind') == 'resync_request':
+                do_resync(session)
+            elif data.get('kind') == 'gaps':
+                _handle_gaps(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -1139,6 +1160,10 @@ def _handle_client_event(session, kind, value):
                 _handle_needs(session, value['data'])
             elif value['data'].get('kind') == 'sims':
                 _handle_sims(session, value['data'])
+            elif value['data'].get('kind') == 'resync':
+                _handle_resync(session)
+            elif value['data'].get('kind') == 'digest':
+                _handle_digest(session, value['data'])
             else:
                 log('[client] EVENT ignore (kind {!r})'.format(value['data'].get('kind')))
         elif msg_type == protocol.BYE:
@@ -1283,6 +1308,7 @@ def pump_tick():
     _gate_tick(time.monotonic())          # pause et file : a chaque tick, meme sans session
     _release_clock_if_unused(_session)    # vitesse de l'hote retiree hors session d'invite
     _traffic_tick(now)                    # P1 : resume du trafic dans le journal
+    _save_lock_tick(_session)             # invite connecte : sauvegarde verrouillee
 
 
 def _poll_session(session, now):
@@ -1292,7 +1318,8 @@ def _poll_session(session, now):
         if kind == 'message':
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
             quiet = (value['type'] == protocol.EVENT
-                     and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims')
+                     and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims',
+                                                        'digest', 'gaps')
                           or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
             if not quiet:
                 log('[{}] recu : {}'.format(session.role, _describe(value)))
@@ -1323,6 +1350,7 @@ def _poll_session(session, now):
         _maybe_send_sims(session, now)
         _auto_ping_tick(session, now)
         _summary_tick(session, now)
+        _digest_tick(session, now)
 
 
 # ---------------------------------------------------------------------------
@@ -2372,6 +2400,8 @@ MENU_CHOICES = (
     (2, 'Notifications : importantes seulement'),
     (3, 'Notifications : aucune'),
     (4, 'État de la partie'),
+    (7, 'Resynchroniser maintenant'),
+    (8, 'Enregistrer un rapport'),
     (5, 'Jouer seul (se déconnecter)'),
     (6, 'Fermer'),
 )
@@ -2398,6 +2428,10 @@ def menu_status_lines():
         'connecté' if session.handshake_done and session.endpoint.is_connected else 'non connecté'))
     if _gate['waiting']:
         lines.append('En attente de l\'autre joueur (pause).')
+    if _save_lock['holder'] is not None:
+        lines.append('Sauvegarde désactivée ici : seul l\'hôte sauvegarde.')
+    if session.last_gaps is not None:
+        lines.append('Derniers écarts : {}'.format(', '.join(session.last_gaps) or 'aucun'))
     return lines + sync_lines(session)
 
 
@@ -2410,6 +2444,11 @@ def on_menu_choice(choice):
             bridge_notify('Notifications : {}.'.format('toutes' if choice == 1 else 'importantes seulement'))
     elif choice == 4:
         bridge_show_dialog('État de la partie', '\n'.join(menu_status_lines()), ((6, 'Fermer'),), None)
+    elif choice == 7:
+        request_resync()
+    elif choice == 8:
+        path = write_report()
+        bridge_notify('Rapport enregistré : {}'.format(path) if path else 'Rapport impossible (voir le journal).')
     elif choice == 5:
         stopped = _auto['target'] is not None or _session is not None
         _auto['target'] = None
@@ -2520,6 +2559,216 @@ def install_menu():
     except Exception:
         _menu['error'] = traceback.format_exc().strip().splitlines()[-1]
         log('ERREUR menu Sims4MP :\n' + traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Fiabilite (0.13.0) : seul l'hote sauvegarde, resynchro, detecteur d'ecarts, rapport
+# ---------------------------------------------------------------------------
+# Verrou de sauvegarde du jeu (services/persistence_service.pyc) :
+# services.get_persistence_service().lock_save(porteur) / unlock_save(porteur) ;
+# le motif affiche vient de porteur.get_lock_save_reason().
+
+_save_lock = {'holder': None}
+
+
+class _GuestSaveLock(object):
+    """Porteur du verrou de sauvegarde chez l'invite."""
+
+    def get_lock_save_reason(self):
+        from sims4.localization import LocalizationHelperTuning
+        return LocalizationHelperTuning.get_raw_text('Partie à deux : seul l\'hôte sauvegarde la partie commune.')
+
+
+def bridge_lock_save(holder):
+    import services
+    services.get_persistence_service().lock_save(holder)
+
+
+def bridge_unlock_save(holder):
+    import services
+    services.get_persistence_service().unlock_save(holder)
+
+
+def _save_lock_tick(session):
+    """Invite connecte : sauvegarde verrouillee ; sinon deverrouillee."""
+    wanted = session is not None and session.role == 'client' and session.handshake_done
+    holder = _save_lock['holder']
+    if wanted and holder is None:
+        holder = _GuestSaveLock()
+        try:
+            bridge_lock_save(holder)
+        except Exception:
+            _sync_error('verrou de sauvegarde')
+            return
+        _save_lock['holder'] = holder
+        log('sauvegarde : verrouillee chez l\'invite')
+        bridge_notify('Sauvegarde désactivée chez vous : seul l\'hôte sauvegarde la partie commune.',
+                      key='save-lock')
+    elif not wanted and holder is not None:
+        _save_lock['holder'] = None
+        _safe('fin du verrou de sauvegarde', bridge_unlock_save, holder)
+        log('sauvegarde : deverrouillee')
+
+
+def request_resync():
+    """Menu : resynchro complete (l'invite la demande a l'hote ; l'hote l'envoie directement)."""
+    session = _session
+    if session is None or not session.handshake_done:
+        bridge_notify('Aucune partie à deux en cours : rien à resynchroniser.')
+        return
+    if session.role == 'client':
+        session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'resync_request'}))
+        log('[client] resynchro demandee a l\'hote')
+        bridge_notify('Resynchronisation demandée à l\'hôte…')
+    else:
+        do_resync(session)
+
+
+def do_resync(session):
+    """Hote : renvoie tout (argent, heure, positions, besoins) au prochain passage de la pompe."""
+    session.money_total_sent = False                 # l'invite se realigne sur le solde de l'hote
+    session.needs_sent.clear()
+    session.sims_sent.clear()
+    session.position_sent = None
+    session.clock_sent_at = 0.0
+    session.resyncs += 1
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'resync'}))
+    log('[host] resynchro complete envoyee')
+    bridge_notify('Resynchronisation complète envoyée à l\'invité.')
+
+
+def _handle_resync(session):
+    """Invite : prepare l'application immediate de tout ce que l'hote renvoie."""
+    session.money_aligned = False
+    session.walk = None
+    session.sims_walk.clear()
+    session.action_hold.clear()
+    session.clock_grace_until = 0.0
+    session.clock_strikes = CLOCK_CONFIRM - 1        # le prochain ecart d'heure est corrige aussitot
+    session.position_sent = None
+    session.needs_sent.clear()
+    session.resyncs += 1
+    log('[client] resynchro complete recue')
+    bridge_notify('Resynchronisation complète reçue de l\'hôte.')
+
+
+# -- detecteur d'ecarts : toutes les 30 s, l'hote envoie un resume ; l'invite compare --
+
+def bridge_digest():
+    """Resume de la partie locale : argent, foyer, heure, positions des Sims presents."""
+    funds = _safe('lecture argent', bridge_funds)
+    clock = _safe('lecture heure', bridge_clock)
+    sims = {}
+    for sim_id in (_safe('liste des Sims', bridge_instanced_sim_ids) or [])[:DIGEST_MAX_SIMS]:
+        snapshot = _safe('position d\'un Sim', bridge_sim_snapshot, sim_id)
+        if snapshot is not None:
+            sims[str(sim_id)] = [round(snapshot['x'], 1), round(snapshot['z'], 1)]
+    return {'kind': 'digest', 'household_id': funds[0] if funds else None, 'money': funds[1] if funds else None,
+            'seconds': clock[0] if clock else None, 'sims': sims}
+
+
+def _digest_tick(session, now):
+    if session.role != 'host' or not (session.endpoint.is_connected and session.handshake_done):
+        return
+    if _gate['waiting'] or now - session.digest_sent_at < DIGEST_INTERVAL:
+        return
+    session.digest_sent_at = now
+    session.endpoint.send(protocol.make_message(protocol.EVENT, bridge_digest()))
+
+
+def compare_digest(session, remote, local):
+    """Liste lisible des ecarts entre le resume de l'hote et la partie de l'invite."""
+    gaps = []
+    if (remote.get('household_id') == local.get('household_id') and isinstance(remote.get('money'), int)
+            and isinstance(local.get('money'), int) and remote['money'] != local['money']):
+        gaps.append('argent {:+d} § par rapport à l\'hôte'.format(local['money'] - remote['money']))
+    if isinstance(remote.get('seconds'), (int, float)) and isinstance(local.get('seconds'), (int, float)):
+        drift = local['seconds'] - remote['seconds']
+        if abs(drift) > DIGEST_TIME_GAP:
+            gaps.append('heure {:+.0f} min de jeu'.format(drift / 60.0))
+    remote_sims = remote.get('sims') if isinstance(remote.get('sims'), dict) else {}
+    local_sims = local.get('sims') or {}
+    only_host = [k for k in remote_sims if k not in local_sims]
+    only_here = [k for k in local_sims if k not in remote_sims]
+    if only_host:
+        gaps.append('{} Sim(s) seulement chez l\'hôte'.format(len(only_host)))
+    if only_here:
+        gaps.append('{} Sim(s) seulement chez vous'.format(len(only_here)))
+    mine = _my_active_id()
+    far = 0
+    for key, where in remote_sims.items():
+        here = local_sims.get(key)
+        if (here is None or not isinstance(where, list) or len(where) != 2
+                or (mine is not None and key == str(mine))):
+            continue
+        try:
+            if ((here[0] - float(where[0])) ** 2 + (here[1] - float(where[1])) ** 2) ** 0.5 > DIGEST_FAR:
+                far += 1
+        except (TypeError, ValueError):
+            continue
+    if far:
+        gaps.append('{} Sim(s) loin de leur place chez l\'hôte'.format(far))
+    return gaps
+
+
+def _handle_digest(session, data):
+    gaps = compare_digest(session, data, bridge_digest())
+    session.last_gaps = gaps
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'gaps', 'list': gaps[:10]}))
+    if gaps:
+        log('[client] ecarts : ' + ', '.join(gaps))
+        bridge_notify('Écarts avec l\'hôte : {}. Menu Sims4MP → Resynchroniser maintenant.'.format(
+            ', '.join(gaps)), alert=True, key='gaps')
+
+
+def _handle_gaps(session, data):
+    entries = data.get('list')
+    if not isinstance(entries, list):
+        return
+    gaps = [_clean_text(g) for g in entries[:10] if _clean_text(g)]
+    session.last_gaps = gaps
+    if gaps:
+        log('[host] ecarts chez l\'invite : ' + ', '.join(gaps))
+        bridge_notify('Écarts chez l\'invité : {}. Menu Sims4MP → Resynchroniser maintenant.'.format(
+            ', '.join(gaps)), alert=True, key='gaps')
+
+
+# -- journal lisible --
+
+def rotate_log(path=None, limit=None):
+    """Au chargement : un journal trop gros devient sims4mp.old.log (l'ancien est remplace)."""
+    path = path or LOG_PATH
+    limit = LOG_MAX_SIZE if limit is None else limit
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) > limit:
+            os.replace(path, path[:-4] + '.old.log' if path.endswith('.log') else path + '.old')
+            return True
+    except OSError:
+        pass
+    return False
+
+
+def write_report():
+    """Rapport a envoyer : etat de la partie et fin du journal, a cote du journal."""
+    path = os.path.join(os.path.dirname(LOG_PATH), REPORT_NAME)
+    try:
+        tail = []
+        if os.path.isfile(LOG_PATH):
+            with open(LOG_PATH, 'r', encoding='utf-8', errors='replace') as f:
+                tail = f.readlines()[-REPORT_LOG_LINES:]
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('Rapport Sims4MP {} - {}\n\n'.format(MOD_VERSION, time.strftime('%Y-%m-%d %H:%M:%S')))
+            f.write('\n'.join(menu_status_lines()) + '\n')
+            f.write('Notifications masquees : {} , regroupees : {}\n'.format(_notify['hidden'], _notify['grouped']))
+            if _menu['error'] or _pump['error']:
+                f.write('Erreurs : menu {} , pompe {}\n'.format(_menu['error'], _pump['error']))
+            f.write('\n--- Fin du journal ---\n')
+            f.writelines(tail)
+        log('rapport ecrit : ' + path)
+        return path
+    except Exception:
+        log('ERREUR rapport :\n' + traceback.format_exc())
+        return None
 
 
 def _install_queue_hook():
@@ -3108,7 +3357,10 @@ def mp_disconnect(_connection=None):
 # ---------------------------------------------------------------------------
 
 try:
+    rotated = rotate_log()                           # journal trop gros : sims4mp.old.log
     log('==== {} {} charge ===='.format(MOD_NAME, MOD_VERSION))
+    if rotated:
+        log('journal precedent renomme en sims4mp.old.log')
     _log_network_test(run_network_test())
 except Exception:
     log('ERREUR au chargement :\n' + traceback.format_exc())
