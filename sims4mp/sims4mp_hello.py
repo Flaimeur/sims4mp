@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - fiabilite (0.13.0) : chez l'invite connecte, la sauvegarde est
+# Sims 4 Multiplayer - correctifs (0.13.1) : une action n'est envoyee qu'apres avoir
+# ete acceptee par la file du jeu ; actions autonomes limitees (1 par Sim et par
+# seconde, pas la meme deux fois en 20 s) ; voyages jamais rejoues (l'autre joueur
+# est prevenu) ; pings automatiques et refus d'autonomie moins bavards au journal.
+# Fiabilite (0.13.0) : chez l'invite connecte, la sauvegarde est
 # verrouillee par le verrou du jeu (persistence_service.lock_save) ; resynchro
 # complete depuis le menu (et d'office a chaque nouvelle connexion) ; toutes les
 # 30 s l'hote envoie un resume (argent, heure, Sims presents et positions) que
@@ -153,7 +157,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.13.0'
+MOD_VERSION = '0.13.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -195,6 +199,9 @@ DIGEST_FAR = 3.0                          # Sim « loin de sa place » au-dela
 LOG_MAX_SIZE = 2 * 1024 * 1024            # journal plus gros au chargement : sims4mp.old.log
 REPORT_NAME = 'sims4mp_rapport.txt'
 REPORT_LOG_LINES = 200
+AUTO_ORDER_GAP = 1.0                      # au plus une action autonome envoyee par Sim et par seconde
+AUTO_ORDER_REPEAT = 20.0                  # meme action autonome du meme Sim : pas renvoyee avant
+AUTO_FAIL_LOG = 60.0                      # refus d'action autonome : une ligne par action et par minute
 SPEED_REQUEST_DEDUP = 1.0                 # meme vitesse demandee a moins d'1 s d'intervalle : une seule
 WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
 WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
@@ -876,6 +883,10 @@ class NetSession(object):
         self.resyncs = 0
         self.digest_sent_at = 0.0
         self.last_gaps = None
+        # Actions autonomes (0.13.1) : envoi limite, refus journalises avec parcimonie.
+        self.auto_sent = {}             # sim_id -> (moment, signature) du dernier envoi
+        self.auto_skipped = 0
+        self.auto_failed_logged = {}    # nom d'action -> moment de la derniere ligne de journal
         # Positions (M3) : derniere envoyee, derniere recue de l'autre joueur.
         self.position_checked_at = 0.0
         self.position_sent = None
@@ -1101,6 +1112,8 @@ def _handle_host_event(session, kind, value):
                 _handle_sims(session, data)
             elif data.get('kind') == 'resync_request':
                 do_resync(session)
+            elif data.get('kind') == 'travel':
+                _handle_travel(session, data)
             elif data.get('kind') == 'gaps':
                 _handle_gaps(session, data)
             else:
@@ -1162,6 +1175,8 @@ def _handle_client_event(session, kind, value):
                 _handle_sims(session, value['data'])
             elif value['data'].get('kind') == 'resync':
                 _handle_resync(session)
+            elif value['data'].get('kind') == 'travel':
+                _handle_travel(session, value['data'])
             elif value['data'].get('kind') == 'digest':
                 _handle_digest(session, value['data'])
             else:
@@ -1317,10 +1332,13 @@ def _poll_session(session, now):
     for kind, value in session.endpoint.poll():
         if kind == 'message':
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
-            quiet = (value['type'] == protocol.EVENT
-                     and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims',
-                                                        'digest', 'gaps')
-                          or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
+            quiet = ((value['type'] == protocol.EVENT
+                      and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims',
+                                                         'digest', 'gaps')
+                           or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
+                     # pings automatiques (latence) : toutes les 10 s, inutiles dans le journal
+                     or (value['type'] == protocol.PING and value['data'].get('auto') is True)
+                     or (value['type'] == protocol.PONG and value['data'].get('seq') in session.auto_pings))
             if not quiet:
                 log('[{}] recu : {}'.format(session.role, _describe(value)))
         else:
@@ -1920,6 +1938,9 @@ def _handle_order(session, data):
         return
     if order['auto'] and _needs_authority(session, order['sim_id'], _my_active_id()):
         return                                       # action autonome d'un Sim dont ce PC fait foi
+    if is_travel(order['name']):
+        log('[{}] voyage recu non rejoue : {}'.format(session.role, order['name']))
+        return                                       # (mod plus ancien en face) : jamais de voyage rejoue
     _sync['pushing'] = True                          # pas un ordre du joueur de ce PC
     try:
         result = _safe('ordre rejoue', bridge_replay_order, order['sim_id'], order['affordance'], order['target'],
@@ -1942,16 +1963,38 @@ def _handle_order(session, data):
             bridge_notify('Action de {} non rejouée chez vous : {} ({}).'.format(
                 _other_label(session), order['name'], reason), alert=True, sim_id=order['sim_id'],
                 key='order-{}'.format(order['name']))
-    if not order['auto'] or not ok:
-        # Les actions autonomes reussies sont nombreuses : seules les refusees vont au journal.
+    if not order['auto']:
         log('[{}] ordre {} {}'.format(session.role, order['id'], session.last_order))
+    elif not ok:
+        # Actions autonomes refusees : au plus une ligne par action et par minute.
+        now = time.monotonic()
+        key = order['name']
+        if now - session.auto_failed_logged.get(key, -AUTO_FAIL_LOG) >= AUTO_FAIL_LOG:
+            session.auto_failed_logged[key] = now
+            log('[{}] ordre {} {}'.format(session.role, order['id'], session.last_order))
 
 
 def on_player_order(queue, interaction):
     """Appele par la file d'attente du jeu pour chaque ordre du joueur de ce PC."""
     order = _safe('lecture de l\'ordre', bridge_order_from_interaction, queue, interaction)
-    if order is not None:
-        send_player_order(order)
+    if order is None:
+        return
+    if is_travel(order['name']):
+        session = _session
+        if _connected(session):
+            session.endpoint.send(protocol.make_message(protocol.EVENT, {
+                'kind': 'travel', 'sim_id': order['sim_id'], 'name': order['name']}))
+            log('[{}] voyage non rejoue chez l\'autre, prevenu : {}'.format(session.role, order['name']))
+        return
+    send_player_order(order)
+
+
+def _handle_travel(session, data):
+    sim_id = _clean_int(data.get('sim_id'), 1, 2 ** 64)
+    log('[{}] l\'autre joueur voyage ({})'.format(session.role, _clean_text(data.get('name'))))
+    bridge_notify('{} part sur un autre lot. Pour continuer ensemble, rejoignez-le sur le même lot '
+                  '(voyage non synchronisé).'.format(_other_label(session).capitalize()),
+                  alert=True, sim_id=sim_id, key='travel')
 
 
 # -- qui fait foi pour chaque Sim (M6) --
@@ -1995,7 +2038,9 @@ def autonomy_refused(queue, interaction):
 
 
 def on_autonomy_action(queue, interaction):
-    """Action decidee par l'autonomie d'un Sim dont ce PC fait foi : envoyee a l'autre PC."""
+    """Action decidee par l'autonomie d'un Sim dont ce PC fait foi : envoyee a l'autre PC,
+    au plus une par Sim et par AUTO_ORDER_GAP s, et jamais la meme deux fois de suite
+    dans les AUTO_ORDER_REPEAT s (l'autonomie repropose souvent la meme action)."""
     session = _session
     if not _connected(session):
         return
@@ -2003,8 +2048,23 @@ def on_autonomy_action(queue, interaction):
     if not _needs_authority(session, sim_id, _my_active_id()):
         return
     order = _safe('lecture de l\'action autonome', bridge_order_from_interaction, queue, interaction, 'auto')
-    if order is not None:
-        send_player_order(order)
+    if order is None or is_travel(order['name']):
+        return
+    now = time.monotonic()
+    last = session.auto_sent.get(sim_id)
+    signature = (order['affordance'], repr(order['target']))
+    if last is not None and (now - last[0] < AUTO_ORDER_GAP
+                             or (last[1] == signature and now - last[0] < AUTO_ORDER_REPEAT)):
+        session.auto_skipped += 1
+        return
+    session.auto_sent[sim_id] = (now, signature)
+    send_player_order(order)
+
+
+def is_travel(name):
+    """Actions de voyage (telephone « Voyager avec », carte...) : jamais rejouees chez l'autre,
+    elles changeraient son lot ; l'autre joueur est seulement prevenu."""
+    return 'travel' in (name or '').lower()
 
 
 # -- positions de tous les Sims dont ce PC fait foi (M6) --
@@ -2789,18 +2849,20 @@ def _install_queue_hook():
             log('ERREUR file d\'attente :\n' + traceback.format_exc())
         if refused is not None:
             return refused
+        result = original(self, interaction, *args, **kwargs)
         try:
-            # Ordre du joueur de ce PC (pas un ordre donne par le mod) : « le dernier ordre gagne »,
-            # et l'action part tout de suite vers l'autre PC (M5). Action autonome d'un Sim dont
-            # ce PC fait foi : envoyee aussi (M6).
-            if not _sync['pushing'] and _is_user_directed(interaction):
-                record_local_order(self.sim.sim_info.sim_id)
-                on_player_order(self, interaction)
-            elif not _sync['pushing']:
-                on_autonomy_action(self, interaction)
+            # Seulement une action que le jeu vient d'accepter (sinon l'autonomie, qui reessaie
+            # aussitot, inonderait l'autre PC). Ordre du joueur de ce PC : « le dernier ordre
+            # gagne » et envoi immediat (M5) ; action autonome d'un Sim dont ce PC fait foi (M6).
+            if result and not _sync['pushing']:
+                if _is_user_directed(interaction):
+                    record_local_order(self.sim.sim_info.sim_id)
+                    on_player_order(self, interaction)
+                else:
+                    on_autonomy_action(self, interaction)
         except Exception:
             _sync_error('suivi des ordres du joueur')
-        return original(self, interaction, *args, **kwargs)
+        return result
 
     append._sims4mp_hook = True
     InteractionQueue.append = append

@@ -89,6 +89,8 @@ class InteractionQueue(object):
         self.items = []
 
     def append(self, interaction):
+        if getattr(self, 'full', False):
+            return TestResult(False, 'Interaction queue is full.')
         self.items.append(interaction)
         return TestResult.TRUE
 
@@ -464,10 +466,42 @@ npc.push_super_affordance = real_push
 report('marche refusee a faible ecart : laisse en place, pas de pose directe',
        guest.sims_status[3003].startswith('occupe') and npc.position.x == 29.0)
 
+# --- 5. Correctifs 0.13.1 : pas d'inondation, pas de voyage rejoue ------------------------------
+CHAT_PICKER = affordance('SocialPickerSI', 1200)
+before = len(events('order'))
+npc.queue.full = True
+for _ in range(5):
+    npc.queue.append(Interaction(CHAT_PICKER, double, source=InteractionContext.SOURCE_AUTONOMY))
+npc.queue.full = False
+pump_for(0.1)
+report('action autonome refusee par le jeu (file pleine) : jamais envoyee', len(events('order')) == before)
+session.auto_sent.clear()
+for _ in range(5):
+    npc.queue.append(Interaction(CHAT_PICKER, double, source=InteractionContext.SOURCE_AUTONOMY))
+pump_until(lambda: len(events('order')) > before)
+pump_for(0.1)
+report('meme action autonome proposee 5 fois de suite : envoyee une seule fois',
+       len(events('order')) == before + 1 and session.auto_skipped >= 4)
+TRAVEL = affordance('Travel_DummyInteractions_Phone_TravelWith', 1300)
+before = len(events('order'))
+my_sim.queue.append(Interaction(TRAVEL, None))
+pump_until(lambda: events('travel'))
+report('voyage choisi par le joueur : pas rejoue chez l\'autre, seulement signale',
+       len(events('order')) == before and events('travel') and events('travel')[-1]['name'] == TRAVEL.__name__)
+del notes[:]
+send({'kind': 'travel', 'sim_id': 2002, 'name': 'Travel_DummyInteractions_Phone_TravelWith'})
+send({'kind': 'order', 'id': 'client-99', 'sim_id': 2002, 'affordance': 1300,
+      'name': 'Travel_DummyInteractions_Phone_TravelWith', 'target': {'t': 'none'}})
+pump_until(lambda: any('autre lot' in n for n in notes))
+pump_for(0.1)
+report('voyage de l\'autre : alerte, et un voyage recu d\'un ancien mod n\'est jamais rejoue',
+       any('L\'invité part sur un autre lot' in n for n in notes)
+       and not any(p[0].__name__ == TRAVEL.__name__ for p in double.pushed))
+
 del _CheatOutput.lines[:]
 mod.mp_positions()
 text = '\n'.join(_CheatOutput.lines)
-report('mp.positions : actions et besoins', 'Actions : 6 envoyee(s), 3 rejouee(s), 2 non rejouee(s)' in text
+report('mp.positions : actions et besoins', 'Actions : 7 envoyee(s), 3 rejouee(s), 2 non rejouee(s)' in text
        and 'Autres Sims (ce PC fait foi)' in text and 'autonomie refusee ici 1 fois' in text
        and 'Besoins : 1 valeur' in text, text[-300:])
 report('aucune erreur de pompe', mod._pump['error'] is None, str(mod._pump['error']))
