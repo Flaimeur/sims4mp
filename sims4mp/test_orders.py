@@ -239,7 +239,7 @@ import transport  # noqa: E402
 
 results = []
 notes = []
-mod.show_notification = lambda title, text: notes.append(text)
+mod.show_notification = lambda title, text, *args: notes.append(text)
 mod.PUMP_INTERVAL = 0.0
 mod.POSITION_INTERVAL = 0.02
 mod.NEEDS_INTERVAL = 0.05

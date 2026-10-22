@@ -174,7 +174,7 @@ import transport  # noqa: E402
 TIMEOUT = 3.0
 results = []
 notes = []
-mod.show_notification = lambda title, text: notes.append(text)
+mod.show_notification = lambda title, text, *args: notes.append(text)
 mod.PUMP_INTERVAL = 0.0
 TMP = tempfile.mkdtemp(prefix='sims4mp_gate_')
 mod.LOG_PATH = os.path.join(TMP, 'sims4mp.log')

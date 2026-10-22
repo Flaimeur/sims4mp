@@ -182,7 +182,7 @@ import sims4mp_hello as mod  # noqa: E402
 
 results = []
 notes = []
-mod.show_notification = lambda title, text: notes.append(text)
+mod.show_notification = lambda title, text, *args: notes.append(text)
 TMP = tempfile.mkdtemp(prefix='sims4mp_menu_')
 mod.LOG_PATH = os.path.join(TMP, 'sims4mp.log')
 mod._mods_dir = TMP

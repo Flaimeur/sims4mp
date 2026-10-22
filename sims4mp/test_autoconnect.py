@@ -68,7 +68,7 @@ import transport  # noqa: E402
 TIMEOUT = 3.0
 results = []
 notes = []                              # notifications affichees par le mod
-mod.show_notification = lambda title, text: notes.append(text)
+mod.show_notification = lambda title, text, *args: notes.append(text)
 mod.PUMP_INTERVAL = 0.0
 
 TMP = tempfile.mkdtemp(prefix='sims4mp_auto_')
@@ -194,7 +194,7 @@ inbox = []
 got = pump_until(lambda: any(v.get('type') == protocol.WELCOME for k, v in inbox if k == 'message'),
                  extra=lambda: inbox.extend(peer.poll()))
 report('un client se connecte : WELCOME et notification « a rejoint »',
-       got and any('Un joueur a rejoint la partie' in n for n in notes))
+       got and any('L\'invité a rejoint la partie' in n for n in notes))
 peer.close()
 left = pump_until(lambda: any('a quitté la partie' in n for n in notes))
 report('le client part : notification « a quitté »', left)

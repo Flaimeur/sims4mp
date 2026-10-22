@@ -1,4 +1,10 @@
-# Sims 4 Multiplayer - menu Sims4MP (0.11.0) : Maj + clic sur le sol (triches du
+# Sims 4 Multiplayer - notifications plus claires (0.12.0) : role de l'autre joueur
+# (hote / invite) et portrait du Sim concerne, regroupement des notifications
+# repetees, resume a la connexion (role, version, ping, Sim de l'autre), ping
+# silencieux toutes les 10 s ; alertes de desynchro (titre « Sims4MP · alerte »,
+# urgentes) : heure fortement recalee, action non rejouee, Sim present d'un seul
+# cote, connexion lente.
+# Menu Sims4MP (0.11.0) : Maj + clic sur le sol (triches du
 # jeu actives) -> « Sims4MP… » : niveau des notifications, etat de la partie,
 # jouer seul. Les commandes mp.* restent en secours.
 # Etape M6 : chaque Sim a un PC qui fait foi (l'invite pour
@@ -141,7 +147,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.11.0'
+MOD_VERSION = '0.12.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -172,6 +178,10 @@ CLOCK_DEFAULT_RATE = 60.0                 # s de jeu par s reelle tant que le ry
 PLAYER_SPEEDS = (0, 1, 2, 3)              # ClockSpeedMode : pause, normale, 2, 3 (boutons du joueur)
 CLOCK_CONFIRM = 2                         # messages de suite au-dela de la tolerance avant correction
 CLOCK_GRACE = 3.0                         # s reelles sans correction apres un changement de vitesse
+AUTO_PING_INTERVAL = 10.0                 # invite : ping silencieux pour mesurer la latence
+SLOW_RTT_MS = 400.0                       # au-dela : alerte « connexion lente »
+SUMMARY_DELAY = 4.0                       # resume de connexion, une fois les premieres infos recues
+ALERT_CLOCK_JUMP = 300.0                  # heure recalee de plus (s de jeu) : alerte
 SPEED_REQUEST_DEDUP = 1.0                 # meme vitesse demandee a moins d'1 s d'intervalle : une seule
 WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
 WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
@@ -300,38 +310,67 @@ def _log_network_test(results):
 # Imports locaux : ces modules du jeu ne doivent pas bloquer le chargement
 # du mod s'ils changent apres un patch.
 
-def show_notification(title, text):
+def show_notification(title, text, sim_id=None, urgent=False):
     # Meme appel que la commande du jeu ui_dialog_notification_test
     # (server_commands/ui_commands.pyc), mais sans _connection : on prend le
-    # premier client, comme le font de nombreux scripts du jeu.
+    # premier client, comme le font de nombreux scripts du jeu. Portrait du Sim :
+    # show_dialog(icon_override=IconInfoData(obj_instance=sim)), transmis a build_msg ;
+    # alerte : reglage urgency = UiDialogNotificationUrgency.URGENT (verifies dans simulation.zip).
     import services
     from sims4.localization import LocalizationHelperTuning
     from ui.ui_dialog_notification import UiDialogNotification
 
     client = services.client_manager().get_first_client()
     owner = client.active_sim if client is not None else None
+    options = {}
+    if urgent:
+        options['urgency'] = UiDialogNotification.UiDialogNotificationUrgency.URGENT
     dialog = UiDialogNotification.TunableFactory().default(
         owner,
-        text=lambda: LocalizationHelperTuning.get_raw_text(text),
-        title=lambda: LocalizationHelperTuning.get_raw_text(title),
+        text=lambda *args, **kwargs: LocalizationHelperTuning.get_raw_text(text),
+        title=lambda *args, **kwargs: LocalizationHelperTuning.get_raw_text(title),
+        **options
     )
-    dialog.show_dialog()
+    icon = None
+    if sim_id is not None:
+        from distributor.shared_messages import IconInfoData
+        from objects import ALL_HIDDEN_REASONS
+        sim_info = services.sim_info_manager().get(sim_id)
+        sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+        if sim is not None:
+            icon = IconInfoData(obj_instance=sim)
+    if icon is not None:
+        dialog.show_dialog(icon_override=icon)
+    else:
+        dialog.show_dialog()
 
 
 NOTIFY_LEVELS = ('tout', 'important', 'rien')
-_notify = {'level': 'tout', 'hidden': 0}
+NOTIFY_REPEAT = 30.0                      # meme notification (meme cle) au plus une fois par 30 s
+ALERT_REPEAT = 120.0                      # meme alerte au plus une fois par 2 min
+_notify = {'level': 'tout', 'hidden': 0, 'last': {}, 'grouped': 0}
 
 
-def bridge_notify(text, important=True):
+def bridge_notify(text, important=True, sim_id=None, alert=False, key=None):
     """Notification protegee : une erreur est journalisee, jamais propagee. Le niveau choisi
-    dans le menu Sims4MP filtre : « important » cache les secondaires, « rien » cache tout."""
+    dans le menu Sims4MP filtre : « important » cache les secondaires, « rien » cache tout.
+    sim_id : portrait du Sim concerne. alert : alerte de desynchro (titre et urgence).
+    key : notifications de meme cle regroupees (une seule par 30 s, 2 min pour une alerte)."""
     level = _notify['level']
     if level == 'rien' or (level == 'important' and not important):
         _notify['hidden'] += 1
         log('notification masquee ({}) : {}'.format(level, text))
         return False
+    if key is not None:
+        now = time.monotonic()
+        last = _notify['last'].get(key)
+        if last is not None and now - last < (ALERT_REPEAT if alert else NOTIFY_REPEAT):
+            _notify['grouped'] += 1
+            log('notification regroupee ({}) : {}'.format(key, text))
+            return False
+        _notify['last'][key] = now
     try:
-        show_notification('Sims4MP', text)
+        show_notification('Sims4MP · alerte' if alert else 'Sims4MP', text, sim_id, alert)
         return True
     except Exception:
         log('ECHEC notification :\n' + traceback.format_exc())
@@ -815,6 +854,11 @@ class NetSession(object):
         # Presence (M2) : derniere presence recue de l'autre, dernier envoi.
         self.peer_seen_at = None
         self.presence_sent_at = 0.0
+        # Notifications plus claires (0.12.0) : latence, resume a la connexion.
+        self.rtt_ms = None
+        self.auto_pings = set()
+        self.auto_ping_at = 0.0
+        self.summary_due = None
         # Positions (M3) : derniere envoyee, derniere recue de l'autre joueur.
         self.position_checked_at = 0.0
         self.position_sent = None
@@ -989,7 +1033,8 @@ def _handle_host_event(session, kind, value):
         session._reset_sync()
     elif kind == 'disconnected':
         if session.handshake_done:
-            bridge_notify('L\'autre joueur a quitté la partie. En attente d\'une nouvelle connexion…')
+            bridge_notify('L\'invité a quitté la partie. En attente d\'une nouvelle connexion…',
+                          sim_id=session.remote_position['sim_id'] if session.remote_position else None)
         session.peer_seen_at = None
         session.peer = None
         session.handshake_done = False
@@ -1002,12 +1047,13 @@ def _handle_host_event(session, kind, value):
                 _send(session, protocol.welcome('Sims4MP host ' + MOD_VERSION))
                 session.handshake_done = True
                 peer = session.peer[0] if isinstance(session.peer, tuple) and session.peer else '?'
-                bridge_notify('Un joueur a rejoint la partie ({}).'.format(peer))
+                bridge_notify('L\'invité a rejoint la partie ({}).'.format(peer))
+                session.summary_due = time.monotonic() + SUMMARY_DELAY
                 if data.get('mod_version') != MOD_VERSION:
                     # Un mod plus ancien n'envoie pas de presence : la pause durerait.
-                    bridge_notify('Versions du mod différentes (vous {}, l\'autre joueur {!s:.16}). '
+                    bridge_notify('Versions du mod différentes (vous {}, l\'invité {!s:.16}). '
                                   'Installez la même version des deux côtés.'.format(
-                                      MOD_VERSION, data.get('mod_version')))
+                                      MOD_VERSION, data.get('mod_version')), alert=True)
             else:
                 _send(session, protocol.reject('protocole {} attendu, recu {}'.format(
                     protocol.PROTOCOL_VERSION, data.get('protocol'))))
@@ -1018,10 +1064,12 @@ def _handle_host_event(session, kind, value):
             game_time = bridge_game_time()
             _send(session, protocol.pong(data.get('seq'), data.get('sent_at'),
                                          {'game_time': game_time}))
-            bridge_notify('Ping reçu du client', important=False)
+            if not data.get('auto'):
+                bridge_notify('Ping reçu de l\'invité', important=False)
         elif msg_type == protocol.EVENT:
             if data.get('kind') == 'presence':
                 session.peer_seen_at = time.monotonic()
+                _note_rtt(session, data.get('rtt'))
             elif data.get('kind') == 'position':
                 _handle_position(session, data)
             elif data.get('kind') == 'money':
@@ -1065,6 +1113,7 @@ def _handle_client_event(session, kind, value):
         msg_type = value['type']
         if msg_type == protocol.WELCOME:
             session.handshake_done = True
+            session.summary_due = time.monotonic() + SUMMARY_DELAY
             bridge_notify('Connecté à l\'hôte : la partie à deux est prête.')
         elif msg_type == protocol.REJECT:
             log('[client] refuse par le host : {}'.format(value['data'].get('reason')))
@@ -1077,6 +1126,7 @@ def _handle_client_event(session, kind, value):
                 _handle_state(session, value['data'])
             elif value['data'].get('kind') == 'presence':
                 session.peer_seen_at = time.monotonic()
+                _note_rtt(session, value['data'].get('rtt'))
             elif value['data'].get('kind') == 'position':
                 _handle_position(session, value['data'])
             elif value['data'].get('kind') == 'money':
@@ -1105,6 +1155,12 @@ def _handle_pong(session, data):
         log('[client] PONG inattendu (seq {!r})'.format(data.get('seq')))
         return
     latency_ms = (time.monotonic() - sent_at) * 1000.0
+    if data.get('seq') in session.auto_pings:
+        # Ping automatique : latence gardee (resume, alerte de connexion lente), sans notification.
+        session.auto_pings.discard(data.get('seq'))
+        _note_rtt(session, latency_ms)
+        return
+    _note_rtt(session, latency_ms)
     host_info = data.get('host_info')
     game_time = host_info.get('game_time') if isinstance(host_info, dict) else None
     if not isinstance(game_time, str):
@@ -1113,6 +1169,59 @@ def _handle_pong(session, data):
     session.last_ping = result
     log('[client] ' + result)
     bridge_notify(result, important=False)
+
+
+# -- latence, resume de connexion (notifications plus claires) --
+
+def _note_rtt(session, value):
+    """Garde la latence (ms) mesuree par l'invite ; alerte si la connexion est lente."""
+    rtt = _clean_float(value, 600000.0)
+    if rtt is None or rtt < 0:
+        return
+    session.rtt_ms = rtt
+    if rtt > SLOW_RTT_MS:
+        bridge_notify('Connexion lente avec {} : {:.0f} ms. Les actions peuvent arriver en retard.'.format(
+            _other_label(session), rtt), alert=True, key='slow')
+
+
+def _other_label(session):
+    return 'l\'invité' if session.role == 'host' else 'l\'hôte'
+
+
+def _auto_ping_tick(session, now):
+    """Invite : un ping silencieux toutes les AUTO_PING_INTERVAL s pour mesurer la latence."""
+    if session.role != 'client' or not (session.endpoint.is_connected and session.handshake_done):
+        return
+    if now - session.auto_ping_at < AUTO_PING_INTERVAL:
+        return
+    session.auto_ping_at = now
+    seq = session.next_ping_seq
+    session.next_ping_seq += 1
+    if len(session.pending_pings) >= 20:
+        session.pending_pings.clear()
+        session.auto_pings.clear()
+    session.pending_pings[seq] = now
+    session.auto_pings.add(seq)
+    session.endpoint.send(protocol.make_message(protocol.PING, {'seq': seq, 'sent_at': now, 'auto': True}))
+
+
+def summary_text(session):
+    """Resume affiche une fois apres la connexion."""
+    remote = session.remote_position
+    parts = ['Vous êtes {}'.format('l\'hôte' if session.role == 'host' else 'l\'invité'),
+             'mod {}'.format(MOD_VERSION)]
+    if session.rtt_ms is not None:
+        parts.append('ping {:.0f} ms'.format(session.rtt_ms))
+    if remote is not None:
+        parts.append('{} contrôle {}'.format(_other_label(session), remote['name'] or 'un Sim'))
+    return 'Partie à deux : ' + ' · '.join(parts) + '.'
+
+
+def _summary_tick(session, now):
+    if session.summary_due is not None and now >= session.summary_due and session.handshake_done:
+        session.summary_due = None
+        remote = session.remote_position
+        bridge_notify(summary_text(session), sim_id=remote['sim_id'] if remote else None)
 
 
 def _handle_state(session, data):
@@ -1212,6 +1321,8 @@ def _poll_session(session, now):
         _walk_tick(session, now)
         _needs_tick(session, now)
         _maybe_send_sims(session, now)
+        _auto_ping_tick(session, now)
+        _summary_tick(session, now)
 
 
 # ---------------------------------------------------------------------------
@@ -1304,7 +1415,8 @@ def _handle_position(session, data):
                               if position['order_age'] is not None else None)
     if previous is None or previous['sim_id'] != position['sim_id']:
         log('[{}] l\'autre joueur controle {} ({})'.format(session.role, position['name'], position['sim_id']))
-        bridge_notify('L\'autre joueur contrôle {}.'.format(position['name'] or 'un Sim'), important=False)
+        bridge_notify('{} contrôle {}.'.format(_other_label(session).capitalize(), position['name'] or 'un Sim'),
+                      important=False, sim_id=position['sim_id'])
         session.walk = None
     _maybe_walk(session, session.remote_position_at)
 
@@ -1540,6 +1652,9 @@ def _handle_clock(session, data):
         else:
             session.clock_jumps += 1
             log('[client] heure : en retard de {:.0f} s de jeu, avancee'.format(-gap))
+            if -gap > ALERT_CLOCK_JUMP:
+                bridge_notify('Heure recalée sur l\'hôte : +{:.0f} min de jeu.'.format(-gap / 60.0),
+                              alert=True, key='clock')
             gap = 0.0
     if gap > tolerance and not session.clock_ahead:
         session.clock_ahead = True
@@ -1661,6 +1776,7 @@ def _maybe_walk(session, now):
     status, session.walk = _move_toward(session, remote, now, session.walk)
     if status is not None:
         _walk_status(session, status)
+        _alert_missing_sim(session, remote, status)
 
 
 def _move_toward(session, remote, now, walk):
@@ -1794,6 +1910,10 @@ def _handle_order(session, data):
     else:
         session.orders_failed += 1
         session.last_order = '{} : non rejouee, {}'.format(label, reason)
+        if not order['auto']:
+            bridge_notify('Action de {} non rejouée chez vous : {} ({}).'.format(
+                _other_label(session), order['name'], reason), alert=True, sim_id=order['sim_id'],
+                key='order-{}'.format(order['name']))
     if not order['auto'] or not ok:
         # Les actions autonomes reussies sont nombreuses : seules les refusees vont au journal.
         log('[{}] ordre {} {}'.format(session.role, order['id'], session.last_order))
@@ -1897,6 +2017,15 @@ def _follow_sim(session, sim_id, now):
     status, session.sims_walk[sim_id] = _move_toward(session, position, now, session.sims_walk.get(sim_id))
     if status is not None:
         session.sims_status[sim_id] = status
+        _alert_missing_sim(session, position, status)
+
+
+def _alert_missing_sim(session, position, status):
+    """Alerte (une fois par Sim et par 2 min) : Sim present chez l'autre, pas ici."""
+    if status.startswith('Sim absent') or status.startswith('Sim inconnu'):
+        bridge_notify('{} est sur le lot chez {}, pas chez vous : il ne peut pas être synchronisé.'.format(
+            position['name'] or 'Un Sim', _other_label(session)), alert=True, important=False,
+            key='absent-{}'.format(position['sim_id']))
 
 
 def _handle_sims(session, data):
@@ -2020,7 +2149,10 @@ def _maybe_send_presence(session, now):
         return
     session.presence_sent_at = now
     # Pas de journal a chaque envoi : une ligne toutes les 2 s noierait le reste.
-    session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'presence'}))
+    presence = {'kind': 'presence'}
+    if session.role == 'client' and session.rtt_ms is not None:
+        presence['rtt'] = round(session.rtt_ms, 1)        # l'hote connait ainsi la latence
+    session.endpoint.send(protocol.make_message(protocol.EVENT, presence))
 
 
 def multiplayer_expected():
