@@ -572,7 +572,8 @@ pump_for(0.15, extra=host_side)
 report('second alignement ignore', HOUSEHOLD.funds.money == 9310)
 
 # --- 6. Heure et vitesse de l'hote ---------------------------------------------------------------
-send({'kind': 'clock', 'seconds': 100600.0, 'speed': 2})
+for _ in range(mod.CLOCK_CONFIRM):                                  # ecart confirme sur 2 messages
+    send({'kind': 'clock', 'seconds': 100600.0, 'speed': 2})
 pump_until(lambda: GAME_CLOCK.advanced, extra=host_side)
 report('invite en retard de 600 s de jeu : heure avancee, vitesse de l\'hote (2)',
        GAME_CLOCK.advanced == [600] and GAME_CLOCK.clock_speed == 2 and GAME_CLOCK.situation_speeds() == [2])
@@ -582,7 +583,8 @@ send({'kind': 'clock', 'seconds': 100610.0, 'speed': 2})
 pump_for(0.1, extra=host_side)
 report('le bouton du joueur ne change pas la vitesse de l\'hote', GAME_CLOCK.clock_speed == 2
        and GAME_CLOCK.situation_speeds() == [2])
-send({'kind': 'clock', 'seconds': 100000.0, 'speed': 2})           # l'invite est en avance de 600 s
+for _ in range(mod.CLOCK_CONFIRM):                                  # l'invite est en avance de 600 s
+    send({'kind': 'clock', 'seconds': 100000.0, 'speed': 2})
 pump_until(lambda: GAME_CLOCK.clock_speed == 0, extra=host_side)
 report('invite en avance : pause jusqu\'a etre rattrape (jamais de retour en arriere)',
        GAME_CLOCK.clock_speed == 0 and GAME_CLOCK.advanced == [600] and session.clock_ahead)
@@ -599,9 +601,22 @@ report('heures invalides ignorees', GAME_CLOCK.clock_speed == 3 and GAME_CLOCK.a
 
 GAME_CLOCK.seconds = 100580.0 - 120.0                               # 2 min de jeu de retard
 send({'kind': 'clock', 'seconds': 100580.0, 'speed': 3})
+pump_for(0.1, extra=host_side)
+single = len(GAME_CLOCK.advanced) == 1
+send({'kind': 'clock', 'seconds': 100580.0, 'speed': 3})
 pump_until(lambda: len(GAME_CLOCK.advanced) == 2, extra=host_side)
-report('2 minutes de jeu de retard : rattrapees (ecart tolere plus petit)',
-       GAME_CLOCK.advanced[-1:] == [120])
+report('ecart sur un seul message : rien ; confirme au second : rattrape (pas de yo-yo)',
+       single and GAME_CLOCK.advanced[-1:] == [120])
+
+# Vitesses posees par le jeu lui-meme (super vitesse quand tous dorment) : jamais transmises.
+del inbox[:]
+GAME_CLOCK.push_speed(5, source=GameSpeedChangeSource.GAMEPLAY)            # SUPER_SPEED3
+GAME_CLOCK.push_speed(4, source=GameSpeedChangeSource.GAMEPLAY)            # INTERACTION_STARTUP_SPEED
+pump_for(0.15, extra=host_side)
+report('invite : vitesses 4 et 5 du jeu jamais transmises a l\'hote', events('speed_request') == [])
+GAME_CLOCK.speed_controllers[GameSpeedChangeSource.GAMEPLAY][:] = [_Request(1)]
+GAME_CLOCK._update()
+session.last_speed_request = None
 
 # Boutons de vitesse de l'invite : la demande part a l'hote.
 del inbox[:]

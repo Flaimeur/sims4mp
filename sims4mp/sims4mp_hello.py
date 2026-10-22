@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - etape M4 : synchro en jeu de l'argent (gains et depenses
+# Sims 4 Multiplayer - etape M5 : chaque action choisie au menu par un joueur
+# (marcher, s'asseoir, dormir, discuter...) est envoyee au clic et rejouee sur
+# l'autre PC ; besoins du Sim controle recopies chez l'autre (le PC qui
+# controle le Sim fait foi, l'hote si les deux controlent le meme).
+# Etape M4 : synchro en jeu de l'argent (gains et depenses
 # des deux cotes), de l'heure et de la vitesse (celles de l'hote) et des
 # positions (le double du Sim de l'autre joueur marche jusqu'a lui).
 # M3 : chaque joueur envoie la position de son Sim
@@ -97,6 +101,19 @@
 #           si son ordre est plus recent ; sans ordre de part et d'autre, l'autre
 #           joueur mene son Sim, et pour un Sim controle des deux cotes c'est l'hote.
 #
+# Ordres (M5). Dans InteractionQueue.append, une interaction du joueur
+# (interaction.source == InteractionContext.SOURCE_PIE_MENU, affordance.is_super)
+# part aussitot : Sim (queue.sim.sim_info.sim_id), action (affordance.guid64) et
+# cible (objet .id, Sim, ou point de terrain ; une partie d'objet -> part_owner).
+# L'autre PC retrouve l'action par services.get_instance_manager(Types.INTERACTION)
+# et la cible par services.object_manager() / sim_info_manager(), puis
+# sim.push_super_affordance(action, cible, InteractionContext(sim,
+# SOURCE_SCRIPT_WITH_USER_INTENT, Priority.High)) ; pour le terrain, le meme
+# contexte que sims.gohere. Chaque ordre a un identifiant : jamais rejoue deux fois.
+# Besoins : sim_info.commodity_tracker.get_all_commodities() filtre is_visible et
+# hors competences (comme household_commands._set_motive_decay), envoyes toutes
+# les 5 s par le PC qui fait foi, ecrits par tracker.set_value(stat.stat_type, v).
+#
 # Prototype P1 (simulation unique, lecture seule) : mp.traffic on mesure ce que
 # la simulation envoie a l'affichage. Verifie dans simulation.zip :
 # server.client.Client.send_message(msg_id, msg) appelle omega.send(client.id,
@@ -114,7 +131,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.8.3'
+MOD_VERSION = '0.9.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -142,12 +159,22 @@ CLOCK_INTERVAL = 1.0                      # host : envoi de l'heure et de la vit
 CLOCK_TOLERANCE_REAL = 1.5                # ecart toléré : 1,5 s reelle de temps de l'hote...
 CLOCK_MIN_TOLERANCE = 20.0                # ... et au moins 20 s de jeu
 CLOCK_DEFAULT_RATE = 60.0                 # s de jeu par s reelle tant que le rythme n'est pas mesure
+PLAYER_SPEEDS = (0, 1, 2, 3)              # ClockSpeedMode : pause, normale, 2, 3 (boutons du joueur)
+CLOCK_CONFIRM = 2                         # messages de suite au-dela de la tolerance avant correction
+SPEED_REQUEST_DEDUP = 1.0                 # meme vitesse demandee a moins d'1 s d'intervalle : une seule
 WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
 WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
 WALK_RETRY = 3.0                          # secondes reelles avant de redonner le meme ordre
 WALK_TIMEOUT = 15.0                       # toujours loin apres : teleportation
 TELEPORT_DIST = 40.0                      # plus loin, ou autre niveau : teleportation directe
 ORDER_MAX_AGE = 3600.0                    # ordre plus ancien : comme s'il n'y en avait pas
+ACTION_HOLD = 20.0                        # apres une action rejouee, le double n'est pas recale
+ORDERS_SEEN_MAX = 500                     # identifiants d'ordres deja rejoues gardes en memoire
+NEEDS_INTERVAL = 5.0                      # secondes reelles entre deux envois des besoins
+NEEDS_RESEND = 30.0                       # renvoi complet meme sans changement
+NEEDS_EPSILON = 1.0                       # ecart minimal (sur ~ -100..100) pour envoyer ou ecrire
+NEEDS_MAX = 64                            # besoins acceptes par message
+NEEDS_LIMIT = 100000.0
 
 
 # ---------------------------------------------------------------------------
@@ -552,6 +579,97 @@ def bridge_set_player_speed(value):
         reason='Sims4MP : vitesse demandee par l\'autre joueur', immediate=True)
 
 
+# --- Ordres des joueurs (M5) et besoins ----------------------------------------
+
+def bridge_order_from_interaction(queue, interaction):
+    """Description d'un clic du joueur (menu d'actions) pour le rejouer ailleurs, ou None.
+    Seules les super-interactions choisies au menu (SOURCE_PIE_MENU) sont prises."""
+    from interactions.context import InteractionContext
+    if interaction.source != InteractionContext.SOURCE_PIE_MENU:
+        return None
+    affordance = interaction.affordance
+    if not getattr(affordance, 'is_super', False):
+        return None
+    target = interaction.target
+    if target is None:
+        where = {'t': 'none'}
+    elif getattr(target, 'is_terrain', False):
+        position = target.position
+        where = {'t': 'terrain', 'x': float(position.x), 'y': float(position.y), 'z': float(position.z),
+                 'level': target.level}
+    elif getattr(target, 'is_sim', False):
+        where = {'t': 'sim', 'id': target.sim_info.sim_id}
+    else:
+        if getattr(target, 'is_part', False):
+            target = target.part_owner                 # le jeu choisit la place (canape, lit double...)
+        where = {'t': 'obj', 'id': target.id}
+    return {'sim_id': queue.sim.sim_info.sim_id, 'affordance': affordance.guid64,
+            'name': affordance.__name__, 'target': where}
+
+
+def bridge_replay_order(sim_id, affordance_id, where):
+    """Rejoue l'ordre : meme Sim, meme action, meme cible. Renvoie (True, None) ou (False, raison)."""
+    import services
+    import sims4.resources
+    from interactions.context import InteractionContext
+    from interactions.priority import Priority
+    from objects import ALL_HIDDEN_REASONS
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    if sim is None:
+        return False, 'Sim absent ici'
+    affordance = services.get_instance_manager(sims4.resources.Types.INTERACTION).get(affordance_id)
+    if affordance is None:
+        return False, 'action inconnue ici (pack ou mod different ?)'
+    kind = where['t']
+    if kind == 'terrain':
+        target, context = _terrain_target(sim, where['x'], where['y'], where['z'], where['level'])
+    else:
+        if kind == 'none':
+            target = None
+        elif kind == 'sim':
+            other = services.sim_info_manager().get(where['id'])
+            target = other.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if other is not None else None
+        else:
+            target = services.object_manager().get(where['id'])
+        if kind != 'none' and target is None:
+            return False, 'cible absente ici (objet cree apres le chargement ?)'
+        context = InteractionContext(sim, InteractionContext.SOURCE_SCRIPT_WITH_USER_INTENT, Priority.High)
+    result = sim.push_super_affordance(affordance, target, context)
+    return (True, None) if result else (False, 'refusee par le jeu ({})'.format(result))
+
+
+def bridge_read_needs(sim_id):
+    """Besoins visibles du Sim (commodites is_visible, hors competences) : {guid64: valeur}."""
+    import services
+    sim_info = services.sim_info_manager().get(sim_id)
+    if sim_info is None:
+        return None
+    values = {}
+    for stat in sim_info.commodity_tracker.get_all_commodities():
+        if getattr(stat, 'is_visible', False) and not getattr(stat, 'is_skill', False):
+            values[int(stat.guid64)] = float(stat.get_value())
+    return values
+
+
+def bridge_write_needs(sim_id, values):
+    """Recopie des besoins recus ; ne touche que les commodites deja presentes. Renvoie le nombre ecrit."""
+    import services
+    sim_info = services.sim_info_manager().get(sim_id)
+    if sim_info is None:
+        return 0
+    tracker = sim_info.commodity_tracker
+    written = 0
+    for stat in tracker.get_all_commodities():
+        if not getattr(stat, 'is_visible', False) or getattr(stat, 'is_skill', False):
+            continue
+        value = values.get(int(stat.guid64))
+        if value is not None and abs(float(stat.get_value()) - value) > NEEDS_EPSILON:
+            tracker.set_value(stat.stat_type, value)
+            written += 1
+    return written
+
+
 def bridge_move_sim(sim_id, x, y, z, level, teleport):
     """Fait marcher (ou teleporte) le Sim sim_id vers la position. Renvoie True si l'ordre est accepte."""
     import services
@@ -656,11 +774,24 @@ class NetSession(object):
         self.clock_ahead = False
         self.clock_jumps = 0
         self.last_gap = None
+        self.clock_strikes = 0          # messages de suite avec un ecart au-dela de la tolerance
         self.speed_requests = 0         # demandes de vitesse envoyees (invite) ou appliquees (hote)
+        self.last_speed_request = None  # invite : (vitesse, moment) de la derniere demande envoyee
         self.walk = None                # dernier ordre de marche donne au double
         self.walks = 0
         self.teleports = 0
         self.walk_status = 'aucune position recue'
+        # Ordres des joueurs (M5) et besoins.
+        self.order_counter = 0
+        self.orders_seen = []           # identifiants deja rejoues (anti double comptage)
+        self.orders_sent = 0
+        self.orders_replayed = 0
+        self.orders_failed = 0
+        self.last_order = None          # texte du dernier ordre rejoue ou refuse
+        self.action_hold = {}           # sim_id -> moment jusqu'auquel le double n'est pas recale
+        self.needs_checked_at = 0.0
+        self.needs_sent = None          # (sim_id, valeurs, moment) du dernier envoi
+        self.needs_written = 0
 
 
 # ---------------------------------------------------------------------------
@@ -823,6 +954,10 @@ def _handle_host_event(session, kind, value):
                 _handle_money(session, data)
             elif data.get('kind') == 'speed_request':
                 _handle_speed_request(session, data)
+            elif data.get('kind') == 'order':
+                _handle_order(session, data)
+            elif data.get('kind') == 'needs':
+                _handle_needs(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -872,6 +1007,10 @@ def _handle_client_event(session, kind, value):
                 _handle_money(session, value['data'])
             elif value['data'].get('kind') == 'clock':
                 _handle_clock(session, value['data'])
+            elif value['data'].get('kind') == 'order':
+                _handle_order(session, value['data'])
+            elif value['data'].get('kind') == 'needs':
+                _handle_needs(session, value['data'])
             else:
                 log('[client] EVENT ignore (kind {!r})'.format(value['data'].get('kind')))
         elif msg_type == protocol.BYE:
@@ -966,7 +1105,7 @@ def _poll_session(session, now):
         if kind == 'message':
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
             if value['type'] != protocol.EVENT or value['data'].get('kind') not in ('state', 'presence', 'position',
-                                                                                    'clock'):
+                                                                                    'clock', 'needs'):
                 log('[{}] recu : {}'.format(session.role, _describe(value)))
         else:
             log('[{}] {} : {}'.format(session.role, kind, value))
@@ -991,6 +1130,7 @@ def _poll_session(session, now):
         _money_tick(session, now)
         _clock_tick(session, now)
         _walk_tick(session, now)
+        _needs_tick(session, now)
 
 
 # ---------------------------------------------------------------------------
@@ -1286,6 +1426,11 @@ def _handle_clock(session, data):
     tolerance = max(CLOCK_MIN_TOLERANCE, rate * CLOCK_TOLERANCE_REAL)
     gap = local[0] - seconds                         # > 0 : l'invite est en avance
     session.last_gap = gap
+    # Un ecart doit se confirmer sur deux messages de suite avant correction (pas de yo-yo
+    # sur un message en retard ou un changement de vitesse en cours).
+    session.clock_strikes = session.clock_strikes + 1 if abs(gap) > tolerance else 0
+    if session.clock_strikes < CLOCK_CONFIRM and not session.clock_ahead:
+        gap = 0.0
     if gap < -tolerance:
         try:
             bridge_advance_clock(-gap)
@@ -1308,8 +1453,8 @@ def _handle_clock(session, data):
 def _handle_speed_request(session, data):
     """Hote : l'invite a appuye sur un bouton de vitesse ; l'hote l'applique comme le sien."""
     speed = _clean_int(data.get('speed'), 0, 16)
-    if speed is None or not _safe('vitesse', bridge_valid_speed, speed):
-        log('[host] demande de vitesse invalide ignoree')
+    if speed is None or speed not in PLAYER_SPEEDS or not _safe('vitesse', bridge_valid_speed, speed):
+        log('[host] demande de vitesse invalide ignoree ({!r})'.format(data.get('speed')))
         return
     try:
         bridge_set_player_speed(speed)
@@ -1327,9 +1472,16 @@ def on_player_speed_change():
     if session is None or session.role != 'client' or not session.handshake_done:
         return
     speed = _safe('lecture vitesse du joueur', bridge_player_speed)
-    if speed is None:
+    if speed is None or speed not in PLAYER_SPEEDS:
+        # 4 (INTERACTION_STARTUP_SPEED) et 5 (SUPER_SPEED3) sont poses par le jeu lui-meme
+        # (sommeil de tous les Sims...), pas par un bouton : jamais transmis.
         return
+    now = time.monotonic()
+    last = session.last_speed_request
+    if last is not None and last[0] == speed and now - last[1] < SPEED_REQUEST_DEDUP:
+        return                                       # meme demande juste avant (push puis pop)
     if session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'speed_request', 'speed': speed})):
+        session.last_speed_request = (speed, now)
         session.speed_requests += 1
         log('[client] vitesse {} demandee a l\'hote'.format(speed))
 
@@ -1400,6 +1552,10 @@ def _maybe_walk(session, now):
         return _walk_status(session, 'votre dernier ordre a ce Sim est le plus recent : il le suit')
     if local_time is None and remote_time is None and mine_id == remote['sim_id'] and session.role == 'host':
         return _walk_status(session, 'meme Sim des deux cotes, aucun ordre recent : l\'hote garde la main')
+    hold = session.action_hold.get(remote['sim_id'])
+    if hold is not None and now < hold:
+        return _walk_status(session, 'action de l\'autre joueur rejouee : pas de recalage pendant {:.0f} s'.format(
+            ACTION_HOLD))
     found = bridge_local_sim_position(remote['sim_id'])
     if found is None:
         return _walk_status(session, 'lecture du Sim impossible (voir le journal)')
@@ -1449,6 +1605,143 @@ def _maybe_walk(session, now):
     _walk_status(session, 'marche vers l\'autre joueur')
 
 
+# -- ordres des joueurs (M5) --
+
+def send_player_order(order):
+    """Envoie a l'autre PC l'action que le joueur de ce PC vient de choisir (au clic)."""
+    session = _session
+    if session is None or not session.handshake_done or not session.endpoint.is_connected or _gate['waiting']:
+        return
+    session.order_counter += 1
+    message = dict(order, kind='order', id='{}-{}'.format(session.role, session.order_counter))
+    if session.endpoint.send(protocol.make_message(protocol.EVENT, message)):
+        session.orders_sent += 1
+        log('[{}] ordre envoye : {} -> {} ({})'.format(session.role, order['name'], order['target']['t'],
+                                                        message['id']))
+
+
+def validate_order(data):
+    """Copie propre d'un ordre recu, ou None."""
+    order_id = data.get('id')
+    sim_id = _clean_int(data.get('sim_id'), 1, 2 ** 64)
+    affordance = _clean_int(data.get('affordance'), 1, 2 ** 64)
+    where = data.get('target')
+    if (not isinstance(order_id, str) or not 0 < len(order_id) <= 40 or not order_id.isprintable()
+            or sim_id is None or affordance is None or not isinstance(where, dict)):
+        return None
+    kind = where.get('t')
+    if kind == 'none':
+        clean = {'t': 'none'}
+    elif kind in ('sim', 'obj'):
+        target_id = _clean_int(where.get('id'), 1, 2 ** 64)
+        if target_id is None:
+            return None
+        clean = {'t': kind, 'id': target_id}
+    elif kind == 'terrain':
+        coords = [_clean_float(where.get(axis), POSITION_MAX_COORD) for axis in ('x', 'y', 'z')]
+        if None in coords:
+            return None
+        clean = {'t': 'terrain', 'x': coords[0], 'y': coords[1], 'z': coords[2],
+                 'level': _clean_int(where.get('level'), POSITION_LEVELS[0], POSITION_LEVELS[1])}
+    else:
+        return None
+    return {'id': order_id, 'sim_id': sim_id, 'affordance': affordance,
+            'name': _clean_text(data.get('name')) or str(affordance), 'target': clean}
+
+
+def _handle_order(session, data):
+    order = validate_order(data)
+    if order is None:
+        log('[{}] ordre invalide ignore'.format(session.role))
+        return
+    if order['id'] in session.orders_seen:
+        return                                       # deja rejoue : jamais deux fois
+    session.orders_seen.append(order['id'])
+    del session.orders_seen[:-ORDERS_SEEN_MAX]
+    if _gate['waiting']:
+        session.last_order = '{} : ignore (attente de l\'autre joueur)'.format(order['name'])
+        return
+    _sync['pushing'] = True                          # pas un ordre du joueur de ce PC
+    try:
+        result = _safe('ordre rejoue', bridge_replay_order, order['sim_id'], order['affordance'], order['target'])
+    finally:
+        _sync['pushing'] = False
+    ok, reason = result if result is not None else (False, 'erreur (voir le journal)')
+    if ok:
+        session.orders_replayed += 1
+        session.action_hold[order['sim_id']] = time.monotonic() + ACTION_HOLD
+        session.walk = None
+        session.last_order = '{} : rejouee'.format(order['name'])
+    else:
+        session.orders_failed += 1
+        session.last_order = '{} : non rejouee, {}'.format(order['name'], reason)
+    log('[{}] ordre {} {}'.format(session.role, order['id'], session.last_order))
+
+
+def on_player_order(queue, interaction):
+    """Appele par la file d'attente du jeu pour chaque ordre du joueur de ce PC."""
+    order = _safe('lecture de l\'ordre', bridge_order_from_interaction, queue, interaction)
+    if order is not None:
+        send_player_order(order)
+
+
+# -- besoins : chaque joueur fait foi pour le Sim qu'il controle --
+
+def _needs_authority(session, sim_id, mine_id):
+    """Vrai si ce PC fait foi pour les besoins de ce Sim."""
+    if sim_id != mine_id:
+        return False
+    if session.role == 'host':
+        return True
+    remote = session.remote_position
+    return remote is None or remote['sim_id'] != sim_id    # meme Sim des deux cotes : l'hote
+
+
+def _needs_tick(session, now):
+    if not (session.endpoint.is_connected and session.handshake_done) or _gate['waiting']:
+        return
+    if now - session.needs_checked_at < NEEDS_INTERVAL:
+        return
+    session.needs_checked_at = now
+    mine = _read('active_sim', _active_sim)
+    mine_id = _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
+    if mine_id is None or not _needs_authority(session, mine_id, mine_id):
+        return
+    values = _safe('lecture des besoins', bridge_read_needs, mine_id)
+    if not values:
+        return
+    last = session.needs_sent
+    if (last is not None and last[0] == mine_id and now - last[2] < NEEDS_RESEND
+            and all(abs(last[1].get(k, NEEDS_LIMIT) - v) <= NEEDS_EPSILON for k, v in values.items())):
+        return
+    payload = {str(k): round(v, 2) for k, v in list(values.items())[:NEEDS_MAX]}
+    if session.endpoint.send(protocol.make_message(protocol.EVENT, {
+            'kind': 'needs', 'sim_id': mine_id, 'values': payload})):
+        session.needs_sent = (mine_id, values, now)
+
+
+def _handle_needs(session, data):
+    sim_id = _clean_int(data.get('sim_id'), 1, 2 ** 64)
+    raw = data.get('values')
+    if sim_id is None or not isinstance(raw, dict) or len(raw) > NEEDS_MAX:
+        log('[{}] besoins invalides ignores'.format(session.role))
+        return
+    values = {}
+    for key, value in raw.items():
+        guid = (_clean_int(int(key), 1, 2 ** 64)
+                if isinstance(key, str) and key.isascii() and key.isdigit() and len(key) <= 20 else None)
+        number = _clean_float(value, NEEDS_LIMIT)
+        if guid is not None and number is not None:
+            values[guid] = number
+    mine = _read('active_sim', _active_sim)
+    mine_id = _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
+    if _needs_authority(session, sim_id, mine_id):
+        return                                       # ce PC fait foi pour ce Sim
+    written = _safe('ecriture des besoins', bridge_write_needs, sim_id, values)
+    if written:
+        session.needs_written += written
+
+
 def _walk_tick(session, now):
     # Reessaie de temps en temps : double arrive, bloque ou ordre refuse.
     if session.walk is not None and now - session.walk['at'] >= WALK_RETRY:
@@ -1472,6 +1765,10 @@ def sync_lines(session):
             session.speed_requests))
     lines.append('Double de l\'autre joueur : {} ; {} ordre(s) de marche, {} teleportation(s)'.format(
         session.walk_status, session.walks, session.teleports))
+    lines.append('Actions : {} envoyee(s), {} rejouee(s), {} non rejouee(s){}'.format(
+        session.orders_sent, session.orders_replayed, session.orders_failed,
+        ' ; derniere : {}'.format(session.last_order) if session.last_order else ''))
+    lines.append('Besoins : {} valeur(s) recopiee(s) depuis l\'autre PC'.format(session.needs_written))
     return lines
 
 
@@ -1714,9 +2011,11 @@ def _install_queue_hook():
         if refused is not None:
             return refused
         try:
-            # Ordre du joueur de ce PC (pas un ordre donne par le mod) : « le dernier ordre gagne ».
+            # Ordre du joueur de ce PC (pas un ordre donne par le mod) : « le dernier ordre gagne »,
+            # et l'action part tout de suite vers l'autre PC (M5).
             if not _sync['pushing'] and _is_user_directed(interaction):
                 record_local_order(self.sim.sim_info.sim_id)
+                on_player_order(self, interaction)
         except Exception:
             _sync_error('suivi des ordres du joueur')
         return original(self, interaction, *args, **kwargs)
