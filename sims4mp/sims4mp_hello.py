@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - annulation (0.14.0) : chaque ordre envoye ou rejoue est relie a
+# Sims 4 Multiplayer - correctif menu (0.14.1) : la base de « Sims4MP… » n'est plus un
+# selecteur (PickerSuperInteractionMixin.potential_interactions : roue vide = entree cachee),
+# les tests regles de la base sont sautes (_tunable_tests_enabled) et l'entree reste
+# disponible quand la sauvegarde est verrouillee (allow_while_save_locked).
+# Annulation (0.14.0) : chaque ordre envoye ou rejoue est relie a
 # l'action du jeu correspondante ; la croix du joueur (Interaction.cancel_user, appele
 # par interaction_commands.cancel_common) sur une action reliee envoie l'annulation,
 # que l'autre PC applique avec interaction.cancel(FinishingType.USER_CANCEL)
@@ -163,7 +167,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.14.0'
+MOD_VERSION = '0.14.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -2668,20 +2672,30 @@ def _menu_affordance_class(base):
         'allow_autonomous': False,
         'visible': True,
         '_test': _test,
+        # Interaction.test : sans ceci, les tests regles de la base (ex. « Voyager avec »)
+        # cachent l'entree ; le verrou de sauvegarde de l'invite la griserait.
+        '_tunable_tests_enabled': staticmethod(lambda: False),
+        'allow_while_save_locked': True,
         '_run_interaction_gen': _run_interaction_gen,
     }
+
+
+def _menu_base_ok(affordance):
+    """Action immediate simple : pas un selecteur (sa roue liste des choix, vide = cachee)."""
+    from interactions.base.immediate_interaction import ImmediateSuperInteraction
+    from interactions.base.picker_interaction import PickerSuperInteractionMixin
+    return issubclass(affordance, ImmediateSuperInteraction) and not issubclass(affordance, PickerSuperInteractionMixin)
 
 
 def bridge_create_menu_affordance():
     """Cree (une fois) et enregistre l'action « Sims4MP… »."""
     import services
     import sims4.resources
-    from interactions.base.immediate_interaction import ImmediateSuperInteraction
     manager = services.get_instance_manager(sims4.resources.Types.INTERACTION)
     terrain = services.terrain_service.terrain_object()
-    candidates = [a for a in type(terrain)._super_affordances if issubclass(a, ImmediateSuperInteraction)]
+    candidates = [a for a in type(terrain)._super_affordances if _menu_base_ok(a)]
     if not candidates:
-        candidates = [a for a in manager.types.values() if issubclass(a, ImmediateSuperInteraction)]
+        candidates = [a for a in manager.types.values() if _menu_base_ok(a)]
     if not candidates:
         raise RuntimeError('aucune action immediate du jeu a reprendre')
     base = candidates[0]

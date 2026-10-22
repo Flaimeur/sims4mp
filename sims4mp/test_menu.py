@@ -104,6 +104,18 @@ module('interactions.base')
 module('interactions.base.immediate_interaction', ImmediateSuperInteraction=ImmediateSuperInteraction)
 
 
+class PickerSuperInteractionMixin(object):
+    pass
+
+
+module('interactions.base.picker_interaction', PickerSuperInteractionMixin=PickerSuperInteractionMixin)
+
+
+class TravelWithPicker(PickerSuperInteractionMixin, ImmediateSuperInteraction):
+    # Comme « Voyager avec » : selecteur, sa roue liste des Sims (vide = cachee).
+    pass
+
+
 class TerrainTeleportCheat(ImmediateSuperInteraction):
     cheat = True
 
@@ -113,7 +125,7 @@ class GoHere(object):
 
 
 class TerrainClass(object):
-    _super_affordances = (GoHere, TerrainTeleportCheat)
+    _super_affordances = (GoHere, TravelWithPicker, TerrainTeleportCheat)
 
 
 TERRAIN = TerrainClass()
@@ -202,11 +214,14 @@ report('reglages : roue Maj + clic, choisie par le joueur, jamais par l\'autonom
        menu.cheat is True and menu.debug is False and menu.allow_user_directed and not menu.allow_autonomous
        and menu.visible and menu.display_name() == 'Sims4MP…' and isinstance(menu.display_name(), RawText))
 report('tests du jeu contournes (toujours disponible)', bool(menu._test(None, None)))
+report('selecteur ignore comme base ; tests regles de la base sautes ; visible meme sauvegarde verrouillee',
+       not issubclass(menu, TravelWithPicker) and menu._tunable_tests_enabled() is False
+       and menu.allow_while_save_locked is True)
 report('enregistree aupres du gestionnaire avec sa propre cle',
        MANAGER.registered and MANAGER.registered[0][0] is menu and menu.guid64 == MANAGER.registered[0][1].instance
        and menu.guid64 != TerrainTeleportCheat.guid64)
 report('ajoutee a la roue du sol', TerrainClass._super_affordances[-1] is menu
-       and TerrainClass._super_affordances[:2] == (GoHere, TerrainTeleportCheat))
+       and TerrainClass._super_affordances[:3] == (GoHere, TravelWithPicker, TerrainTeleportCheat))
 mod._safe_on_zone_loaded()                            # deuxieme chargement
 report('deuxieme chargement : ni recreee ni ajoutee deux fois',
        len(MANAGER.registered) == 1 and TerrainClass._super_affordances.count(menu) == 1)
