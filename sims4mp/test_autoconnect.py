@@ -263,6 +263,27 @@ report('session manuelle deja active : le reglage ne la remplace pas',
        mod._session is manual and manual.role == 'host' and mod._auto['target'] is None)
 reset()
 
+# --- 11. mp.solo : seul jusqu'a la fermeture du jeu -----------------------------------------
+write_settings({'role': 'host', 'ip': '', 'port': free_port()})
+load_zone()
+auto_session = mod._session
+del _CheatOutput.lines[:]
+mod.mp_solo()
+report('mp.solo : partie a deux fermee, pause levee, message clair',
+       auto_session is not None and mod._session is None and not mod._gate['waiting']
+       and any('Mode solo' in line and 'Partie a deux arretee' in line for line in _CheatOutput.lines))
+load_zone()                                           # voyage ou autre partie : nouveau chargement
+load_zone()
+mod._auto_tick(time.monotonic() + 10 * mod.AUTO_RETRY_INTERVAL)
+report('mp.solo : reglage du lanceur ignore aux chargements suivants',
+       mod._session is None and mod._auto['target'] is None and mod._auto['solo']
+       and not mod._gate['waiting'])
+solo_port = free_port()
+mod.mp_host(solo_port)
+report('mp.solo : mp.host reste possible a la main', mod._session is not None and mod._session.role == 'host')
+reset()
+mod._auto['solo'] = False
+
 # --- Fin -------------------------------------------------------------------------------------
 shutil.rmtree(TMP, ignore_errors=True)
 if not LOG_EXISTED and os.path.exists(LOG_FILE):

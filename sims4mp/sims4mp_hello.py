@@ -1,4 +1,6 @@
-# Sims 4 Multiplayer - latence (0.15.0) : TCP_NODELAY regle par le mod sur la socket connectee
+# Sims 4 Multiplayer - mp.solo (0.15.1) : jouer seul jusqu'a la fermeture du jeu (session
+# fermee, pause levee, reglage du lanceur ignore aux chargements suivants).
+# Latence (0.15.0) : TCP_NODELAY regle par le mod sur la socket connectee
 # (transport.py inchange), envoi immediat en fin de passage de pompe et au clic (ordres,
 # annulations) via Connection.handle_write, pompe toutes les 20 ms au lieu de 50.
 # Diagnostic menu (0.14.4) : l'erreur avalee par ProtocolBufferRollback
@@ -177,7 +179,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.15.0'
+MOD_VERSION = '0.15.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -3258,6 +3260,7 @@ def _start_client(ip, port):
 
 _auto = {
     'target': None,          # ('host', port) ou ('join', ip, port) ; None : rien d'automatique
+    'solo': False,           # mp.solo : plus de connexion automatique jusqu'a la fermeture du jeu
     'next_try': 0.0,         # time.monotonic() avant lequel on ne retente pas
     'attempts': 0,
     'last_error': None,
@@ -3369,6 +3372,10 @@ def on_zone_loaded():
         return
     if _session is not None:
         log('auto : session deja active ({}), rien a faire'.format(_session.role))
+        return
+    if _auto['solo']:
+        _auto['target'] = None
+        log('auto : mode solo (mp.solo), reglage du lanceur ignore jusqu\'a la fermeture du jeu')
         return
     path = settings_path()
     settings, reason = read_settings(path)
@@ -3672,6 +3679,29 @@ def mp_disconnect(_connection=None):
     except Exception:
         log('ERREUR mp.disconnect :\n' + traceback.format_exc())
         output('Erreur dans mp.disconnect (voir le journal).')
+
+
+@sims4.commands.Command('mp.solo', command_type=sims4.commands.CommandType.Live)
+def mp_solo(_connection=None):
+    """Jouer seul jusqu'a la fermeture du jeu : ferme la partie a deux, leve la pause et
+    ignore le reglage du lanceur aux chargements suivants (voyage, autre lot, autre partie).
+    mp.host / mp.join restent possibles a la main."""
+    output = sims4.commands.CheatOutput(_connection)
+    try:
+        _auto['solo'] = True
+        _auto['target'] = None
+        had_session = _session is not None
+        if had_session:
+            _close_session(send_bye=True)
+        _gate_tick(time.monotonic())                 # leve la pause tout de suite
+        _release_clock_if_unused(None)
+        log('mp.solo : mode solo jusqu\'a la fermeture du jeu ({})'.format(
+            'partie a deux arretee' if had_session else 'aucune session'))
+        output('Mode solo jusqu\'a la fermeture du jeu : plus de connexion automatique, '
+               'meme apres un voyage ou un chargement.' + (' Partie a deux arretee.' if had_session else ''))
+    except Exception:
+        log('ERREUR mp.solo :\n' + traceback.format_exc())
+        output('Erreur dans mp.solo (voir le journal).')
 
 
 # ---------------------------------------------------------------------------
