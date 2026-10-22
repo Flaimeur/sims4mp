@@ -163,6 +163,32 @@ class ChoiceMenu(object):
 module('interactions.choices', ChoiceMenu=ChoiceMenu)
 
 
+class ProtocolBufferRollback(object):
+    """Comme distributor.rollback.ProtocolBufferRollback : retire l'element et avale l'erreur."""
+
+    def __init__(self, items):
+        self.items = items
+
+    def __enter__(self):
+        self.items.append('bouton')
+        return self.items[-1]
+
+    def __exit__(self, exc_type, value, tb):
+        if exc_type is not None:
+            del self.items[-1]
+        return True
+
+
+module('distributor')
+module('distributor.rollback', ProtocolBufferRollback=ProtocolBufferRollback)
+
+
+def create_pie_menu_message(items, fail):
+    with ProtocolBufferRollback(items):
+        if fail:
+            raise TypeError('nom du bouton impossible')
+
+
 class TravelWithPicker(PickerSuperInteractionMixin, ImmediateSuperInteraction):
     # Comme « Voyager avec » : selecteur, sa roue liste des Sims (vide = cachee).
     pass
@@ -299,6 +325,16 @@ report('roue : entree proposee et acceptee, raison notee une seule fois dans le 
 ChoiceMenu().add_potential_aops(TERRAIN, types.SimpleNamespace(shift_held=False), aops[:1])
 with open(mod.LOG_PATH, encoding='utf-8') as handle:
     report('roue sans Maj : rien de note', sum('menu (roue)' in line for line in handle) == 2)
+buttons = []
+create_pie_menu_message(buttons, fail=False)
+create_pie_menu_message(buttons, fail=True)
+with ProtocolBufferRollback([]):
+    raise ValueError('hors de la roue')
+with open(mod.LOG_PATH, encoding='utf-8') as handle:
+    text = handle.read()
+report('bouton retire par le jeu : erreur avalee notee avec sa trace (roue seulement)',
+       buttons == ['bouton'] and 'bouton retire par le jeu' in text and 'nom du bouton impossible' in text
+       and 'hors de la roue' not in text)
 
 # --- 2. La fenetre ----------------------------------------------------------------------
 result = menu()._run_interaction_gen(None)

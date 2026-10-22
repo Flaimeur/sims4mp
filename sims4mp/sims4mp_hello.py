@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - diagnostic menu (0.14.3) : ChoiceMenu.add_potential_aops / add_aop
+# Sims 4 Multiplayer - latence (0.15.0) : TCP_NODELAY regle par le mod sur la socket connectee
+# (transport.py inchange), envoi immediat en fin de passage de pompe et au clic (ordres,
+# annulations) via Connection.handle_write, pompe toutes les 20 ms au lieu de 50.
+# Diagnostic menu (0.14.4) : l'erreur avalee par ProtocolBufferRollback
+# pendant la construction d'un bouton de la roue (create_pie_menu_message) est notee.
+# Diagnostic menu (0.14.3) : ChoiceMenu.add_potential_aops / add_aop
 # sont suivis pour noter dans le journal si l'entree est proposee a la roue Maj + clic et
 # la raison d'un refus du jeu (une ligne par situation differente).
 # Correctif menu (0.14.2) : tests regles de la base remplaces par des
@@ -172,10 +177,10 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.14.3'
+MOD_VERSION = '0.15.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
-PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
+PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
 MAX_PUMP_ERRORS = 20     # au-dela, la session est arretee
 STATE_INTERVAL = 5.0     # secondes reelles minimum entre deux envois d'etat
 STATE_MAX_SIMS = 16      # limite du nombre de Sims acceptes dans un etat
@@ -904,6 +909,7 @@ class NetSession(object):
         self.presence_sent_at = 0.0
         # Notifications plus claires (0.12.0) : latence, resume a la connexion.
         self.rtt_ms = None
+        self.nodelay_sock = None          # socket deja reglee en TCP_NODELAY (0.15.0)
         self.auto_pings = set()
         self.auto_ping_at = 0.0
         self.summary_due = None
@@ -1360,8 +1366,42 @@ def pump_tick():
     _save_lock_tick(_session)             # invite connecte : sauvegarde verrouillee
 
 
+def _connected_conn(session):
+    """Connexion ouverte de la session (transport.Connection), ou None."""
+    if not session.endpoint.is_connected:
+        return None
+    conn = getattr(session.endpoint, 'conn', None)
+    if conn is None or conn.closed:
+        return None
+    return conn
+
+
+def _set_nodelay(session):
+    """TCP_NODELAY sur la socket connectee, une fois : sinon Windows peut garder un petit
+    message ~200 ms (Nagle + accuse de reception differe), d'ou un ping eleve meme en local."""
+    conn = _connected_conn(session)
+    if conn is None or conn.sock is session.nodelay_sock:
+        return
+    session.nodelay_sock = conn.sock
+    try:
+        import socket
+        conn.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        log('[{}] reseau : envoi immediat des petits messages (TCP_NODELAY)'.format(session.role))
+    except Exception as exc:
+        log('[{}] reseau : TCP_NODELAY impossible ({})'.format(session.role, exc))
+
+
+def _flush_now(session):
+    """Envoie tout de suite ce qui a ete prepare pendant ce passage (reponses, ordres),
+    au lieu d'attendre le poll suivant. Une erreur sera vue par ce poll suivant."""
+    conn = _connected_conn(session)
+    if conn is not None and conn.wants_write():
+        conn.handle_write()
+
+
 def _poll_session(session, now):
     session.polls += 1
+    _set_nodelay(session)
 
     for kind, value in session.endpoint.poll():
         if kind == 'message':
@@ -1403,6 +1443,7 @@ def _poll_session(session, now):
         _auto_ping_tick(session, now)
         _summary_tick(session, now)
         _digest_tick(session, now)
+        _flush_now(session)
 
 
 # ---------------------------------------------------------------------------
@@ -1926,6 +1967,7 @@ def send_player_order(order, interaction=None):
     message = dict(order, kind='order', id='{}-{}'.format(session.role, session.order_counter))
     if not session.endpoint.send(protocol.make_message(protocol.EVENT, message)):
         return None
+    _flush_now(session)                              # l'ordre part au clic, sans attendre la pompe
     session.orders_sent += 1
     if not order.get('auto'):
         log('[{}] ordre envoye : {} -> {} ({})'.format(session.role, order['name'], order['target']['t'],
@@ -1972,6 +2014,7 @@ def on_user_cancel(interaction):
     if order_id is None:
         return
     if session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'cancel', 'order_id': order_id})):
+        _flush_now(session)
         session.cancels_sent += 1
         log('[{}] annulation envoyee ({})'.format(session.role, order_id))
 
@@ -2998,6 +3041,31 @@ def _install_menu_diag_hook():
     add_aop._sims4mp_hook = True
     ChoiceMenu.add_potential_aops = add_potential_aops
     ChoiceMenu.add_aop = add_aop
+    _install_rollback_diag_hook()
+
+
+def _install_rollback_diag_hook():
+    """Chaque bouton de la roue est construit dans un ProtocolBufferRollback
+    (interaction_commands.create_pie_menu_message) ; son __exit__ (distributor/rollback.pyc)
+    retire le bouton et avale l'erreur. On note cette erreur quand elle vient de la roue."""
+    from distributor.rollback import ProtocolBufferRollback
+    original = ProtocolBufferRollback.__exit__
+    if getattr(original, '_sims4mp_hook', False):
+        return
+
+    @functools.wraps(original)
+    def __exit__(self, exc_type, value, tb):
+        if exc_type is not None:
+            try:
+                lines = traceback.format_exception(exc_type, value, tb)
+                if any('create_pie_menu_message' in line for line in lines):
+                    _menu_diag('bouton retire par le jeu apres une erreur :\n' + ''.join(lines).strip())
+            except Exception:
+                pass
+        return original(self, exc_type, value, tb)
+
+    __exit__._sims4mp_hook = True
+    ProtocolBufferRollback.__exit__ = __exit__
 
 
 def _install_cancel_hook():
