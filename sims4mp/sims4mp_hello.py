@@ -10,7 +10,7 @@
 # pas de match, pas d'annotations avancees.
 #
 # Commandes : mp.hello, mp.host [port], mp.join <ip> [port], mp.status,
-#             mp.ping, mp.state, mp.positions, mp.disconnect
+#             mp.ping, mp.state, mp.positions, mp.traffic [on|off], mp.disconnect
 #
 # Connexion automatique (M1) : a la fin de chaque chargement de partie
 # (zone.Zone.on_loading_screen_animation_finished, verifie dans simulation.zip),
@@ -86,6 +86,14 @@
 #           puis sim.push_super_affordance(CommandTuning.TERRAIN_GOHERE_AFFORDANCE,
 #           cible, contexte) ; teleportation : TERRAIN_TELEPORT_AFFORDANCE (sims.teleport).
 #           Le Sim que ce joueur controle n'est jamais deplace par l'autre.
+#
+# Prototype P1 (simulation unique, lecture seule) : mp.traffic on mesure ce que
+# la simulation envoie a l'affichage. Verifie dans simulation.zip :
+# server.client.Client.send_message(msg_id, msg) appelle omega.send(client.id,
+# msg_id, msg.SerializeToString()) ; omega.send appelle le natif _omega.send et
+# leve KeyError pour une session inconnue. Le mod enveloppe omega.send pour
+# compter messages et octets par type (noms MSG_* de Consts_pb2) et par
+# session, puis appelle l'original sans rien changer.
 
 import functools
 import json
@@ -96,7 +104,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.8.0'
+MOD_VERSION = '0.8.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -897,6 +905,7 @@ def pump_tick():
         _poll_session(session, now)
     _gate_tick(time.monotonic())          # pause et file : a chaque tick, meme sans session
     _release_clock_if_unused(_session)    # vitesse de l'hote retiree hors session d'invite
+    _traffic_tick(now)                    # P1 : resume du trafic dans le journal
 
 
 def _poll_session(session, now):
@@ -1393,6 +1402,116 @@ def queue_refuses(interaction):
         _gate['notice_at'] = now
         bridge_notify('Action refusée : l\'autre joueur n\'est pas encore en jeu.')
     return True
+
+
+# ---------------------------------------------------------------------------
+# Prototype P1 : mesure du trafic simulation -> affichage (lecture seule)
+# ---------------------------------------------------------------------------
+
+TRAFFIC_REPORT_INTERVAL = 60.0           # resume dans le journal, en secondes reelles
+
+_traffic = {
+    'enabled': False,
+    'installed': False,
+    'started_at': None,
+    'reported_at': None,
+    'total': [0, 0],                      # messages, octets
+    'by_type': {},                        # msg_id -> [messages, octets, plus gros]
+    'by_session': {},                     # session -> [messages, octets]
+    'errors': 0,
+    'names': None,                        # msg_id -> nom MSG_* (Consts_pb2), lu a la demande
+}
+
+
+def traffic_reset(now):
+    _traffic.update(started_at=now, reported_at=now, total=[0, 0], by_type={}, by_session={}, errors=0)
+
+
+def traffic_record(session_id, msg_id, data):
+    """Compte un message (appele pour chaque omega.send pendant la mesure)."""
+    size = len(data) if isinstance(data, (bytes, bytearray)) else 0
+    total = _traffic['total']
+    total[0] += 1
+    total[1] += size
+    entry = _traffic['by_type'].get(msg_id)
+    if entry is None:
+        entry = _traffic['by_type'][msg_id] = [0, 0, 0]
+    entry[0] += 1
+    entry[1] += size
+    if size > entry[2]:
+        entry[2] = size
+    per = _traffic['by_session'].get(session_id)
+    if per is None:
+        per = _traffic['by_session'][session_id] = [0, 0]
+    per[0] += 1
+    per[1] += size
+
+
+def _message_names():
+    if _traffic['names'] is None:
+        names = {}
+        try:
+            from protocolbuffers import Consts_pb2
+            for name in dir(Consts_pb2):
+                value = getattr(Consts_pb2, name)
+                if name.startswith('MSG_') and isinstance(value, int) and value not in names:
+                    names[value] = name
+        except Exception:
+            log('trafic : noms des messages illisibles :\n' + traceback.format_exc())
+        _traffic['names'] = names
+    return _traffic['names']
+
+
+def traffic_lines(now, top=12):
+    started = _traffic['started_at']
+    if started is None:
+        return ['Mesure jamais lancee (mp.traffic on).']
+    elapsed = max(now - started, 0.001)
+    count, size = _traffic['total']
+    lines = ['Trafic simulation -> affichage {} depuis {:.0f} s : {} messages, {:.1f} Ko '
+             '({:.1f} msg/s, {:.1f} Ko/s){}'.format(
+                 'en cours' if _traffic['enabled'] else 'arrete', elapsed, count, size / 1024.0,
+                 count / elapsed, size / 1024.0 / elapsed,
+                 ' , {} erreur(s)'.format(_traffic['errors']) if _traffic['errors'] else '')]
+    names = _message_names()
+    ranked = sorted(_traffic['by_type'].items(), key=lambda item: item[1][1], reverse=True)
+    for msg_id, (n, octets, biggest) in ranked[:top]:
+        lines.append('  {} ({}) : {} msg, {:.1f} Ko, max {} octets'.format(
+            names.get(msg_id, '?'), msg_id, n, octets / 1024.0, biggest))
+    if len(ranked) > top:
+        lines.append('  ... {} autre(s) type(s)'.format(len(ranked) - top))
+    sessions = ', '.join('{:x} : {} msg'.format(s, v[0]) if isinstance(s, int) else '{} : {} msg'.format(s, v[0])
+                         for s, v in sorted(_traffic['by_session'].items(), key=lambda kv: -kv[1][0]))
+    lines.append('Sessions (clients) : {}'.format(sessions or 'aucune'))
+    return lines
+
+
+def _traffic_tick(now):
+    if _traffic['enabled'] and now - _traffic['reported_at'] >= TRAFFIC_REPORT_INTERVAL:
+        _traffic['reported_at'] = now
+        log('trafic :\n  ' + '\n  '.join(traffic_lines(now)))
+
+
+def _install_traffic_hook():
+    import omega
+    original = omega.send
+    if getattr(original, '_sims4mp_hook', False):
+        log('trafic : omega.send deja enveloppe')
+        return
+
+    @functools.wraps(original)
+    def send(session_id, msg_id, data, *args, **kwargs):
+        if _traffic['enabled']:
+            try:
+                traffic_record(session_id, msg_id, data)
+            except Exception:
+                _traffic['errors'] += 1
+        return original(session_id, msg_id, data, *args, **kwargs)
+
+    send._sims4mp_hook = True
+    omega.send = send
+    _traffic['installed'] = True
+    log('trafic : omega.send enveloppe (mesure arretee par defaut, mp.traffic on)')
 
 
 def _install_queue_hook():
@@ -1916,6 +2035,34 @@ def mp_positions(_connection=None):
         output('Erreur dans mp.positions (voir le journal).')
 
 
+@sims4.commands.Command('mp.traffic', command_type=sims4.commands.CommandType.Live)
+def mp_traffic(action=None, _connection=None):
+    output = sims4.commands.CheatOutput(_connection)
+    try:
+        if not _traffic['installed']:
+            output('Mesure indisponible (voir le journal).')
+            return
+        now = time.monotonic()
+        if action == 'on':
+            traffic_reset(now)
+            _traffic['enabled'] = True
+            log('trafic : mesure lancee')
+            output('Mesure du trafic lancee. mp.traffic pour le resultat, mp.traffic off pour arreter.')
+            return
+        if action == 'off':
+            _traffic['enabled'] = False
+            log('trafic : mesure arretee\n  ' + '\n  '.join(traffic_lines(now)))
+            output('Mesure arretee (resultat aussi dans le journal).')
+        elif action is not None:
+            output('Usage : mp.traffic [on|off]')
+            return
+        for line in traffic_lines(now):
+            output(line)
+    except Exception:
+        log('ERREUR mp.traffic :\n' + traceback.format_exc())
+        output('Erreur dans mp.traffic (voir le journal).')
+
+
 @sims4.commands.Command('mp.disconnect', command_type=sims4.commands.CommandType.Live)
 def mp_disconnect(_connection=None):
     output = sims4.commands.CheatOutput(_connection)
@@ -1958,6 +2105,12 @@ try:
 except Exception:
     # Sans ce hook, mp.host / mp.join restent utilisables a la main.
     log('ERREUR installation connexion automatique :\n' + traceback.format_exc())
+
+try:
+    _install_traffic_hook()
+except Exception:
+    # Sans ce hook, seule la mesure du trafic (mp.traffic) est indisponible.
+    log('ERREUR installation mesure du trafic :\n' + traceback.format_exc())
 
 try:
     _install_queue_hook()
