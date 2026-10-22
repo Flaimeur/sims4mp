@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - correctifs (0.13.1) : une action n'est envoyee qu'apres avoir
+# Sims 4 Multiplayer - annulation (0.14.0) : chaque ordre envoye ou rejoue est relie a
+# l'action du jeu correspondante ; la croix du joueur (Interaction.cancel_user, appele
+# par interaction_commands.cancel_common) sur une action reliee envoie l'annulation,
+# que l'autre PC applique avec interaction.cancel(FinishingType.USER_CANCEL)
+# (action rejouee obtenue par EnqueueResult.interaction).
+# Correctifs (0.13.1) : une action n'est envoyee qu'apres avoir
 # ete acceptee par la file du jeu ; actions autonomes limitees (1 par Sim et par
 # seconde, pas la meme deux fois en 20 s) ; voyages jamais rejoues (l'autre joueur
 # est prevenu) ; pings automatiques et refus d'autonomie moins bavards au journal.
@@ -153,11 +158,12 @@ import json
 import os
 import time
 import traceback
+import weakref
 
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.13.1'
+MOD_VERSION = '0.14.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -202,6 +208,7 @@ REPORT_LOG_LINES = 200
 AUTO_ORDER_GAP = 1.0                      # au plus une action autonome envoyee par Sim et par seconde
 AUTO_ORDER_REPEAT = 20.0                  # meme action autonome du meme Sim : pas renvoyee avant
 AUTO_FAIL_LOG = 60.0                      # refus d'action autonome : une ligne par action et par minute
+LINKS_MAX = 300                           # actions reliees a un ordre gardees (annulation)
 SPEED_REQUEST_DEDUP = 1.0                 # meme vitesse demandee a moins d'1 s d'intervalle : une seule
 WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
 WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
@@ -758,7 +765,19 @@ def bridge_replay_order(sim_id, affordance_id, where, auto=False):
         else:
             context = InteractionContext(sim, InteractionContext.SOURCE_SCRIPT_WITH_USER_INTENT, Priority.High)
     result = sim.push_super_affordance(affordance, target, context)
-    return (True, None) if result else (False, 'refusee par le jeu ({})'.format(result))
+    if not result:
+        return False, 'refusee par le jeu ({})'.format(result)
+    # EnqueueResult.interaction (event_testing/results.pyc) : l'action rejouee, pour l'annulation.
+    return True, getattr(result, 'interaction', None)
+
+
+def bridge_cancel_interaction(interaction):
+    """Annule comme la croix du joueur (FinishingType.USER_CANCEL), sans fenetre de confirmation."""
+    from interactions.interaction_finisher import FinishingType
+    if getattr(interaction, 'is_finishing', False):
+        return False
+    interaction.cancel(FinishingType.USER_CANCEL, cancel_reason_msg='Sims4MP : annulee par l\'autre joueur')
+    return True
 
 
 def bridge_read_needs(sim_id):
@@ -887,6 +906,8 @@ class NetSession(object):
         self.auto_sent = {}             # sim_id -> (moment, signature) du dernier envoi
         self.auto_skipped = 0
         self.auto_failed_logged = {}    # nom d'action -> moment de la derniere ligne de journal
+        self.cancels_sent = 0           # annulations (D1)
+        self.cancels_applied = 0
         # Positions (M3) : derniere envoyee, derniere recue de l'autre joueur.
         self.position_checked_at = 0.0
         self.position_sent = None
@@ -1114,6 +1135,8 @@ def _handle_host_event(session, kind, value):
                 do_resync(session)
             elif data.get('kind') == 'travel':
                 _handle_travel(session, data)
+            elif data.get('kind') == 'cancel':
+                _handle_cancel(session, data)
             elif data.get('kind') == 'gaps':
                 _handle_gaps(session, data)
             else:
@@ -1177,6 +1200,8 @@ def _handle_client_event(session, kind, value):
                 _handle_resync(session)
             elif value['data'].get('kind') == 'travel':
                 _handle_travel(session, value['data'])
+            elif value['data'].get('kind') == 'cancel':
+                _handle_cancel(session, value['data'])
             elif value['data'].get('kind') == 'digest':
                 _handle_digest(session, value['data'])
             else:
@@ -1517,6 +1542,8 @@ def position_lines(session, now):
 
 _sync = {
     'orders': {},            # sim_id -> (moment, numero) du dernier ordre du joueur de ce PC
+    'links': {},             # identifiant d'ordre -> weakref de l'action du jeu (annulation)
+    'link_ids': {},          # id(action) -> identifiant d'ordre
     'pushing': False,        # vrai pendant un ordre donne par le mod (pas un ordre du joueur)
     'clock_request': None,   # invite : demande de vitesse posee dans l'horloge
     'clock_value': None,     # ... et sa valeur
@@ -1880,18 +1907,85 @@ def _move_toward(session, remote, now, walk):
 
 # -- ordres des joueurs (M5) --
 
-def send_player_order(order):
-    """Envoie a l'autre PC l'action que le joueur de ce PC vient de choisir (au clic)."""
+def send_player_order(order, interaction=None):
+    """Envoie a l'autre PC l'action que le joueur de ce PC vient de choisir (au clic).
+    Renvoie l'identifiant de l'ordre, relie a l'action locale pour une annulation."""
     session = _session
     if session is None or not session.handshake_done or not session.endpoint.is_connected or _gate['waiting']:
-        return
+        return None
     session.order_counter += 1
     message = dict(order, kind='order', id='{}-{}'.format(session.role, session.order_counter))
-    if session.endpoint.send(protocol.make_message(protocol.EVENT, message)):
-        session.orders_sent += 1
-        if not order.get('auto'):
-            log('[{}] ordre envoye : {} -> {} ({})'.format(session.role, order['name'], order['target']['t'],
-                                                            message['id']))
+    if not session.endpoint.send(protocol.make_message(protocol.EVENT, message)):
+        return None
+    session.orders_sent += 1
+    if not order.get('auto'):
+        log('[{}] ordre envoye : {} -> {} ({})'.format(session.role, order['name'], order['target']['t'],
+                                                        message['id']))
+    if interaction is not None:
+        link_order(message['id'], interaction)
+    return message['id']
+
+
+# -- annulation (D1) : l'ordre et l'action locale sont relies des deux cotes --
+
+def link_order(order_id, interaction):
+    """Relie un ordre (envoye ou rejoue) a l'action du jeu correspondante sur ce PC."""
+    if interaction is None:
+        return
+    links = _sync['links']
+    try:
+        ref = weakref.ref(interaction)
+    except TypeError:
+        ref = lambda: interaction                   # objet sans weakref (tests) : reference simple
+    links[order_id] = ref
+    _sync['link_ids'][id(interaction)] = order_id
+    while len(links) > LINKS_MAX:
+        old_id = next(iter(links))
+        old = links.pop(old_id)()
+        if old is not None:
+            _sync['link_ids'].pop(id(old), None)
+
+
+def order_of(interaction):
+    order_id = _sync['link_ids'].get(id(interaction))
+    if order_id is None:
+        return None
+    ref = _sync['links'].get(order_id)
+    return order_id if ref is not None and ref() is interaction else None
+
+
+def on_user_cancel(interaction):
+    """La croix du joueur de ce PC sur une action reliee : l'annulation part vers l'autre PC."""
+    session = _session
+    if _sync['pushing'] or not _connected(session):
+        return
+    order_id = order_of(interaction)
+    if order_id is None:
+        return
+    if session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'cancel', 'order_id': order_id})):
+        session.cancels_sent += 1
+        log('[{}] annulation envoyee ({})'.format(session.role, order_id))
+
+
+def _handle_cancel(session, data):
+    order_id = data.get('order_id')
+    if not isinstance(order_id, str) or not 0 < len(order_id) <= 40:
+        return
+    ref = _sync['links'].get(order_id)
+    interaction = ref() if ref is not None else None
+    if interaction is None:
+        log('[{}] annulation {} : action deja terminee ici'.format(session.role, order_id))
+        return
+    _sync['pushing'] = True                          # pas d'annulation renvoyee en echo
+    try:
+        done = _safe('annulation', bridge_cancel_interaction, interaction)
+    finally:
+        _sync['pushing'] = False
+    if done:
+        session.cancels_applied += 1
+        log('[{}] annulation {} appliquee'.format(session.role, order_id))
+        bridge_notify('{} a annulé une action.'.format(_other_label(session).capitalize()), important=False,
+                      key='cancel')
 
 
 def validate_order(data):
@@ -1950,6 +2044,8 @@ def _handle_order(session, data):
     ok, reason = result if result is not None else (False, 'erreur (voir le journal)')
     label = '{}{}'.format(order['name'], ' (autonomie)' if order['auto'] else '')
     if ok:
+        link_order(order['id'], reason)                # reason : l'action rejouee (pour l'annulation)
+        reason = None
         session.orders_replayed += 1
         session.action_hold[order['sim_id']] = time.monotonic() + ACTION_HOLD
         if not order['auto']:
@@ -1986,7 +2082,7 @@ def on_player_order(queue, interaction):
                 'kind': 'travel', 'sim_id': order['sim_id'], 'name': order['name']}))
             log('[{}] voyage non rejoue chez l\'autre, prevenu : {}'.format(session.role, order['name']))
         return
-    send_player_order(order)
+    send_player_order(order, interaction)
 
 
 def _handle_travel(session, data):
@@ -2058,7 +2154,7 @@ def on_autonomy_action(queue, interaction):
         session.auto_skipped += 1
         return
     session.auto_sent[sim_id] = (now, signature)
-    send_player_order(order)
+    send_player_order(order, interaction)
 
 
 def is_travel(name):
@@ -2208,6 +2304,8 @@ def sync_lines(session):
         session.orders_sent, session.orders_replayed, session.orders_failed,
         ' ; derniere : {}'.format(session.last_order) if session.last_order else ''))
     lines.append('Besoins : {} valeur(s) recopiee(s) depuis l\'autre PC'.format(session.needs_written))
+    lines.append('Annulations : {} envoyee(s), {} appliquee(s)'.format(session.cancels_sent,
+                                                                        session.cancels_applied))
     moving = sum(1 for status in session.sims_status.values() if status.startswith('marche'))
     lines.append('Autres Sims ({}) : {} suivi(s), {} en marche ; autonomie refusee ici {} fois'.format(
         'l\'hote fait foi' if session.role == 'client' else 'ce PC fait foi',
@@ -2831,6 +2929,29 @@ def write_report():
         return None
 
 
+def _install_cancel_hook():
+    """La croix du joueur (interaction_commands.cancel_common -> Interaction.cancel_user,
+    verifie dans simulation.zip) : apres l'original, une annulation acceptee est transmise."""
+    from interactions.base.interaction import Interaction
+    original = Interaction.cancel_user
+    if getattr(original, '_sims4mp_hook', False):
+        return
+
+    @functools.wraps(original)
+    def cancel_user(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        try:
+            if result:
+                on_user_cancel(self)
+        except Exception:
+            _sync_error('suivi des annulations')
+        return result
+
+    cancel_user._sims4mp_hook = True
+    Interaction.cancel_user = cancel_user
+    log('synchro : annulations du joueur suivies (Interaction.cancel_user)')
+
+
 def _install_queue_hook():
     from interactions.interaction_queue import InteractionQueue
     original = InteractionQueue.append
@@ -3439,6 +3560,11 @@ try:
 except Exception:
     # Sans ce hook, mp.host / mp.join restent utilisables a la main.
     log('ERREUR installation connexion automatique :\n' + traceback.format_exc())
+
+try:
+    _install_cancel_hook()
+except Exception:
+    log('ERREUR installation suivi des annulations :\n' + traceback.format_exc())
 
 try:
     _install_speed_hook()
