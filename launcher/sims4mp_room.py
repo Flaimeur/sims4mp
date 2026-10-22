@@ -848,10 +848,18 @@ def plan_mods_sync(ip, port, code, session, documents, cache_dir, is_running=Non
     return lines, plan
 
 
-def apply_mods_sync(ip, port, code, session, plan, backup_root, temp_dir, is_running=None):
+def progress_text(received, total, files_done, files_total):
+    """'Copie des mods : 42 % (3/7 fichiers, 12.5 / 30.0 Mo)'"""
+    percent = 100 if total <= 0 else min(100, int(received * 100 / total))
+    return 'Copie des mods : {} % ({}/{} fichiers, {:.1f} / {:.1f} Mo)'.format(
+        percent, files_done, files_total, received / 1e6, total / 1e6)
+
+
+def apply_mods_sync(ip, port, code, session, plan, backup_root, temp_dir, is_running=None, progress=None):
     """Copie les mods prevus : chaque fichier est telecharge et verifie (taille, SHA-256)
     avant d'etre ecrit dans Mods ; les fichiers remplaces vont d'abord dans
-    sims4mp_backups/mods_AAAAMMJJ_HHMMSS/. Renvoie (lignes, statut_court)."""
+    sims4mp_backups/mods_AAAAMMJJ_HHMMSS/. progress(texte) recoit l'avancement
+    (pourcentage des octets recus). Renvoie (lignes, statut_court)."""
     code = validate_room_code(code)
     is_running = is_running or core.game_is_running
     mods_dir, copies = Path(plan['mods_dir']), plan['copier']
@@ -867,11 +875,26 @@ def apply_mods_sync(ip, port, code, session, plan, backup_root, temp_dir, is_run
         n += 1
     done, saved = 0, 0
     lines = []
+    count = {'octets': 0}
+    total = sum(c['entree']['taille'] for c in copies)
+
+    def report():
+        if progress is not None:
+            progress(progress_text(count['octets'], total, done, len(copies)))
+
+    def on_data(n):
+        count['octets'] += n
+        report()
+
+    report()
     try:
         for copy in copies:
             entry, target = copy['entree'], Path(copy['cible'])
+            before = count['octets']
             received = _fetch_file(ip, port, code, session, '/modfile/{}'.format(copy['index']),
-                                   entry['taille'], entry['sha256'], temp_dir, entry['chemin'])
+                                   entry['taille'], entry['sha256'], temp_dir, entry['chemin'],
+                                   on_data=on_data)
+            count['octets'] = before + entry['taille']
             try:
                 if is_running():
                     raise RoomError('Les Sims 4 a été lancé pendant la copie : arrêt.')
@@ -898,6 +921,7 @@ def apply_mods_sync(ip, port, code, session, plan, backup_root, temp_dir, is_run
                     raise RoomError('Copie incomplète dans Mods : {}.'.format(entry['chemin']))
                 os.replace(part, target)
                 done += 1
+                report()
             finally:
                 try:
                     received.unlink()
@@ -959,8 +983,10 @@ def _download(ip, port, code, session, info, temp_dir, timeout_per_mb=2.0):
                        'la sauvegarde reçue', timeout_per_mb)
 
 
-def _fetch_file(ip, port, code, session, url_path, size, sha256, temp_dir, what, timeout_per_mb=2.0):
-    """Telecharge dans un fichier temporaire de temp_dir, verifie taille et SHA-256 ; renvoie son chemin."""
+def _fetch_file(ip, port, code, session, url_path, size, sha256, temp_dir, what, timeout_per_mb=2.0,
+                on_data=None):
+    """Telecharge dans un fichier temporaire de temp_dir, verifie taille et SHA-256 ; renvoie son chemin.
+    on_data(n) est appele apres chaque bloc recu (progression)."""
     info = {'taille': size, 'sha256': sha256}
     deadline = time.monotonic() + 30 + timeout_per_mb * info['taille'] / 1e6
     headers = _session_headers(session)
@@ -989,6 +1015,8 @@ def _fetch_file(ip, port, code, session, url_path, size, sha256, temp_dir, what,
                     if total > info['taille']:
                         raise RoomError('L\'hôte envoie plus de données que prévu : refus.')
                     out.write(block)
+                    if on_data is not None:
+                        on_data(len(block))
         finally:
             conn.close()
         if total != info['taille']:

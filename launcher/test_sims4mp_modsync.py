@@ -106,6 +106,24 @@ class ModSyncTest(unittest.TestCase):
         self.assertEqual(plan['copier'], [])
         self.assertEqual(self.apply(port, plan)[1], 'Mods déjà identiques')
 
+    def test_progress_percentages(self):
+        put(self.host_mods, 'gros.package', b'G' * (700 * 1024))           # plusieurs blocs de 256 Ko
+        server, port = self.open_room()
+        lines, plan = self.plan(port)
+        seen = []
+        room.apply_mods_sync('127.0.0.1', port, CODE, SESSION, plan, self.backups, self.launcher,
+                             is_running=lambda: False, progress=seen.append)
+        percents = [int(text.split(': ')[1].split(' %')[0]) for text in seen]
+        self.assertEqual(percents[0], 0)
+        self.assertEqual(percents, sorted(percents))                         # jamais en arriere
+        self.assertTrue(any(0 < p < 100 for p in percents))                  # avancement visible
+        self.assertTrue(seen[-1].startswith('Copie des mods : 100 % (5/5 fichiers'), seen[-1])
+
+    def test_progress_text(self):
+        self.assertEqual(room.progress_text(12_500_000, 30_000_000, 3, 7),
+                         'Copie des mods : 41 % (3/7 fichiers, 12.5 / 30.0 Mo)')
+        self.assertEqual(room.progress_text(0, 0, 0, 1), 'Copie des mods : 100 % (0/1 fichiers, 0.0 / 0.0 Mo)')
+
     def test_different_in_other_folder_is_moved(self):
         put(self.host_mods, 'CC/new/hat.package', b'H' * 40)
         put(self.guest_mods, 'old/hat.package', b'h' * 41)
@@ -239,6 +257,16 @@ class ModSyncWindowTest(unittest.TestCase):
             copied = (guest_game / 'Mods' / 'CC' / 'hair.package').exists()
             self.assertEqual(copied, answer)
         self.assertEqual((guest_game / 'Mods' / 'CC' / 'hair.package').read_bytes(), b'h' * 64)
+        self.assertIsNone(guest.task_progress)                       # effacee a la fin de la tache
+        # Pendant une tache, la barre d'etat affiche le pourcentage recu du thread.
+        guest.installing = False
+        guest._start_task('Copie des mods...', lambda: guest._set_progress(
+            room.progress_text(5_000_000, 10_000_000, 1, 2)))
+        guest._poll_install()
+        self.assertEqual(guest.status.cget('text'), 'Copie des mods : 50 % (1/2 fichiers, 5.0 / 10.0 Mo)')
+        guest.results.put(('ok', ['fin'], 'Mods copiés (2)'))
+        guest._poll_install()
+        self.assertEqual(guest.status.cget('text'), 'Mods copiés (2)')
 
 
 if __name__ == '__main__':

@@ -2405,8 +2405,10 @@ class LauncherApp:
             self.show('Copie des mods : annulée, rien n\'a été écrit.')
             self.set_status('Annulé : rien n\'a été écrit')
             return
+        self.task_progress = None
         self._start_task('Copie des mods...', lambda: self._run_worker(
-            lambda: room.apply_mods_sync(ip, port, code, session, plan, base_dir() / BACKUP_DIR_NAME, base_dir())))
+            lambda: room.apply_mods_sync(ip, port, code, session, plan, base_dir() / BACKUP_DIR_NAME, base_dir(),
+                                         progress=self._set_progress)))
 
     def _run_check(self):
         import sims4mp_room as room
@@ -2525,12 +2527,20 @@ class LauncherApp:
                               base_dir(), allow_test=allow_test, allow_downgrade=allow_downgrade)
         self._run_worker(task)
 
+    def _set_progress(self, text):
+        # Appele depuis le thread de la tache : simple affectation, lue par _poll_install.
+        self.task_progress = text
+
     def _poll_install(self):
         try:
             kind, lines, summary = self.results.get_nowait()
         except queue.Empty:
+            progress = getattr(self, 'task_progress', None)
+            if progress:
+                self.set_status(progress)                    # pourcentage pendant la copie
             self.root.after(100, self._poll_install)
             return
+        self.task_progress = None
         for i, line in enumerate(lines):
             tag = 'error' if kind == 'error' or line.startswith('ATTENTION') else None
             if kind == 'ok' and i == len(lines) - 1:
