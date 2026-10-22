@@ -117,6 +117,18 @@ class FakeClock(object):
             self.speed_controllers[source].remove(request)
         self._update()
 
+    def set_clock_speed(self, speed, source=2, reason='', immediate=False):
+        # Comme clock.pyc : remplace les demandes de cette source (bouton de vitesse).
+        self.speed_controllers[source][:] = [_Request(speed)]
+        self._update()
+        return True
+
+    def pop_speed(self, speed=None, source=2, reason='', immediate=False):
+        requests = self.speed_controllers[source]
+        request = requests.pop() if requests else None
+        self._update()
+        return request
+
     def now(self):
         return _Now(self.seconds)
 
@@ -131,6 +143,7 @@ class FakeClock(object):
 clock = types.ModuleType('clock')
 clock.ClockSpeedMode = ClockSpeedMode
 clock.GameSpeedChangeSource = GameSpeedChangeSource
+clock.GameClock = FakeClock
 GAME_CLOCK = FakeClock()
 
 
@@ -188,10 +201,18 @@ class FakeSim(object):
         self.queue = FakeQueue()
         self.pushed = []
         self.accept = True
+        self.broken = False
+        self.placed = []
 
     def push_super_affordance(self, affordance, target, context):
+        if self.broken:
+            raise RuntimeError('affordance non reglee')
         self.pushed.append((affordance, target, context))
         return self.accept
+
+    def move_to(self, translation=None, routing_surface=None):
+        self.placed.append((translation.x, translation.z, routing_surface.level))
+        self.position = translation
 
 
 class FakeClient(object):
@@ -455,6 +476,43 @@ pump_for(0.2, extra=presence)
 ZONE['id'] = 555
 report('autre zone : aucun ordre', len(double.pushed) == count)
 
+# --- 3b. Diagnostic et repli ---------------------------------------------------------------
+del _CheatOutput.lines[:]
+mod.mp_positions()
+report('mp.positions dit pourquoi le double ne bouge pas', 'autre lot (zone 555 , ici 555)' in
+       '\n'.join(_CheatOutput.lines) or 'autre lot' in session.walk_status,
+       session.walk_status)
+del notes[:]
+send(position(sim_id=1001, name='Élise Petrova', x=40.0, z=40.0))
+pump_until(lambda: 'meme Sim' in session.walk_status, extra=presence)
+report('meme Sim controle des deux cotes : notification une fois',
+       sum('même Sim' in n for n in notes) == 1)
+double.position = Vector3(18.0, 0.0, 12.0)
+double.level = 0
+double.broken = True                                         # ordres du jeu en erreur
+del double.placed[:]
+send(position(x=25.0, z=14.0))
+pump_until(lambda: double.placed, extra=presence)
+report('ordres de marche en erreur : double pose directement (repli)',
+       double.placed == [(25.0, 14.0, 0)] and 'pose directement' in session.walk_status,
+       '{} / {}'.format(double.placed, session.walk_status))
+double.broken = False
+
+# --- 3c. Vitesse demandee par l'invite --------------------------------------------------------
+before = len(events('clock'))
+send({'kind': 'speed_request', 'speed': 3})
+pump_until(lambda: GAME_CLOCK.clock_speed == 3, extra=presence)
+pump_until(lambda: any(e.get('speed') == 3 for e in events('clock')[before:]), extra=presence)
+report('hote : vitesse demandee par l\'invite appliquee comme son bouton, renvoyee aussitot',
+       GAME_CLOCK.speed_controllers[GameSpeedChangeSource.GAMEPLAY][-1].speed == 3
+       and session.speed_requests == 1 and any(e.get('speed') == 3 for e in events('clock')[before:]))
+send({'kind': 'speed_request', 'speed': 9})
+pump_for(0.1, extra=presence)
+report('hote : vitesse invalide refusee', GAME_CLOCK.clock_speed == 3 and session.speed_requests == 1)
+GAME_CLOCK.set_clock_speed(1, source=GameSpeedChangeSource.GAMEPLAY)
+pump_for(0.1, extra=presence)
+report('hote : ses propres boutons ne sont pas renvoyes', events('speed_request') == [])
+
 # --- 4. Pendant l'attente : rien n'est applique ----------------------------------------------
 session.peer_seen_at = time.monotonic() - mod.PRESENCE_TIMEOUT - 1
 mod._gate_tick(time.monotonic())
@@ -526,6 +584,25 @@ for bad in ({'seconds': 'x', 'speed': 1}, {'seconds': 1.0, 'speed': 9}, {'second
 pump_for(0.15, extra=host_side)
 report('heures invalides ignorees', GAME_CLOCK.clock_speed == 3 and GAME_CLOCK.advanced == [600])
 
+GAME_CLOCK.seconds = 100580.0 - 120.0                               # 2 min de jeu de retard
+send({'kind': 'clock', 'seconds': 100580.0, 'speed': 3})
+pump_until(lambda: len(GAME_CLOCK.advanced) == 2, extra=host_side)
+report('2 minutes de jeu de retard : rattrapees (ecart tolere plus petit)',
+       GAME_CLOCK.advanced[-1:] == [120])
+
+# Boutons de vitesse de l'invite : la demande part a l'hote.
+del inbox[:]
+GAME_CLOCK.set_clock_speed(2, source=GameSpeedChangeSource.GAMEPLAY)      # bouton vitesse 2
+GAME_CLOCK.push_speed(0, source=GameSpeedChangeSource.GAMEPLAY)           # bouton pause
+GAME_CLOCK.pop_speed(0, source=GameSpeedChangeSource.GAMEPLAY)            # reprise
+GAME_CLOCK.push_speed(0, source=GameSpeedChangeSource.UI_MODAL)           # fenetre : pas un bouton
+pump_until(lambda: len(events('speed_request')) >= 3, extra=host_side)
+pump_for(0.1, extra=host_side)
+report('invite : vitesse 2, pause, reprise envoyees a l\'hote (pas les fenetres)',
+       [e['speed'] for e in events('speed_request')] == [2, 0, 2], str(events('speed_request')))
+GAME_CLOCK.speed_controllers[GameSpeedChangeSource.UI_MODAL][:] = []
+GAME_CLOCK._update()
+
 del _CheatOutput.lines[:]
 mod.mp_positions()
 text = '\n'.join(_CheatOutput.lines)
@@ -535,7 +612,7 @@ report('mp.positions affiche la synchro (argent, heure, double)',
 # --- 7. Fin de session : la vitesse de l'hote est retiree -------------------------------------
 mod.mp_disconnect()
 report('mp.disconnect : vitesse de l\'hote retiree, le joueur reprend la main',
-       GAME_CLOCK.situation_speeds() == [] and GAME_CLOCK.clock_speed == 0)
+       GAME_CLOCK.situation_speeds() == [] and GAME_CLOCK.clock_speed == 2)       # dernier bouton du joueur
 report('aucune erreur de pompe', mod._pump['error'] is None, str(mod._pump['error']))
 
 # --- Fin -------------------------------------------------------------------------------------

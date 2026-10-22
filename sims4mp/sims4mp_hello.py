@@ -78,7 +78,12 @@
 #           clock_commands.set_speed_internal / set_clock_speed. L'hote envoie
 #           heure et vitesse ; l'invite avance son heure s'il est en retard,
 #           se met en pause s'il est en avance, et prend la vitesse de l'hote
-#           (demande SITUATION, comme la pause de M2).
+#           (demande SITUATION, comme la pause de M2). Ecart tolere : 1,5 s reelle
+#           au rythme mesure de l'horloge de l'hote (au moins 20 s de jeu).
+#           Boutons de vitesse de l'invite : GameClock.set_clock_speed / push_speed /
+#           pop_speed sont enveloppes ; une demande en source GAMEPLAY (clock_commands :
+#           set_speed, request_pause, unrequest_pause) part a l'hote, qui l'applique
+#           avec set_clock_speed(..., source=GAMEPLAY) comme set_speed_internal.
 #   marche  comme la commande du jeu sims.gohere (server_commands/sim_commands) :
 #           sims4.math.Vector3, routing.SurfaceIdentifier(zone, niveau,
 #           SurfaceType.SURFACETYPE_WORLD), _build_terrain_interaction_target_and_context
@@ -104,7 +109,7 @@ import traceback
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.8.1'
+MOD_VERSION = '0.8.2'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.05     # secondes reelles minimum entre deux poll()
@@ -129,9 +134,9 @@ POSITION_LEVELS = (-16, 64)
 MONEY_INTERVAL = 0.5                      # secondes reelles entre deux lectures de l'argent
 MONEY_MAX_DELTA = 10 ** 9
 CLOCK_INTERVAL = 1.0                      # host : envoi de l'heure et de la vitesse
-CLOCK_BEHIND = 300.0                      # invite en retard de plus (secondes de jeu) : avance
-CLOCK_AHEAD = 300.0                       # invite en avance de plus : pause jusqu'a etre rattrape
-CLOCK_AHEAD_RESUME = 60.0                 # ... et reprise sous cet ecart
+CLOCK_TOLERANCE_REAL = 1.5                # ecart toléré : 1,5 s reelle de temps de l'hote...
+CLOCK_MIN_TOLERANCE = 20.0                # ... et au moins 20 s de jeu
+CLOCK_DEFAULT_RATE = 60.0                 # s de jeu par s reelle tant que le rythme n'est pas mesure
 WALK_MIN = 0.75                           # ecart minimal (unites du jeu) pour faire marcher le double
 WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge d'au moins
 WALK_RETRY = 3.0                          # secondes reelles avant de redonner le meme ordre
@@ -507,6 +512,40 @@ def _terrain_target(sim, x, y, z, level):
                                                          TerrainPoint)
 
 
+def bridge_place_sim(sim_id, x, y, z, level):
+    """Repli : pose le Sim a la position (ClientObjectMixin.move_to -> Location.clone(translation,
+    routing_surface), verifie dans simulation.zip). Renvoie True si fait."""
+    import routing
+    import services
+    import sims4.math
+    from objects import ALL_HIDDEN_REASONS
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    if sim is None:
+        return False
+    surface = routing.SurfaceIdentifier(services.current_zone_id(), level or 0,
+                                        routing.SurfaceType.SURFACETYPE_WORLD)
+    sim.move_to(translation=sims4.math.Vector3(x, y, z), routing_surface=surface)
+    return True
+
+
+def bridge_player_speed():
+    """Vitesse demandee par les boutons du joueur (derniere demande GAMEPLAY), ou None."""
+    import services
+    from clock import GameSpeedChangeSource
+    requests = services.game_clock_service().speed_controllers[GameSpeedChangeSource.GAMEPLAY]
+    return int(requests[-1].speed) if len(requests) else None
+
+
+def bridge_set_player_speed(value):
+    """Comme le bouton de vitesse du joueur (clock_commands.set_speed_internal)."""
+    import services
+    from clock import ClockSpeedMode, GameSpeedChangeSource
+    services.game_clock_service().set_clock_speed(
+        ClockSpeedMode(value), source=GameSpeedChangeSource.GAMEPLAY,
+        reason='Sims4MP : vitesse demandee par l\'autre joueur', immediate=True)
+
+
 def bridge_move_sim(sim_id, x, y, z, level, teleport):
     """Fait marcher (ou teleporte) le Sim sim_id vers la position. Renvoie True si l'ordre est accepte."""
     import services
@@ -606,12 +645,16 @@ class NetSession(object):
         self.money_sent = 0             # nombre de differences envoyees / appliquees
         self.money_applied = 0
         self.clock_sent_at = 0.0
-        self.host_clock = None          # invite : (secondes, vitesse) recues de l'hote
+        self.host_clock = None          # invite : (secondes, vitesse, recu_a) de l'hote
+        self.host_rate = None           # rythme mesure de l'horloge de l'hote (s de jeu / s reelle)
         self.clock_ahead = False
         self.clock_jumps = 0
+        self.last_gap = None
+        self.speed_requests = 0         # demandes de vitesse envoyees (invite) ou appliquees (hote)
         self.walk = None                # dernier ordre de marche donne au double
         self.walks = 0
         self.teleports = 0
+        self.walk_status = 'aucune position recue'
 
 
 # ---------------------------------------------------------------------------
@@ -772,6 +815,8 @@ def _handle_host_event(session, kind, value):
                 _handle_position(session, data)
             elif data.get('kind') == 'money':
                 _handle_money(session, data)
+            elif data.get('kind') == 'speed_request':
+                _handle_speed_request(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -1190,14 +1235,25 @@ def _handle_clock(session, data):
     if seconds is None or seconds < 0 or speed is None or not _safe('vitesse', bridge_valid_speed, speed):
         log('[client] heure de l\'hote invalide ignoree')
         return
-    session.host_clock = (seconds, speed)
+    now = time.monotonic()
+    previous = session.host_clock
+    if previous is None or previous[1] != speed:
+        session.host_rate = None                     # nouvelle vitesse : rythme a remesurer
+    elif now - previous[2] >= 0.2:
+        rate = (seconds - previous[0]) / (now - previous[2])
+        if 0.0 <= rate <= 10000.0:
+            session.host_rate = rate if session.host_rate is None else 0.7 * session.host_rate + 0.3 * rate
+    session.host_clock = (seconds, speed, now)
     if _gate['waiting']:
         return                                       # la pause d'attente passe avant
     local = _safe('lecture heure', bridge_clock)
     if local is None:
         return
+    rate = session.host_rate if session.host_rate is not None else (CLOCK_DEFAULT_RATE if speed else 0.0)
+    tolerance = max(CLOCK_MIN_TOLERANCE, rate * CLOCK_TOLERANCE_REAL)
     gap = local[0] - seconds                         # > 0 : l'invite est en avance
-    if gap < -CLOCK_BEHIND:
+    session.last_gap = gap
+    if gap < -tolerance:
         try:
             bridge_advance_clock(-gap)
         except Exception:
@@ -1206,14 +1262,72 @@ def _handle_clock(session, data):
             session.clock_jumps += 1
             log('[client] heure : en retard de {:.0f} s de jeu, avancee'.format(-gap))
             gap = 0.0
-    if gap > CLOCK_AHEAD and not session.clock_ahead:
+    if gap > tolerance and not session.clock_ahead:
         session.clock_ahead = True
         log('[client] heure : en avance de {:.0f} s de jeu, pause jusqu\'a etre rattrape'.format(gap))
-    elif gap < CLOCK_AHEAD_RESUME and session.clock_ahead:
+    elif gap < tolerance / 4.0 and session.clock_ahead:
         session.clock_ahead = False
         log('[client] heure : rattrapee par l\'hote')
     paused = _safe('vitesse', bridge_paused_value)
     _set_clock_request(paused if session.clock_ahead and paused is not None else speed)
+
+
+def _handle_speed_request(session, data):
+    """Hote : l'invite a appuye sur un bouton de vitesse ; l'hote l'applique comme le sien."""
+    speed = _clean_int(data.get('speed'), 0, 16)
+    if speed is None or not _safe('vitesse', bridge_valid_speed, speed):
+        log('[host] demande de vitesse invalide ignoree')
+        return
+    try:
+        bridge_set_player_speed(speed)
+    except Exception:
+        _sync_error('vitesse demandee')
+        return
+    session.speed_requests += 1
+    session.clock_sent_at = 0.0                     # l'invite recoit la nouvelle vitesse tout de suite
+    log('[host] vitesse {} demandee par l\'invite, appliquee'.format(speed))
+
+
+def on_player_speed_change():
+    """Invite : un bouton de vitesse du joueur a ete utilise ; la demande part a l'hote."""
+    session = _session
+    if session is None or session.role != 'client' or not session.handshake_done:
+        return
+    speed = _safe('lecture vitesse du joueur', bridge_player_speed)
+    if speed is None:
+        return
+    if session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'speed_request', 'speed': speed})):
+        session.speed_requests += 1
+        log('[client] vitesse {} demandee a l\'hote'.format(speed))
+
+
+def _install_speed_hook():
+    """Enveloppe GameClock.set_clock_speed / push_speed / pop_speed : apres l'original, une
+    demande en source GAMEPLAY (boutons du joueur, clock_commands) est signalee."""
+    import inspect
+    from clock import GameClock, GameSpeedChangeSource
+    for name in ('set_clock_speed', 'push_speed', 'pop_speed'):
+        original = getattr(GameClock, name)
+        if getattr(original, '_sims4mp_hook', False):
+            continue
+        signature = inspect.signature(original)
+
+        def make(original, signature):
+            @functools.wraps(original)
+            def wrapper(self, *args, **kwargs):
+                result = original(self, *args, **kwargs)
+                try:
+                    bound = signature.bind(self, *args, **kwargs)
+                    bound.apply_defaults()
+                    if bound.arguments.get('source') == GameSpeedChangeSource.GAMEPLAY:
+                        on_player_speed_change()
+                except Exception:
+                    _sync_error('suivi des boutons de vitesse')
+                return result
+            wrapper._sims4mp_hook = True
+            return wrapper
+        setattr(GameClock, name, make(original, signature))
+    log('synchro : boutons de vitesse suivis (GameClock.set_clock_speed / push_speed / pop_speed)')
 
 
 def _release_clock_if_unused(session):
@@ -1225,27 +1339,46 @@ def _release_clock_if_unused(session):
 
 # -- marche du double --
 
+def _walk_status(session, text):
+    """Pourquoi le double bouge ou non : affiche par mp.positions, journalise s'il change."""
+    if session.walk_status != text:
+        session.walk_status = text
+        log('[{}] double : {}'.format(session.role, text))
+
+
 def _maybe_walk(session, now):
     """Fait marcher le double du Sim de l'autre joueur vers sa derniere position."""
     remote = session.remote_position
-    if remote is None or _gate['waiting']:
-        return
-    if remote['zone_id'] is None or remote['zone_id'] != bridge_current_zone_id():
-        return
+    if remote is None:
+        return _walk_status(session, 'aucune position recue')
+    if _gate['waiting']:
+        return _walk_status(session, 'en attente de l\'autre joueur')
+    local_zone = bridge_current_zone_id()
+    if remote['zone_id'] is None or remote['zone_id'] != local_zone:
+        return _walk_status(session, 'autre lot (zone {} , ici {})'.format(remote['zone_id'], local_zone))
     mine = _read('active_sim', _active_sim)
     mine_id = _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None
     if mine_id == remote['sim_id']:
-        return                                       # le Sim de ce joueur n'est jamais deplace
+        # Le Sim de ce joueur n'est jamais deplace par l'autre.
+        text = 'vous controlez le meme Sim que l\'autre joueur : choisissez-en un autre'
+        if session.walk_status != text:
+            bridge_notify('Vous contrôlez le même Sim que l\'autre joueur : choisissez-en un autre '
+                          'pour voir son Sim se déplacer.')
+        return _walk_status(session, text)
     found = bridge_local_sim_position(remote['sim_id'])
-    if found is None or found[0] != 'present':
-        return
+    if found is None:
+        return _walk_status(session, 'lecture du Sim impossible (voir le journal)')
+    if found[0] == 'inconnu':
+        return _walk_status(session, 'Sim inconnu ici : ce n\'est pas la meme sauvegarde')
+    if found[0] != 'present':
+        return _walk_status(session, 'Sim absent du lot ici')
     x, y, z, level = found[1]
     gap = ((x - remote['x']) ** 2 + (z - remote['z']) ** 2) ** 0.5
     target = (remote['x'], remote['z'], remote['level'])
     walk = session.walk
     if gap < WALK_MIN and (remote['level'] is None or level == remote['level']):
         session.walk = None
-        return
+        return _walk_status(session, 'en place')
     same = (walk is not None and walk['target'][2] == target[2]
             and ((walk['target'][0] - target[0]) ** 2 + (walk['target'][1] - target[1]) ** 2) ** 0.5 < WALK_RETARGET)
     teleport = ((remote['level'] is not None and level is not None and level != remote['level'])
@@ -1254,21 +1387,26 @@ def _maybe_walk(session, now):
         return                                       # deja en route vers ce point
     if walk is not None and not same and not teleport and now - walk['at'] < 1.0:
         return                                       # au plus un nouvel ordre par seconde
-    ok = _safe('marche', bridge_move_sim, remote['sim_id'], remote['x'], remote['y'], remote['z'],
-               remote['level'], teleport)
+    args = (remote['sim_id'], remote['x'], remote['y'], remote['z'], remote['level'])
+    ok = _safe('marche', bridge_move_sim, *(args + (teleport,)))
     if not ok and not teleport:
         teleport = True
-        ok = _safe('teleportation', bridge_move_sim, remote['sim_id'], remote['x'], remote['y'], remote['z'],
-                   remote['level'], True)
+        ok = _safe('teleportation', bridge_move_sim, *(args + (True,)))
     if not ok:
-        return
+        # Ordres du jeu refuses ou en erreur : le double est pose directement a la position.
+        if _safe('placement', bridge_place_sim, *args):
+            session.teleports += 1
+            session.walk = None
+            return _walk_status(session, 'pose directement (ordres de marche refuses, voir le journal)')
+        return _walk_status(session, 'impossible de le deplacer (voir le journal)')
     if teleport:
         session.teleports += 1
         log('[{}] double teleporte ({:.1f} d\'ecart)'.format(session.role, gap))
         session.walk = None
-        return
+        return _walk_status(session, 'teleporte')
     session.walks += 1
     session.walk = {'target': target, 'started': now if not same else walk['started'], 'at': now}
+    _walk_status(session, 'marche vers l\'autre joueur')
 
 
 def _walk_tick(session, now):
@@ -1283,14 +1421,17 @@ def sync_lines(session):
         ' , solde suivi {}'.format(session.money_known) if session.money_known is not None else '')]
     if session.role == 'client':
         clock = session.host_clock
-        lines.append('Heure : {}{}{}'.format(
+        lines.append('Heure : {}{}{}{}{}'.format(
             'vitesse de l\'hote {}'.format(clock[1]) if clock else 'rien recu de l\'hote',
+            ' , ecart {:+.0f} s de jeu'.format(session.last_gap) if session.last_gap is not None else '',
             ' , en avance : pause' if session.clock_ahead else '',
-            ' , {} avance(s) d\'heure'.format(session.clock_jumps) if session.clock_jumps else ''))
+            ' , {} avance(s) d\'heure'.format(session.clock_jumps) if session.clock_jumps else '',
+            ' , {} demande(s) de vitesse envoyee(s)'.format(session.speed_requests) if session.speed_requests else ''))
     else:
-        lines.append('Heure : envoyee a l\'invite (l\'heure et la vitesse de l\'hote font foi)')
-    lines.append('Double de l\'autre joueur : {} ordre(s) de marche, {} teleportation(s)'.format(
-        session.walks, session.teleports))
+        lines.append('Heure : envoyee a l\'invite ; {} demande(s) de vitesse de l\'invite appliquee(s)'.format(
+            session.speed_requests))
+    lines.append('Double de l\'autre joueur : {} ; {} ordre(s) de marche, {} teleportation(s)'.format(
+        session.walk_status, session.walks, session.teleports))
     return lines
 
 
@@ -2105,6 +2246,12 @@ try:
 except Exception:
     # Sans ce hook, mp.host / mp.join restent utilisables a la main.
     log('ERREUR installation connexion automatique :\n' + traceback.format_exc())
+
+try:
+    _install_speed_hook()
+except Exception:
+    # Sans ce hook, seule la vitesse de l'hote compte (les boutons de l'invite restent sans effet).
+    log('ERREUR installation suivi des boutons de vitesse :\n' + traceback.format_exc())
 
 try:
     _install_traffic_hook()
