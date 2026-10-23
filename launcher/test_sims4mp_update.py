@@ -531,6 +531,60 @@ class UpdateWindowTest(TempDirTest):
         self.assertIn('non configuree', app.status.cget('text'))
         self.assertEqual(str(app.update_button.cget('state')), 'normal')
 
+    def test_mod_choices_kept_between_openings(self):
+        import tkinter as tk
+        (self.tmp / 'Electronic Arts').mkdir()
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        app = gui.LauncherApp(root, documents=self.tmp)
+        self.assertFalse(gui.prefs_path().exists())             # rien d'ecrit a l'ouverture
+        app.allow_test.set(True)                                 # comme un clic sur la case
+        self.assertEqual(gui.read_prefs(gui.prefs_path()), {'version_test': True, 'retour_arriere': False})
+        self.assertEqual(app.status.cget('text'), 'Choix enregistré')
+        app.allow_downgrade.set(True)
+        app.allow_test.set(False)
+        # Nouvelle ouverture du lanceur : les cases reprennent les derniers choix.
+        second = tk.Toplevel(root)
+        reopened = gui.LauncherApp(second, documents=self.tmp)
+        self.assertFalse(reopened.allow_test.get())
+        self.assertTrue(reopened.allow_downgrade.get())
+        self.assertEqual(gui.read_prefs(gui.prefs_path()), {'version_test': False, 'retour_arriere': True})
+
+
+class PrefsTest(TempDirTest):
+    def test_defaults_when_missing(self):
+        self.assertEqual(gui.read_prefs(self.tmp / 'absent.json'), {'version_test': False, 'retour_arriere': False})
+
+    def test_write_then_read(self):
+        path = self.tmp / gui.PREFS_NAME
+        gui.write_prefs(path, {'version_test': True})
+        self.assertEqual(gui.read_prefs(path), {'version_test': True, 'retour_arriere': False})
+
+    def test_invalid_refused(self):
+        path = self.tmp / gui.PREFS_NAME
+        for bad in ['pas du json', '[]', '{"version_test": "oui"}', '{"autre": true}', '{"version_test": 1}']:
+            path.write_text(bad, encoding='utf-8')
+            with self.assertRaises(ValueError, msg=bad):
+                gui.read_prefs(path)
+
+    def test_config_file_unchanged(self):
+        # Les options GitHub gardent leurs deux cles : un ancien lanceur les lit toujours.
+        self.assertEqual(gui.CONFIG_KEYS, {'depot', 'tag'})
+        self.assertNotEqual(gui.PREFS_NAME, gui.CONFIG_NAME)
+
+    def test_invalid_file_ignored_by_window(self):
+        import tkinter as tk
+        (self.tmp / 'Electronic Arts').mkdir()
+        gui.prefs_path().write_text('{"version_test": "oui"}', encoding='utf-8')
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        app = gui.LauncherApp(root, documents=self.tmp)
+        self.assertFalse(app.allow_test.get())
+        app.allow_test.set(True)                                  # le fichier est reecrit proprement
+        self.assertEqual(gui.read_prefs(gui.prefs_path()), {'version_test': True, 'retour_arriere': False})
+
 
 if __name__ == '__main__':
     unittest.main()

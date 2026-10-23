@@ -62,6 +62,10 @@ USER_AGENT = 'Sims4MP-Launcher'
 # MANIFEST_URL quand ils sont renseignes.
 CONFIG_NAME = 'sims4mp_launcher_config.json'
 CONFIG_KEYS = {'depot', 'tag'}
+# Choix de la page Mod, gardes d'une ouverture a l'autre. Fichier a part : un ancien
+# lanceur refuserait le fichier d'options s'il contenait des cles inconnues.
+PREFS_NAME = 'sims4mp_launcher_prefs.json'
+PREFS_DEFAULTS = {'version_test': False, 'retour_arriere': False}
 MANIFEST_NAME = 'sims4mp_manifest.json'
 # Icone de la roue (mod 0.16.0) : second manifeste, a cote du premier dans la meme release.
 # Le manifeste du mod ne change pas : les anciens lanceurs le lisent toujours.
@@ -293,6 +297,41 @@ def read_config(path):
 
 def write_config(path, data):
     clean = validate_config(data)
+    _write_json_atomic(Path(path), clean)
+    return clean
+
+
+def validate_prefs(data):
+    """Choix de la page Mod : cles connues seulement, valeurs vrai/faux ; les absentes valent faux."""
+    if not isinstance(data, dict):
+        raise ValueError('Choix enregistrés invalides : objet JSON attendu.')
+    unknown = set(data) - set(PREFS_DEFAULTS)
+    if unknown:
+        raise ValueError('Choix enregistrés invalides : clés inconnues {}.'.format(sorted(unknown)))
+    if any(not isinstance(value, bool) for value in data.values()):
+        raise ValueError('Choix enregistrés invalides : valeurs vrai/faux attendues.')
+    return dict(PREFS_DEFAULTS, **data)
+
+
+def prefs_path():
+    return base_dir() / PREFS_NAME
+
+
+def read_prefs(path):
+    """Choix enregistres (valeurs par defaut si le fichier n'existe pas) ; ValueError s'il est invalide."""
+    path = Path(path)
+    if not path.is_file():
+        return dict(PREFS_DEFAULTS)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError('Lecture impossible de {} : {}'.format(path, exc)) from None
+    return validate_prefs(data)
+
+
+def write_prefs(path, data):
+    clean = validate_prefs(data)
     _write_json_atomic(Path(path), clean)
     return clean
 
@@ -1859,6 +1898,7 @@ class LauncherApp:
         self._refresh_ips()
         self._load_settings()
         self._load_config()
+        self._load_prefs()
         self._refresh_source_label()
         self._on_role()
         self._on_tag_mode()
@@ -1960,6 +2000,33 @@ class LauncherApp:
             self.repo.set(data['depot'])
             self.tag.set(data['tag'])
             self.tag_mode.set('tag' if data['tag'] else 'latest')
+
+    # -- choix de la page Mod (enregistres des qu'une case change) --
+    def _load_prefs(self):
+        try:
+            data = read_prefs(prefs_path())
+        except ValueError as exc:
+            self.show('Choix de la page Mod ignorés : {}'.format(exc), 'error')
+            data = dict(PREFS_DEFAULTS)
+        self._prefs_loading = True
+        self.allow_test.set(data['version_test'])
+        self.allow_downgrade.set(data['retour_arriere'])
+        self._prefs_loading = False
+        if not getattr(self, '_prefs_traced', False):
+            self.allow_test.trace_add('write', lambda *args: self._save_prefs())
+            self.allow_downgrade.trace_add('write', lambda *args: self._save_prefs())
+            self._prefs_traced = True
+
+    def _save_prefs(self):
+        if getattr(self, '_prefs_loading', False):
+            return
+        try:
+            write_prefs(prefs_path(), {'version_test': bool(self.allow_test.get()),
+                                       'retour_arriere': bool(self.allow_downgrade.get())})
+        except (ValueError, OSError) as exc:
+            self.show('Choix non enregistré : {}'.format(exc), 'error')
+            return
+        self.set_status('Choix enregistré', 'ok')
 
     def _form_config(self):
         tag = self.tag.get() if self.tag_mode.get() == 'tag' else ''
