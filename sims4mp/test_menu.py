@@ -36,11 +36,17 @@ commands = module('sims4.commands', Command=lambda *a, **k: (lambda f: f),
 
 class Key(object):
     def __init__(self, name, kind):
-        self.instance, self.type = abs(hash(name)) % (2 ** 63), kind
+        # Comme get_resource_key : un entier est pris tel quel, un nom est hache.
+        self.instance = name if isinstance(name, int) else abs(hash(name)) % (2 ** 63)
+        self.type = kind
 
 
-resources = module('sims4.resources', Types=types.SimpleNamespace(INTERACTION='INTERACTION'),
-                   get_resource_key=lambda name, kind: Key(name, kind))
+PACKAGE_KEYS = set()                                  # (type, instance) des .package installes
+
+
+resources = module('sims4.resources', Types=types.SimpleNamespace(INTERACTION='INTERACTION', PNG=0x2F7D0004),
+                   get_resource_key=lambda name, kind: Key(name, kind),
+                   does_key_exist=lambda key: (key.type, key.instance) in PACKAGE_KEYS)
 
 
 class RawText(str):
@@ -184,6 +190,8 @@ class ProtocolBufferRollback(object):
 
 module('distributor')
 module('distributor.rollback', ProtocolBufferRollback=ProtocolBufferRollback)
+module('distributor.shared_messages',
+       IconInfoData=lambda icon_resource=None, **kwargs: types.SimpleNamespace(icon_resource=icon_resource))
 
 
 def create_pie_menu_message(items, fail):
@@ -420,6 +428,21 @@ count = len(DIALOGS)
 mod.open_menu()
 DIALOGS[-1].click(6)
 report('« Fermer » : rien d\'autre', len(DIALOGS) == count + 1)
+
+# --- 4b. Icone de la roue (sims4mp_icons.package) -----------------------------------------
+import icon_package  # noqa: E402
+
+with open(mod.LOG_PATH, encoding='utf-8') as handle:
+    text = handle.read()
+report('sans sims4mp_icons.package : bouton sans icone, journal explicite',
+       menu.pie_menu_icon is None and 'icone absente' in text and mod.bridge_menu_icon() is None)
+PACKAGE_KEYS.add((0x2F7D0004, icon_package.ICON_INSTANCE))
+with_icon = mod.bridge_create_menu_affordance()
+icon = with_icon.pie_menu_icon('resolver')
+report('avec sims4mp_icons.package : le bouton montre l\'image PNG du fichier',
+       mod.MENU_ICON_INSTANCE == icon_package.ICON_INSTANCE and icon.icon_resource.type == 0x2F7D0004
+       and icon.icon_resource.instance == icon_package.ICON_INSTANCE)
+PACKAGE_KEYS.clear()
 
 # --- 5. Erreur pendant la creation : le jeu continue ---------------------------------------
 mod._menu['affordance'] = None

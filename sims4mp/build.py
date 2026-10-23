@@ -16,6 +16,9 @@ MODULES = ['sims4mp_hello', 'protocol', 'transport']
 HERE = os.path.dirname(os.path.abspath(__file__))
 BUILD_DIR = os.path.join(HERE, 'build')
 OUTPUT = os.path.join(BUILD_DIR, ARCHIVE + '.ts4script')
+# Icone de la roue (0.16.0) : a placer dans Mods a cote du .ts4script.
+ICONS = os.path.join(BUILD_DIR, 'sims4mp_icons.package')
+ICON_PREVIEW = os.path.join(BUILD_DIR, 'sims4mp_icon.png')
 
 
 def main():
@@ -37,6 +40,15 @@ def main():
             print('  + ' + module + '.pyc')
 
     print('OK : ' + OUTPUT)
+
+    sys.path.insert(0, HERE)
+    import icon_package
+    png = icon_package.icon_png()
+    with open(ICON_PREVIEW, 'wb') as f:
+        f.write(png)
+    with open(ICONS, 'wb') as f:
+        f.write(icon_package.build_package([(icon_package.PNG_TYPE, 0, icon_package.ICON_INSTANCE, png)]))
+    print('OK : ' + ICONS + ' (icone {:016X})'.format(icon_package.ICON_INSTANCE))
     return 0
 
 

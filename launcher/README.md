@@ -34,6 +34,10 @@ ou **Jeu : introuvable** (le bouton « Lancer Les Sims 4 » est alors désactiv�
    l'ancien mod est d'abord rangé dans `sims4mp_backups`.
 3. Une version de test demande de cocher « Installer une version de test » ; une version
    plus ancienne demande « Autoriser le retour à une version plus ancienne ».
+4. À partir du mod 0.16.0, le lanceur installe aussi `sims4mp_icons.package` (l'icône du
+   bouton « Sims4MP… » de la roue), décrit par un second manifeste de la même release
+   (`sims4mp_icons_manifest.json`), vérifié de la même façon. Une icône manquante ou refusée
+   n'empêche jamais la mise à jour du mod. Relancez le jeu pour voir l'icône.
 
 « Aucune version stable publiée » : le dépôt n'a que des pré-versions, choisissez **Tag précis**.
 

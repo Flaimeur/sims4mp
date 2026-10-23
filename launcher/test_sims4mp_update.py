@@ -267,7 +267,7 @@ class UpdateFlowTest(TempDirTest):
     def test_already_up_to_date(self):
         lines, summary = self.update(manifest_for(self.old, version='0.4.0'))
         self.assertTrue(summary.startswith('Déjà à jour'))
-        self.assertEqual(self.opener.requested, [MANIFEST_URL])          # pas de telechargement
+        self.assertNotIn(MOD_URL, self.opener.requested)                 # pas de telechargement du mod
         self.assertFalse(self.backups.exists())
 
     def test_test_status_refused_by_default(self):
@@ -412,6 +412,101 @@ class UpdateFlowTest(TempDirTest):
             with self.assertRaises(OSError):
                 self.update(manifest_for(self.new))
         self.assert_mods_unchanged()
+
+
+ICONS_MANIFEST_URL = 'https://example.invalid/releases/latest/download/sims4mp_icons_manifest.json'
+ICONS_URL = 'https://example.invalid/releases/download/v0.16.0/sims4mp_icons.package'
+
+
+def icons_bytes(filler=b'\x00'):
+    return b'DBPF\x02\x00\x00\x00\x01\x00\x00\x00' + filler * 84
+
+
+def icons_manifest_for(data, **changes):
+    manifest = {'fichier': gui.ICONS_FILE, 'url': ICONS_URL,
+                'sha256': hashlib.sha256(data).hexdigest(), 'taille': len(data)}
+    manifest.update(changes)
+    return manifest
+
+
+class IconsUpdateTest(UpdateFlowTest):
+    """Second manifeste (icone de la roue) : le manifeste du mod ne change pas."""
+
+    def update_with_icons(self, icons_manifest, icons=None, mod_manifest=None, running=False):
+        self.icons = icons_bytes() if icons is None else icons
+        routes = {MANIFEST_URL: json_bytes(mod_manifest or manifest_for(self.new)), MOD_URL: self.new,
+                  ICONS_MANIFEST_URL: (icons_manifest if isinstance(icons_manifest, Exception)
+                                       else json_bytes(icons_manifest)),
+                  ICONS_URL: self.icons}
+        self.opener = FakeOpener(routes)
+        return gui.run_update(MANIFEST_URL, self.documents, self.backups, self.downloads,
+                              is_running=lambda: running, opener=self.opener)
+
+    def test_icons_manifest_url_next_to_mod_manifest(self):
+        self.assertEqual(gui.icons_manifest_url(MANIFEST_URL), ICONS_MANIFEST_URL)
+        self.assertEqual(gui.icons_manifest_url(
+            'https://github.com/a/b/releases/download/v0.16.0/sims4mp_manifest.json'),
+            'https://github.com/a/b/releases/download/v0.16.0/sims4mp_icons_manifest.json')
+
+    def test_mod_and_icons_installed(self):
+        lines, summary = self.update_with_icons(icons_manifest_for(icons_bytes()))
+        self.assertEqual((self.mods / gui.MOD_FILE).read_bytes(), self.new)
+        self.assertEqual((self.mods / gui.ICONS_FILE).read_bytes(), self.icons)
+        self.assertIn('Icone copiee', ' '.join(lines))
+        self.assertEqual(summary, 'Mod mis à jour (0.5.0)')
+        self.assertEqual(list(self.downloads.iterdir()), [])
+
+    def test_icons_already_installed_not_downloaded(self):
+        (self.mods / gui.ICONS_FILE).write_bytes(icons_bytes())
+        lines, _ = self.update_with_icons(icons_manifest_for(icons_bytes()))
+        self.assertNotIn(ICONS_URL, self.opener.requested)
+        self.assertIn('Icone deja installee', ' '.join(lines))
+
+    def test_icons_added_when_mod_already_up_to_date(self):
+        (self.mods / gui.MOD_FILE).write_bytes(self.new)
+        lines, summary = self.update_with_icons(icons_manifest_for(icons_bytes()))
+        self.assertTrue(summary.startswith('Déjà à jour'))
+        self.assertEqual((self.mods / gui.ICONS_FILE).read_bytes(), self.icons)
+
+    def test_old_release_without_icons(self):
+        missing = urllib.error.HTTPError(ICONS_MANIFEST_URL, 404, 'Not Found', {}, None)
+        lines, summary = self.update_with_icons(missing)
+        self.assertEqual(summary, 'Mod mis à jour (0.5.0)')
+        self.assertIn('aucune dans cette release', ' '.join(lines))
+        self.assertFalse((self.mods / gui.ICONS_FILE).exists())
+
+    def test_bad_icons_never_block_the_mod(self):
+        for icons_manifest, icons in [(icons_manifest_for(icons_bytes(), sha256='0' * 64), None),
+                                      (icons_manifest_for(b'pas un package'), b'pas un package'),
+                                      (icons_manifest_for(icons_bytes(), url='http://example.invalid/i'), None),
+                                      (icons_manifest_for(icons_bytes(), fichier='autre.package'), None),
+                                      (icons_manifest_for(icons_bytes(), taille=2 * 1024 * 1024), None),
+                                      (dict(icons_manifest_for(icons_bytes()), extra=1), None)]:
+            (self.mods / gui.MOD_FILE).write_bytes(self.old)
+            lines, summary = self.update_with_icons(icons_manifest, icons)
+            self.assertEqual(summary, 'Mod mis à jour (0.5.0)', msg=icons_manifest)
+            self.assertIn('ATTENTION : icone non installee', ' '.join(lines), msg=icons_manifest)
+            self.assertFalse((self.mods / gui.ICONS_FILE).exists(), msg=icons_manifest)
+            self.assertEqual(list(self.downloads.iterdir()), [])
+
+    def test_old_icons_backed_up_outside_mods(self):
+        (self.mods / gui.ICONS_FILE).write_bytes(icons_bytes(b'\x01'))
+        self.update_with_icons(icons_manifest_for(icons_bytes()))
+        self.assertEqual((self.mods / gui.ICONS_FILE).read_bytes(), icons_bytes())
+        saved = [p for p in self.backups.iterdir() if p.suffix == '.package']
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), icons_bytes(b'\x01'))
+        self.assertEqual(sorted(p.name for p in self.mods.iterdir()),
+                         sorted(['Resource.cfg', gui.MOD_FILE, gui.ICONS_FILE]))
+
+    def test_local_install_copies_icons_next_to_mod(self):
+        source_dir = self.tmp / 'build'
+        source_dir.mkdir()
+        (source_dir / gui.MOD_FILE).write_bytes(self.new)
+        (source_dir / gui.ICONS_FILE).write_bytes(icons_bytes())
+        lines = gui.run_install(source_dir / gui.MOD_FILE, self.documents, self.backups, is_running=lambda: False)
+        self.assertEqual((self.mods / gui.ICONS_FILE).read_bytes(), icons_bytes())
+        self.assertIn('Icone copiee', ' '.join(lines))
 
 
 class UpdateWindowTest(TempDirTest):

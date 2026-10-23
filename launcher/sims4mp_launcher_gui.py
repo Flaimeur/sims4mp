@@ -63,6 +63,14 @@ USER_AGENT = 'Sims4MP-Launcher'
 CONFIG_NAME = 'sims4mp_launcher_config.json'
 CONFIG_KEYS = {'depot', 'tag'}
 MANIFEST_NAME = 'sims4mp_manifest.json'
+# Icone de la roue (mod 0.16.0) : second manifeste, a cote du premier dans la meme release.
+# Le manifeste du mod ne change pas : les anciens lanceurs le lisent toujours.
+#   {"fichier": "sims4mp_icons.package", "url": "https://.../sims4mp_icons.package",
+#    "sha256": "<64 hex>", "taille": 12345}
+ICONS_FILE = 'sims4mp_icons.package'
+ICONS_MANIFEST_NAME = 'sims4mp_icons_manifest.json'
+ICONS_MANIFEST_KEYS = {'fichier', 'url', 'sha256', 'taille'}
+MAX_ICONS_SIZE = 1024 * 1024             # 1 Mo
 
 IS_WINDOWS = sys.platform == 'win32'
 IS_MAC = sys.platform == 'darwin'
@@ -441,27 +449,33 @@ def sha256_of(path):
 
 
 def install_mod(source, mods_dir, backup_dir):
-    target = Path(mods_dir) / MOD_FILE
+    return install_file(source, mods_dir, backup_dir, MOD_FILE)
+
+
+def install_file(source, mods_dir, backup_dir, name):
+    """Copie verifiee de source vers Mods/name (mod ou icone). Renvoie (cible, sauvegarde, sha256)."""
+    target = Path(mods_dir) / name
     backup = None
     if target.exists():
-        # Sauvegarde HORS du dossier Mods : un .ts4script renomme dans Mods
-        # (ou un sous-dossier) serait charge par le jeu en double.
+        # Sauvegarde HORS du dossier Mods : un .ts4script (ou .package) renomme dans
+        # Mods (ou un sous-dossier) serait charge par le jeu en double.
         backup_dir = Path(backup_dir)
         backup_dir.mkdir(exist_ok=True)
         stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        backup = backup_dir / 'sims4mp_hello_{}.ts4script'.format(stamp)
+        stem, suffix = Path(name).stem, Path(name).suffix
+        backup = backup_dir / '{}_{}{}'.format(stem, stamp, suffix)
         n = 2
         while backup.exists():
-            backup = backup_dir / 'sims4mp_hello_{}_{}.ts4script'.format(stamp, n)
+            backup = backup_dir / '{}_{}_{}{}'.format(stem, stamp, n, suffix)
             n += 1
         shutil.copy2(target, backup)
         if sha256_of(backup) != sha256_of(target):
-            raise LauncherError('Sauvegarde de l\'ancien mod incorrecte : {}'.format(backup))
+            raise LauncherError('Sauvegarde de l\'ancien fichier incorrecte : {}'.format(backup))
 
     # Copie dans un fichier .part (ignore par le jeu), verification, puis
-    # remplacement atomique : en cas d'echec l'ancien mod reste intact et
+    # remplacement atomique : en cas d'echec l'ancien fichier reste intact et
     # le .part est supprime.
-    part = Path(mods_dir) / ('.' + MOD_FILE + '.part')
+    part = Path(mods_dir) / ('.' + name + '.part')
     try:
         shutil.copy2(source, part)
         src_size, dst_size = Path(source).stat().st_size, part.stat().st_size
@@ -504,8 +518,25 @@ def run_install(source, documents, backup_dir, is_running=game_is_running):
     lines.append('Ancien mod sauvegarde : {}'.format(backup or 'aucun (pas de mod precedent)'))
     for path in other_copies(mods_dir, target):
         lines.append('ATTENTION : autre copie du mod dans Mods, a supprimer : {}'.format(path))
+    icons = Path(source).parent / ICONS_FILE
+    if icons.is_file():
+        if not is_dbpf(icons):
+            lines.append('ATTENTION : {} n\'est pas un fichier .package valide : icone non copiee.'.format(icons))
+        else:
+            icon_target, _, _ = install_file(icons, mods_dir, backup_dir, ICONS_FILE)
+            lines.append('Icone copiee : {}'.format(icon_target))
     lines.append('Version du mod installe : {}'.format(version))
     return lines
+
+
+def is_dbpf(path):
+    """Vrai si le fichier commence comme un .package du jeu (DBPF version 2)."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(8)
+    except OSError:
+        return False
+    return head[:4] == b'DBPF' and head[4:8] == b'\x02\x00\x00\x00'
 
 
 def launch_game(is_running=game_is_running, start=None, target=STEAM_GAME_URL):
@@ -956,6 +987,32 @@ def validate_manifest(data):
             'taille': size, 'statut': data['statut']}
 
 
+def validate_icons_manifest(data):
+    """Valide le manifeste de l'icone et renvoie une copie normalisee, sinon LauncherError."""
+    if not isinstance(data, dict):
+        raise LauncherError('Manifeste de l\'icone invalide : objet JSON attendu.')
+    if set(data) != ICONS_MANIFEST_KEYS:
+        raise LauncherError('Manifeste de l\'icone invalide : cles attendues {}.'.format(
+            sorted(ICONS_MANIFEST_KEYS)))
+    if data['fichier'] != ICONS_FILE:
+        raise LauncherError('Manifeste de l\'icone invalide : fichier « {} » (attendu {}).'.format(
+            data['fichier'], ICONS_FILE))
+    url = require_https(data['url'], 'URL de l\'icone')
+    sha = data['sha256']
+    if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-fA-F]{64}', sha):
+        raise LauncherError('Manifeste de l\'icone invalide : sha256 doit faire 64 caracteres hexadecimaux.')
+    size = data['taille']
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= MAX_ICONS_SIZE:
+        raise LauncherError('Manifeste de l\'icone invalide : taille {} (1 a {} octets).'.format(
+            size, MAX_ICONS_SIZE))
+    return {'fichier': ICONS_FILE, 'url': url, 'sha256': sha.lower(), 'taille': size}
+
+
+def icons_manifest_url(manifest_url):
+    """Le manifeste de l'icone est range a cote de celui du mod (meme release)."""
+    return manifest_url.strip().rsplit('/', 1)[0] + '/' + ICONS_MANIFEST_NAME
+
+
 class HTTPSOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Suit les redirections (GitHub -> objects.githubusercontent.com) en HTTPS seulement."""
 
@@ -1085,6 +1142,74 @@ def download_mod(manifest, temp_dir, opener, timeout=DOWNLOAD_TIMEOUT):
     return tmp
 
 
+def fetch_icons_manifest(url, opener, timeout=DOWNLOAD_TIMEOUT):
+    """Manifeste de l'icone, ou None si la release n'en a pas (HTTP 404, releases < 0.16.0)."""
+    url = require_https(url, 'URL du manifeste de l\'icone')
+    buffer = _BytesSink()
+    try:
+        read_limited(url, buffer, MAX_MANIFEST_SIZE, timeout, opener)
+    except LauncherError as exc:
+        if '(HTTP 404)' in str(exc):
+            return None
+        raise
+    try:
+        data = json.loads(bytes(buffer.data).decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LauncherError('Manifeste de l\'icone illisible (JSON invalide) : {}'.format(exc)) from None
+    return validate_icons_manifest(data)
+
+
+def download_icons(icons, temp_dir, opener, timeout=DOWNLOAD_TIMEOUT):
+    """Telecharge sims4mp_icons.package dans temp_dir et le verifie (taille, SHA-256, DBPF)."""
+    url = require_https(icons['url'], 'URL de l\'icone')
+    fd, tmp = tempfile.mkstemp(prefix='sims4mp_icons_', suffix='.part', dir=str(temp_dir))
+    tmp = Path(tmp)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            size = read_limited(url, out, min(icons['taille'], MAX_ICONS_SIZE), timeout, opener)
+        if size != icons['taille']:
+            raise LauncherError('Icone : taille incorrecte ({} octets recus, {} attendus).'.format(
+                size, icons['taille']))
+        digest = sha256_of(tmp)
+        if digest != icons['sha256']:
+            raise LauncherError('Icone : SHA-256 incorrect, fichier refuse.')
+        if not is_dbpf(tmp):
+            raise LauncherError('Icone : le fichier telecharge n\'est pas un .package valide.')
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return tmp
+
+
+def update_icons(manifest_url, mods_dir, backup_dir, temp_dir, opener, timeout, is_running):
+    """Installe ou met a jour l'icone de la roue. Ne leve jamais : renvoie des lignes de resume
+    (une icone manquante ne doit pas faire echouer la mise a jour du mod)."""
+    try:
+        icons = fetch_icons_manifest(icons_manifest_url(manifest_url), opener, timeout)
+        if icons is None:
+            return ['Icone : aucune dans cette release (versions avant 0.16.0).']
+        current = Path(mods_dir) / ICONS_FILE
+        if current.is_file() and sha256_of(current) == icons['sha256']:
+            return ['Icone deja installee (fichier identique).']
+        tmp = download_icons(icons, temp_dir, opener, timeout)
+        try:
+            if is_running():
+                raise LauncherError('Fermez Les Sims 4 ({} est en cours d\'execution).'.format(GAME_PROCESS))
+            target, _, _ = install_file(tmp, mods_dir, backup_dir, ICONS_FILE)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return ['Icone copiee : {} ({} octets).'.format(target, target.stat().st_size)]
+    except (LauncherError, OSError) as exc:
+        return ['ATTENTION : icone non installee ({}). Le mod fonctionne sans.'.format(
+            str(exc).splitlines()[0])]
+
+
 def version_tuple(version):
     """'0.4.0' -> (0, 4, 0) ; None si la version est illisible."""
     if not isinstance(version, str) or not re.fullmatch(r'\d+\.\d+\.\d+', version):
@@ -1116,6 +1241,7 @@ def run_update(manifest_url, documents, backup_dir, temp_dir, allow_test=False,
     current = mods_dir / MOD_FILE
     if current.is_file() and sha256_of(current) == manifest['sha256']:
         lines.append('Version {} deja installee (fichier identique) : rien a faire.'.format(manifest['version']))
+        lines += update_icons(manifest_url, mods_dir, backup_dir, temp_dir, opener, timeout, is_running)
         return lines, 'Déjà à jour ({})'.format(manifest['version'])
     if current.is_file():
         installed = read_mod_version(current)
@@ -1147,6 +1273,7 @@ def run_update(manifest_url, documents, backup_dir, temp_dir, allow_test=False,
     lines.append('Ancien mod sauvegarde : {}'.format(backup or 'aucun (pas de mod precedent)'))
     for path in other_copies(mods_dir, target):
         lines.append('ATTENTION : autre copie du mod dans Mods, a supprimer : {}'.format(path))
+    lines += update_icons(manifest_url, mods_dir, backup_dir, temp_dir, opener, timeout, is_running)
     lines.append('Version du mod installe : {}{}'.format(
         manifest['version'], ' (version de test)' if manifest['statut'] == STATUS_TEST else ''))
     return lines, 'Mod mis à jour ({})'.format(manifest['version'])
