@@ -209,8 +209,14 @@ class TravelWithPicker(PickerSuperInteractionMixin, ImmediateSuperInteraction):
     pass
 
 
+class DebugCategory(object):
+    guid64 = 999                                      # sous-menu « … » de la roue
+
+
 class TerrainTeleportCheat(ImmediateSuperInteraction):
     cheat = True
+    category = DebugCategory
+    category_on_forwarded = DebugCategory
 
 
 class GoHere(object):
@@ -307,6 +313,9 @@ report('reglages : roue Maj + clic, choisie par le joueur, jamais par l\'autonom
        menu.cheat is True and menu.debug is False and menu.allow_user_directed and not menu.allow_autonomous
        and menu.visible and menu.display_name() == 'Sims4MP…' and isinstance(menu.display_name(), RawText))
 report('tests du jeu contournes (toujours disponible)', bool(menu._test(None, None)))
+report('sans categorie : premier niveau de la roue (la base est dans un sous-menu)',
+       TerrainTeleportCheat.category is DebugCategory and menu.category is None
+       and menu.category_on_forwarded is None)
 report('selecteur ignore comme base ; visible meme sauvegarde verrouillee',
        not issubclass(menu, TravelWithPicker) and menu.allow_while_save_locked is True)
 try:

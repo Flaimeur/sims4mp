@@ -1,4 +1,6 @@
-# Sims 4 Multiplayer - mp.menu (0.15.3) : ouvre la fenetre Sims4MP sans passer par la roue.
+# Sims 4 Multiplayer - menu sans categorie (0.15.4) : le bouton « Sims4MP… » n'herite plus de
+# la categorie de sa base (category = None) et apparait au premier niveau de la roue.
+# mp.menu (0.15.3) : ouvre la fenetre Sims4MP sans passer par la roue.
 # Diagnostic menu (0.15.2) : create_pie_menu_message suivi, le journal
 # note si le bouton Sims4MP est dans le message final de la roue (nom, priorite).
 # mp.solo (0.15.1) : jouer seul jusqu'a la fermeture du jeu (session
@@ -182,7 +184,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.15.3'
+MOD_VERSION = '0.15.4'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -2735,6 +2737,11 @@ def _menu_affordance_class(base):
         'tests': TestList(()),
         'test_globals': TestList(()),
         'allow_while_save_locked': True,
+        # Interaction.get_pie_menu_category renvoie category (ou category_on_forwarded) ;
+        # sans ceci le bouton herite de la categorie de la base et se range dans un
+        # sous-menu « … » de la roue (0.15.4).
+        'category': None,
+        'category_on_forwarded': None,
         '_run_interaction_gen': _run_interaction_gen,
     }
 
@@ -2764,7 +2771,9 @@ def bridge_create_menu_affordance():
     menu = type(base)(MENU_NAME, (base,), attributes)
     menu.reloadable = False
     manager.register_tuned_class(menu, key)
-    log('menu : action creee (base {} , cle {})'.format(base.__name__, key.instance))
+    base_category = getattr(base, 'category', None)
+    log('menu : action creee (base {} , cle {} , categorie de la base {} retiree)'.format(
+        base.__name__, key.instance, getattr(base_category, '__name__', base_category)))
     return menu
 
 
@@ -3072,9 +3081,10 @@ def _install_pie_message_diag_hook():
                     mine = [item for item in items if getattr(item, 'affordance_id', None) == menu.guid64]
                     _menu_diag('message de la roue : {} bouton(s), Sims4MP {}{}'.format(
                         len(items), 'present' if mine else 'ABSENT',
-                        ' (nom {!r}, priorite {!r})'.format(
+                        ' (nom {!r}, priorite {!r}, categorie {!r})'.format(
                             str(getattr(mine[0], 'loc_string', ''))[:120],
-                            getattr(mine[0], 'pie_menu_priority', None)) if mine else ''))
+                            getattr(mine[0], 'pie_menu_priority', None),
+                            getattr(mine[0], 'category_key', None)) if mine else ''))
         except Exception:
             _menu_diag('erreur diagnostic message : ' + traceback.format_exc().strip().splitlines()[-1])
         return msg
