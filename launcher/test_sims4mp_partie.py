@@ -56,7 +56,9 @@ class PartieTest(unittest.TestCase):
 
     def test_connexion_card_removed(self):
         self.assertEqual(card_titles(self.app.pages['connexion']), ['Mode de jeu', 'Room'])
-        self.assertEqual(card_titles(self.app.pages['options']), ['GitHub', 'Outils', 'Réseau'])
+        # Outils est devenu une page a part (etape 5 du lanceur).
+        self.assertEqual(card_titles(self.app.pages['options']), ['GitHub', 'Réseau'])
+        self.assertEqual(card_titles(self.app.pages['outils']), ['Diagnostic'])
         texts = []
         stack = [self.app.pages['connexion']]
         while stack:

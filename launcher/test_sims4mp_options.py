@@ -176,8 +176,10 @@ class GithubOnlyInstallTest(OptionsWindowTest):
         app.repo.set('Flaimeur/sims4mp')
         app.tag_mode.set('tag')
         app.tag.set('v0.4.0')
+        app._check_manifest = lambda: None                       # pas de reseau dans le test
         app._save_config()
-        self.assertEqual(app.source_label.cget('text'), 'Source : Flaimeur/sims4mp (tag v0.4.0)')
+        # La version a installer se choisit maintenant dans la page Mod (menu « Version »).
+        self.assertEqual(app.source_label.cget('text'), 'Source : Flaimeur/sims4mp (GitHub)')
 
     def test_latest_404_explains_tag(self):
         import urllib.error

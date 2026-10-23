@@ -89,6 +89,11 @@ GAME_PROCESS = MAC_GAME_PROCESS if IS_MAC else WINDOWS_GAME_PROCESS
 STEAM_GAME_URL = 'steam://rungameid/1222670'     # Les Sims 4 sur Steam
 BACKUP_DIR_NAME = 'sims4mp_backups'
 LOG_NAME = 'launcher.log'
+LAUNCHER_VERSION = '0.17.0'              # suit la version du mod au moment du build du lanceur
+SET_ASIDE_DIR = 'mods_mis_de_cote'       # dans sims4mp_backups : anciennes copies du mod retirees de Mods
+MOD_LOG_NAME = 'sims4mp.log'             # journal du mod, dans Mods
+MOD_REPORT_NAME = 'sims4mp_rapport.txt'  # rapport du mod (menu Sims4MP → Outils), dans Mods
+CHECK_REMINDER = 'A VERIFIER : '         # ligne de diagnostic informative (non comptee)
 SETTINGS_NAME = 'sims4mp_settings.json'
 
 ROLE_HOST = 'host'
@@ -541,6 +546,59 @@ def other_copies(mods_dir, target):
             if p.resolve() != Path(target).resolve()]
 
 
+def set_aside_copy(path, mods_dir, backup_dir, is_running=game_is_running):
+    """Retire de Mods une autre copie du mod (sims4mp_hello*.ts4script) en la deplacant dans
+    sims4mp_backups/mods_mis_de_cote. Renvoie le nouveau chemin."""
+    path, mods_dir = Path(path), Path(mods_dir)
+    if not re.fullmatch(r'sims4mp_hello.*\.ts4script', path.name, re.IGNORECASE):
+        raise LauncherError('Seules les copies du mod Sims4MP peuvent être mises de côté : {}'.format(path))
+    try:
+        inside = path.resolve().is_relative_to(mods_dir.resolve())
+    except OSError:
+        inside = False
+    if not inside or path.is_symlink() or not path.is_file():
+        raise LauncherError('Fichier introuvable dans Mods : {}'.format(path))
+    if path.resolve() == (mods_dir / MOD_FILE).resolve():
+        raise LauncherError('Le mod installé ne peut pas être mis de côté ici.')
+    if is_running():
+        raise LauncherError('Fermez Les Sims 4 ({} est en cours d\'execution), puis recommencez.'.format(GAME_PROCESS))
+    target_dir = Path(backup_dir) / SET_ASIDE_DIR
+    target_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    target = target_dir / '{}_{}{}'.format(path.stem, stamp, path.suffix)
+    n = 2
+    while target.exists():
+        target = target_dir / '{}_{}_{}{}'.format(path.stem, stamp, n, path.suffix)
+        n += 1
+    shutil.move(str(path), str(target))
+    return target
+
+
+def latest_tag(tags, allow_test):
+    """Version la plus recente a installer : les versions de test seulement si allow_test."""
+    for entry in tags:
+        if allow_test or entry['statut'] == STATUS_STABLE:
+            return entry
+    return None
+
+
+def installed_state(documents, mods_dir=None):
+    """Etat local (lecture seule) : dossier Mods, version du mod installe, icone presente.
+    mods_dir deja connu : pas de nouvelle recherche dans Documents (lente avec beaucoup de mods)."""
+    state = {'mods_dir': None, 'error': None, 'version': None, 'icons': False}
+    if mods_dir is None or not (Path(mods_dir) / 'Resource.cfg').is_file():
+        try:
+            mods_dir = find_mods_dir(documents)
+        except LauncherError as exc:
+            state['error'] = str(exc).splitlines()[0]
+            return state
+    state['mods_dir'] = mods_dir
+    mod = mods_dir / MOD_FILE
+    state['version'] = read_mod_version(mod) if mod.is_file() else None
+    state['icons'] = (mods_dir / ICONS_FILE).is_file()
+    return state
+
+
 def run_install(source, documents, backup_dir, is_running=game_is_running):
     """Installation complete. Renvoie la liste des lignes de resume."""
     lines = []
@@ -920,8 +978,14 @@ def run_diagnostic(documents, is_running=game_is_running, list_ips=local_ipv4_ad
         mod = mods_dir / MOD_FILE
         if mod.is_file():
             lines.append('Mod : present, version {} ({})'.format(read_mod_version(mod), mod))
+            if (mods_dir / ICONS_FILE).is_file():
+                lines.append('Icone de la roue : installee ({})'.format(ICONS_FILE))
+            else:
+                lines.append(CHECK_REMINDER + 'icone de la roue absente : page Mod → Installer pour l\'ajouter')
         else:
             warn('mod absent du dossier Mods ({})'.format(mods_dir))
+        for copy in other_copies(mods_dir, mod):
+            warn('autre copie du mod : {}'.format(copy))
     except LauncherError as exc:
         warn('dossier Mods : {}'.format(str(exc).splitlines()[0]))
 
@@ -979,6 +1043,8 @@ def run_diagnostic(documents, is_running=game_is_running, list_ips=local_ipv4_ad
         else:
             warn('hote {} : {}'.format(target, message))
 
+    # Le lanceur ne peut pas lire ce reglage du jeu : simple rappel.
+    lines.append(CHECK_REMINDER + 'mods de script autorises dans le jeu (Options du jeu → Autres)')
     if warnings:
         lines.append('Resultat : {} point(s) a verifier.'.format(warnings))
         return lines, 'Diagnostic : {} point(s) à vérifier'.format(warnings)
@@ -1370,7 +1436,12 @@ MONO_FAMILY = 'Menlo' if IS_MAC else 'Consolas'
 MAC_TK_SCALING = 96 / 72
 PAD = 12                      # marge exterieure et entre les cadres
 GAP = 6                       # espacement entre les lignes d'un cadre
-SIDEBAR_WIDTH = 200
+SIDEBAR_WIDTH = 220
+LATEST_CHOICE = 'Dernière version (selon « version de test »)'
+HOME_REFRESH_MS = 5000                   # Accueil : etat du jeu et du mod relu toutes les 5 s
+COPY_TAIL_LINES = 200                    # « Copier » un journal : ses 200 dernieres lignes
+NAV_PAGES = [('accueil', 'Accueil'), ('connexion', 'Partie à deux'), ('mod', 'Mod'),
+             ('outils', 'Outils'), ('options', 'Options')]
 
 # Palette claire et sobre, aux couleurs des Sims 4 : panneaux blancs,
 # bleu des boutons du jeu, vert du losange pour les succes.
@@ -1389,6 +1460,7 @@ COLOR_ACCENT_TEXT = '#ffffff'
 COLOR_NAV_ACTIVE = '#eaf2fd'
 COLOR_OK = '#1e9e4a'
 COLOR_ERROR = '#d93025'
+COLOR_WARN = '#c27c0e'
 
 LABEL_LAN = 'Wi-Fi/Ethernet'
 LABEL_VIRTUAL = 'Virtuel'
@@ -1479,6 +1551,17 @@ def apply_style(root):
     style.configure('Status.TLabel', foreground=COLOR_MUTED, **status)
     style.configure('StatusOk.TLabel', foreground=COLOR_OK, **status)
     style.configure('StatusError.TLabel', foreground=COLOR_ERROR, **status)
+    style.configure('StatusWarn.TLabel', foreground=COLOR_WARN, **status)
+    # Pastilles de la barre laterale (vides : invisibles).
+    badge = dict(background=COLOR_SIDEBAR, font=(FONT_FAMILY, 8), padding=(6, 0))
+    style.configure('Badge.TLabel', foreground=COLOR_MUTED, **badge)
+    style.configure('BadgeOk.TLabel', foreground=COLOR_OK, **badge)
+    style.configure('BadgeWarn.TLabel', foreground=COLOR_WARN, **badge)
+    # Lignes du diagnostic et des cartes d'etat.
+    style.configure('Ok.TLabel', foreground=COLOR_OK)
+    style.configure('Warn.TLabel', foreground=COLOR_WARN)
+    style.configure('Error.TLabel', foreground=COLOR_ERROR)
+    style.configure('Value.TLabel', foreground=COLOR_TEXT)
 
     # Boutons
     style.configure('TButton', background=COLOR_BUTTON, foreground=COLOR_TEXT, padding=(14, 7),
@@ -1636,7 +1719,8 @@ class LauncherApp:
                                       command=self._show_help)
         self.help_button.pack(side='right')
         self.nav = {}
-        for key, text in [('connexion', 'Connexion'), ('mod', 'Mod'), ('options', 'Options')]:
+        self.badges = {}                     # pastille d'etat a droite de chaque entree
+        for key, text in NAV_PAGES:
             row = ttk.Frame(side, style='Side.TFrame')
             row.pack(fill='x', padx=PAD - 2, pady=1)
             bar = ttk.Frame(row, style='NavBarOff.TFrame', width=3)
@@ -1644,10 +1728,16 @@ class LauncherApp:
             button = ttk.Button(row, text=text, style='Nav.TButton', takefocus=False,
                                 command=lambda k=key: self._show_page(k))
             button.pack(side='left', fill='x', expand=True)
+            badge = ttk.Label(row, style='Badge.TLabel')
+            badge.pack(side='right', padx=(0, GAP))
+            badge.bind('<Button-1>', lambda event, k=key: self._show_page(k))
             self.nav[key] = (bar, button)
+            self.badges[key] = badge
 
-        ttk.Label(side, text='Projet de fan, non affilié à EA', style='SideMuted.TLabel').pack(
-            side='bottom', anchor='w', padx=PAD + 8, pady=(GAP, PAD + 4))
+        foot = ttk.Frame(side, style='Side.TFrame')
+        foot.pack(side='bottom', fill='x', padx=PAD + 8, pady=(GAP, PAD + 4))
+        ttk.Label(foot, text='Projet de fan, non affilié à EA', style='SideMuted.TLabel').pack(anchor='w')
+        ttk.Label(foot, text='lanceur {}'.format(LAUNCHER_VERSION), style='SideMuted.TLabel').pack(anchor='w')
         quit_row = ttk.Frame(side, style='Side.TFrame')
         quit_row.pack(side='bottom', fill='x', padx=PAD - 2)
         # Explication sous le bouton Jouer quand le jeu est introuvable (vide sinon).
@@ -1675,14 +1765,28 @@ class LauncherApp:
         self.status.pack(side='left', fill='x', expand=True)
         ttk.Separator(right, orient='horizontal').pack(side='bottom', fill='x')
 
+        # Journal en bas, repliable (Copier / Effacer) ; les pages prennent toute la largeur.
+        journal = ttk.Frame(right, style='Card.TFrame')
+        journal.pack(side='bottom', fill='x')
+        ttk.Separator(right, orient='horizontal').pack(side='bottom', fill='x')
+        journal_head = ttk.Frame(journal, style='Card.TFrame', padding=(PAD + 6, GAP, PAD + 6, GAP))
+        journal_head.pack(fill='x')
+        self.journal_toggle = ttk.Button(journal_head, text='Journal ▾', style='Nav.TButton', takefocus=False,
+                                         command=self._toggle_journal)
+        self.journal_toggle.pack(side='left')
+        ttk.Button(journal_head, text='Effacer', command=self._clear_journal).pack(side='right')
+        ttk.Button(journal_head, text='Copier', command=self._copy_journal).pack(side='right', padx=(0, GAP))
+        self.journal_body = ttk.Frame(journal, style='Card.TFrame', padding=(PAD + 6, 0, PAD + 6, PAD))
+        self.journal_body.pack(fill='x')
+        self.journal_body.columnconfigure(0, weight=1)
+
         content = ttk.Frame(right, style='Bg.TFrame', padding=PAD + 6)
         content.pack(fill='both', expand=True)
-        content.columnconfigure(0, weight=3, uniform='col')
-        content.columnconfigure(1, weight=2, uniform='col')
+        content.columnconfigure(0, weight=1)
         content.rowconfigure(0, weight=1)
 
         pages = ttk.Frame(content, style='Bg.TFrame')
-        pages.grid(row=0, column=0, sticky='nsew', padx=(0, PAD + 6))
+        pages.grid(row=0, column=0, sticky='nsew')
         pages.columnconfigure(0, weight=1)
         pages.rowconfigure(0, weight=1)
         self.pages = {key: ttk.Frame(pages, style='Bg.TFrame') for key in self.nav}
@@ -1820,15 +1924,36 @@ class LauncherApp:
             row=1, column=0, sticky='w')
         self.source_label = ttk.Label(update, wraplength=400, justify='left')
         self.source_label.grid(row=2, column=0, sticky='w', pady=(GAP, 0))
+        versions = ttk.Frame(update)
+        versions.grid(row=3, column=0, sticky='ew', pady=(PAD, 0))
+        versions.columnconfigure(1, weight=1)
+        ttk.Label(versions, text='Installé', style='Muted.TLabel').grid(row=0, column=0, sticky='w', padx=(0, PAD))
+        self.mod_installed_label = ttk.Label(versions, text='…', style='Value.TLabel')
+        self.mod_installed_label.grid(row=0, column=1, sticky='w')
+        ttk.Label(versions, text='À installer', style='Muted.TLabel').grid(row=1, column=0, sticky='w',
+                                                                          padx=(0, PAD), pady=(GAP, 0))
+        self.mod_target_label = ttk.Label(versions, text='…', style='Primary.TLabel')
+        self.mod_target_label.grid(row=1, column=1, sticky='w', pady=(GAP, 0))
+        ttk.Label(versions, text='Version', style='Muted.TLabel').grid(row=2, column=0, sticky='w',
+                                                                      padx=(0, PAD), pady=(GAP, 0))
+        self.version_choice = tk.StringVar(value=LATEST_CHOICE)
+        self.version_box = ttk.Combobox(versions, textvariable=self.version_choice, state='readonly', width=40,
+                                        values=[LATEST_CHOICE])
+        self.version_box.grid(row=2, column=1, sticky='w', pady=(GAP, 0))
+        self.version_box.bind('<<ComboboxSelected>>', lambda event: self._refresh_mod_page())
         self.update_button = ttk.Button(update, text='Installer / mettre à jour depuis GitHub',
                                         style='Accent.TButton', command=self._update)
-        self.update_button.grid(row=3, column=0, sticky='ew', pady=(PAD, GAP))
+        self.update_button.grid(row=4, column=0, sticky='ew', pady=(PAD, GAP))
         self.allow_test = tk.BooleanVar(value=False)
         ttk.Checkbutton(update, text='Installer une version de test', variable=self.allow_test).grid(
-            row=4, column=0, sticky='w', pady=(GAP, 0))
+            row=5, column=0, sticky='w', pady=(GAP, 0))
         self.allow_downgrade = tk.BooleanVar(value=False)
         ttk.Checkbutton(update, text='Autoriser le retour à une version plus ancienne',
-                        variable=self.allow_downgrade).grid(row=5, column=0, sticky='w', pady=(GAP, 0))
+                        variable=self.allow_downgrade).grid(row=6, column=0, sticky='w', pady=(GAP, 0))
+        self.tags = []                       # versions publiees (fetch_release_tags), la plus recente d'abord
+        self.local = None                    # installed_state() : mod et icone installes
+        self.game_running = None             # jeu ouvert ? (None : pas encore lu)
+        self.home_results = queue.Queue()
 
         restore = self._card(page, 'Restaurer l\'ancien mod', row=1)
         restore.columnconfigure(0, weight=1)
@@ -1887,23 +2012,8 @@ class LauncherApp:
         for var in (self.repo, self.tag, self.tag_mode):
             var.trace_add('write', lambda *args: self._refresh_manifest_preview())
 
-        tools = self._card(page, 'Outils', row=1)
-        tools.columnconfigure(0, weight=1)
-        tools.columnconfigure(1, weight=1)
-        self.diag_button = ttk.Button(tools, text='Diagnostic', command=self._diagnostic)
-        self.diag_button.grid(row=1, column=0, sticky='ew', padx=(0, GAP // 2), pady=(0, GAP))
-        ttk.Button(tools, text='Ouvrir le journal', command=self._open_log).grid(
-            row=1, column=1, sticky='ew', padx=(GAP // 2, 0), pady=(0, GAP))
-        ttk.Button(tools, text='Dossier du lanceur', command=self._open_launcher_dir).grid(
-            row=2, column=0, sticky='ew', padx=(0, GAP // 2))
-        ttk.Button(tools, text='Dossier Mods', command=self._open_mods_dir).grid(
-            row=2, column=1, sticky='ew', padx=(GAP // 2, 0))
-        ttk.Label(tools, style='Muted.TLabel', wraplength=400, justify='left',
-                  text='Le diagnostic ne modifie rien ; en Rejoindre, il essaie l\'hôte 3 s.').grid(
-            row=3, column=0, columnspan=2, sticky='w', pady=(GAP, 0))
-
         # Reseau : IP locales et port du jeu (la room utilise le port + 1).
-        net = self._card(page, 'Réseau', row=2)
+        net = self._card(page, 'Réseau', row=1)
         net.columnconfigure(1, weight=1)
         ttk.Label(net, text='IP locales', style='Muted.TLabel').grid(row=1, column=0, sticky='nw', padx=(0, PAD))
         self.ip_list = ttk.Frame(net)
@@ -1917,26 +2027,22 @@ class LauncherApp:
         self.copy_button = ttk.Button(net, text='Copier l\'IP', command=self._copy_ips)
         self.copy_button.grid(row=2, column=2, sticky='e', pady=(GAP, 0))
 
-        # Journal, toujours visible a droite.
-        box = ttk.Frame(content, style='Card.TFrame', padding=PAD + 2)
-        box.grid(row=0, column=1, sticky='nsew')
-        box.columnconfigure(0, weight=1)
-        box.rowconfigure(1, weight=1)
-        ttk.Label(box, text='Journal', style='CardTitle.TLabel').grid(row=0, column=0, sticky='w', pady=(0, PAD))
-        # tk.Text n'a pas d'equivalent ttk ; la barre de defilement est ttk.
-        self.messages = tk.Text(box, height=8, wrap='word', state='disabled',
+        self._build_tools_page(self.pages['outils'])
+        self._build_home_page(self.pages['accueil'])
+
+        # Journal (cadre du bas) : tk.Text n'a pas d'equivalent ttk ; la barre de defilement est ttk.
+        self.messages = tk.Text(self.journal_body, height=5, wrap='word', state='disabled',
                                 font=(MONO_FAMILY, 9), relief='flat', borderwidth=0,
-                                padx=PAD, pady=PAD, background=COLOR_FIELD, foreground='#334155',
+                                padx=PAD, pady=GAP, background=COLOR_FIELD, foreground='#334155',
                                 highlightthickness=1, highlightbackground=COLOR_BORDER,
                                 highlightcolor=COLOR_BORDER, cursor='arrow', spacing3=3)
-        self.messages.grid(row=1, column=0, sticky='nsew')
-        scroll = ttk.Scrollbar(box, orient='vertical', command=self.messages.yview)
-        scroll.grid(row=1, column=1, sticky='ns')
+        self.messages.grid(row=0, column=0, sticky='nsew')
+        scroll = ttk.Scrollbar(self.journal_body, orient='vertical', command=self.messages.yview)
+        scroll.grid(row=0, column=1, sticky='ns')
         self.messages.configure(yscrollcommand=scroll.set)
         self.messages.tag_configure('error', foreground=COLOR_ERROR)
         self.messages.tag_configure('ok', foreground=COLOR_OK)
 
-        self._show_page('connexion')
         self._refresh_ips()
         self._load_settings()
         self._load_config()
@@ -1947,7 +2053,459 @@ class LauncherApp:
         self._refresh_backups()
         self.game = detect_game()
         self._apply_game_state()
-        center_window(root, 1040, 790)
+        self._show_page('accueil')
+        self.allow_test.trace_add('write', lambda *args: self._refresh_mod_page())
+        self._refresh_mod_page()
+        # Une fois la fenetre affichee : etat local (mod, icone, jeu) et versions publiees,
+        # en tache de fond, puis mise a jour de l'Accueil toutes les HOME_REFRESH_MS.
+        root.after(300, self._start_background)
+        center_window(root, 1060, 800)
+
+    def _start_background(self):
+        self._ready = True
+        self._refresh_local()
+        self._fetch_tags_background()
+        self.root.after(HOME_REFRESH_MS, self._periodic_refresh)
+
+    def _periodic_refresh(self):
+        if not self.installing:
+            self._refresh_local()
+        self.root.after(HOME_REFRESH_MS, self._periodic_refresh)
+
+    # -- etat en tache de fond (Accueil, page Mod, pastilles) --
+    def _refresh_local(self):
+        """Relit le mod installe, l'icone et l'etat du jeu dans un thread."""
+        if getattr(self, '_local_busy', False):
+            return
+        self._local_busy = True
+        documents = self._documents()
+        known = self.local['mods_dir'] if self.local else None
+
+        def work():
+            try:
+                state = installed_state(documents, known)
+            except Exception as exc:                     # jamais d'erreur visible pour une relecture
+                state = {'mods_dir': None, 'error': str(exc), 'version': None, 'icons': False}
+            try:
+                running = bool(game_is_running())
+            except Exception:
+                running = None
+            self.home_results.put(('local', state, running))
+        self._spawn(work)
+        self.root.after(100, self._poll_background)
+
+    def _fetch_tags_background(self):
+        """Versions publiees du depot configure (une fois par depot), sans bloquer l'interface."""
+        try:
+            config = read_config(config_path())
+        except ValueError:
+            config = None
+        repo = config['depot'] if config else None
+        if repo is None or repo == self.tags_loaded_for or getattr(self, '_tags_busy', False):
+            return
+        self._tags_busy = True
+        self.tags_loaded_for = repo
+
+        def work():
+            try:
+                self.home_results.put(('tags', repo, fetch_release_tags(repo, make_https_opener())))
+            except Exception as exc:
+                self.home_results.put(('tags_error', repo, str(exc).splitlines()[0] if str(exc) else repr(exc)))
+        self._spawn(work)
+        self.root.after(100, self._poll_background)
+
+    def _poll_background(self):
+        try:
+            item = self.home_results.get_nowait()
+        except queue.Empty:
+            if getattr(self, '_local_busy', False) or getattr(self, '_tags_busy', False):
+                self.root.after(100, self._poll_background)
+            return
+        self._apply_background(item)
+        self.root.after(10, self._poll_background)
+
+    def _apply_background(self, item):
+        kind = item[0]
+        if kind == 'local':
+            self._local_busy = False
+            self.local, self.game_running = item[1], item[2]
+        elif kind == 'tags':
+            self._tags_busy = False
+            self._fill_tags(item[1], item[2])
+        elif kind == 'tags_error':
+            self._tags_busy = False
+            self.tags_loaded_for = None                  # nouvel essai a la prochaine visite
+            log('Versions publiees indisponibles : {}'.format(item[2]))
+        self._refresh_mod_page()
+        self._refresh_home()
+        self._refresh_badges()
+
+    # -- page Mod : version installee / a installer --
+    def _install_target(self):
+        """(url du manifeste, tag) d'apres le choix de la page Mod ; tag None : selon les Options."""
+        try:
+            config = read_config(config_path())
+        except ValueError:
+            config = None
+        if not config:
+            return self._manifest_url(), None
+        choice = self.version_choice.get()
+        tag = getattr(self, 'version_labels', {}).get(choice)
+        if tag is None:
+            entry = latest_tag(self.tags, bool(self.allow_test.get()))
+            tag = entry['tag'] if entry else None
+        if tag is None:
+            return self._manifest_url(), None
+        return manifest_url_for(config['depot'], tag), tag
+
+    def _target_entry(self):
+        _, tag = self._install_target()
+        return next((t for t in self.tags if t['tag'] == tag), None) if tag else None
+
+    def _refresh_mod_page(self):
+        if not hasattr(self, 'version_box'):
+            return
+        self.version_labels = {tag_label(t): t['tag'] for t in self.tags}
+        self.version_box.configure(values=[LATEST_CHOICE] + list(self.version_labels))
+        if self.version_choice.get() not in self.version_labels:
+            self.version_choice.set(LATEST_CHOICE)
+        installed = (self.local or {}).get('version')
+        if self.local is None:
+            installed_text = '…'
+        elif self.local.get('error'):
+            installed_text = 'dossier Mods introuvable'
+        else:
+            installed_text = installed or 'aucun mod installé'
+        self.mod_installed_label.configure(text=installed_text)
+        entry = self._target_entry()
+        if entry is not None:
+            date = tag_label(entry).split(' · ')[2:] or ['']
+            self.mod_target_label.configure(text='{} ({}){}'.format(
+                entry['tag'], entry['statut'], ' · ' + date[0] if date[0] else ''))
+            self.update_button.configure(text='Installer {}'.format(entry['tag']))
+        else:
+            self.mod_target_label.configure(text='selon les Options (dépôt et version)')
+            self.update_button.configure(text='Installer / mettre à jour depuis GitHub')
+
+    def _newer_available(self):
+        """Tag publie plus recent que le mod installe (d'apres « version de test »), ou None."""
+        installed = version_tuple((self.local or {}).get('version'))
+        entry = latest_tag(self.tags, bool(self.allow_test.get()))
+        if entry is None or installed is None:
+            return None
+        published = version_tuple(entry['tag'].lstrip('vV'))
+        return entry if published is not None and published > installed else None
+
+    def _refresh_badges(self):
+        if not hasattr(self, 'badges'):
+            return
+        if self.room is not None:
+            party = ('room ouverte', 'BadgeOk.TLabel')
+        elif self.presence is not None:
+            party = ('en room', 'BadgeOk.TLabel')
+        else:
+            party = ('seul', 'Badge.TLabel')
+        installed = (self.local or {}).get('version')
+        newer = self._newer_available()
+        if self.local is None:
+            mod = ('', 'Badge.TLabel')
+        elif newer is not None:
+            mod = ('{} dispo'.format(newer['tag']), 'BadgeWarn.TLabel')
+        elif installed:
+            mod = (installed, 'BadgeOk.TLabel')
+        else:
+            mod = ('absent', 'BadgeWarn.TLabel')
+        problems = getattr(self, 'diag_problems', 0)
+        tools = (str(problems), 'BadgeWarn.TLabel') if problems else ('', 'Badge.TLabel')
+        for key, (text, style) in (('connexion', party), ('mod', mod), ('outils', tools)):
+            self.badges[key].configure(text=text, style=style)
+
+    # -- journal --
+    def _toggle_journal(self):
+        if self.journal_body.winfo_manager():
+            self.journal_body.pack_forget()
+            self.journal_toggle.configure(text='Journal ▸')
+        else:
+            self.journal_body.pack(fill='x')
+            self.journal_toggle.configure(text='Journal ▾')
+
+    def _copy_journal(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.messages.get('1.0', 'end').strip())
+        self.set_status('Journal copié dans le presse-papiers', 'ok')
+
+    def _clear_journal(self):
+        self.messages.configure(state='normal')
+        self.messages.delete('1.0', 'end')
+        self.messages.configure(state='disabled')
+        self.set_status('Journal effacé')
+
+    # -- page Accueil --
+    def _build_home_page(self, page):
+        ttk = self.ttk
+        grid = ttk.Frame(page, style='Bg.TFrame')
+        grid.grid(row=0, column=0, sticky='nsew')
+        grid.columnconfigure(0, weight=1, uniform='home')
+        grid.columnconfigure(1, weight=1, uniform='home')
+        self.home_cards = {}
+        specs = [('mod', 'Mod Sims4MP', 0, 0, [('Installé', 'installed'), ('Dernière publiée', 'latest'),
+                                               ('Icône de la roue', 'icons')]),
+                 ('game', 'Les Sims 4', 0, 1, [('Jeu', 'kind'), ('État', 'running'), ('Dossier Mods', 'mods')]),
+                 ('net', 'Réseau', 1, 0, [('IP de ce PC', 'ip'), ('Port du jeu / room', 'ports')]),
+                 ('party', 'Partie à deux', 1, 1, [('Room', 'room'), ('Réglage du mod', 'settings')])]
+        for key, title, row, column, rows in specs:
+            card = ttk.Frame(grid, style='Card.TFrame', padding=PAD + 4)
+            card.grid(row=row, column=column, sticky='nsew', padx=(0 if column == 0 else PAD // 2,
+                                                                    PAD // 2 if column == 0 else 0),
+                      pady=(0 if row == 0 else PAD, 0))
+            card.columnconfigure(1, weight=1)
+            head = ttk.Label(card, text=title, style='CardTitle.TLabel')
+            head.grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, GAP))
+            values = {}
+            for i, (label, name) in enumerate(rows, start=1):
+                ttk.Label(card, text=label, style='Muted.TLabel').grid(row=i, column=0, sticky='w', pady=2)
+                values[name] = ttk.Label(card, text='…', style='Value.TLabel')
+                values[name].grid(row=i, column=1, sticky='e', pady=2)
+            buttons = ttk.Frame(card, style='Card.TFrame')
+            buttons.grid(row=len(rows) + 1, column=0, columnspan=2, sticky='w', pady=(PAD, 0))
+            self.home_cards[key] = values
+            values['_buttons'] = buttons
+        mod_buttons = self.home_cards['mod']['_buttons']
+        self.home_update_button = ttk.Button(mod_buttons, text='Mettre à jour', style='Accent.TButton',
+                                             command=self._update)
+        self.home_update_button.pack(side='left')
+        ttk.Button(mod_buttons, text='Changer de version…', command=lambda: self._show_page('mod')).pack(
+            side='left', padx=(GAP, 0))
+        ttk.Button(self.home_cards['game']['_buttons'], text='Ouvrir le dossier Mods',
+                   command=self._open_mods_dir).pack(side='left')
+        ttk.Button(self.home_cards['net']['_buttons'], text='Copier l\'IP', command=self._copy_ips).pack(side='left')
+        party = self.home_cards['party']['_buttons']
+        ttk.Button(party, text='Créer une room', style='Accent.TButton',
+                   command=lambda: self._go_party(ROLE_HOST)).pack(side='left')
+        ttk.Button(party, text='Rejoindre une room', command=lambda: self._go_party(ROLE_JOIN)).pack(
+            side='left', padx=(GAP, 0))
+
+    def _go_party(self, role):
+        self.role.set(role)
+        self._on_role()
+        self._show_page('connexion')
+
+    def _home_value(self, card, name, text, style='Value.TLabel'):
+        self.home_cards[card][name].configure(text=text, style=style)
+
+    def _refresh_home(self):
+        if not hasattr(self, 'home_cards'):
+            return
+        local = self.local
+        newer = self._newer_available()
+        if local is None:
+            self._home_value('mod', 'installed', '…')
+            self._home_value('mod', 'icons', '…')
+            self._home_value('game', 'mods', '…')
+        elif local.get('error'):
+            self._home_value('mod', 'installed', 'dossier Mods introuvable', 'Error.TLabel')
+            self._home_value('mod', 'icons', '-')
+            self._home_value('game', 'mods', 'introuvable', 'Error.TLabel')
+        else:
+            version = local.get('version')
+            self._home_value('mod', 'installed', version or 'aucun', 'Value.TLabel' if version else 'Warn.TLabel')
+            self._home_value('mod', 'icons', 'installée' if local.get('icons') else 'absente',
+                             'Ok.TLabel' if local.get('icons') else 'Warn.TLabel')
+            self._home_value('game', 'mods', 'trouvé (Resource.cfg)', 'Ok.TLabel')
+        entry = latest_tag(self.tags, bool(self.allow_test.get()))
+        if entry is not None:
+            self._home_value('mod', 'latest', tag_label(entry).replace(' · ', ' (', 1).replace(' · ', ') · ', 1)
+                             if entry['date'] else '{} ({})'.format(entry['tag'], entry['statut']))
+        else:
+            self._home_value('mod', 'latest', 'inconnue (dépôt dans Options)', 'Muted.TLabel')
+        self.home_update_button.configure(text='Mettre à jour vers {}'.format(newer['tag']) if newer else
+                                          'Installer / réinstaller')
+        kind = getattr(self, 'game', None)
+        self._home_value('game', 'kind', GAME_KIND_LABELS[kind.kind] if kind and kind.kind else 'introuvable',
+                         'Value.TLabel' if kind and kind.kind else 'Error.TLabel')
+        running = self.game_running
+        self._home_value('game', 'running', '…' if running is None else ('ouvert' if running else 'fermé'),
+                         'Value.TLabel' if running is None else ('Warn.TLabel' if running else 'Ok.TLabel'))
+        main_ip = primary_ip(self.ips)
+        self._home_value('net', 'ip', main_ip or 'aucune', 'Primary.TLabel' if main_ip else 'Error.TLabel')
+        try:
+            port = validate_port(self.port.get())
+            self._home_value('net', 'ports', '{} / {}'.format(port, port + 1))
+        except ValueError:
+            self._home_value('net', 'ports', 'port invalide (Options)', 'Error.TLabel')
+        if self.room is not None:
+            self._home_value('party', 'room', 'ouverte, code {}'.format(self.room.code), 'Ok.TLabel')
+        elif self.presence is not None:
+            self._home_value('party', 'room', 'connecté à {}'.format(self.presence['ip']), 'Ok.TLabel')
+        else:
+            self._home_value('party', 'room', 'aucune')
+        try:
+            settings = read_settings(self._settings_file())
+        except (ValueError, LauncherError):
+            settings = None
+        if settings is None:
+            self._home_value('party', 'settings', 'aucun', 'Muted.TLabel')
+        elif settings['role'] == ROLE_HOST:
+            self._home_value('party', 'settings', 'Héberger, port {}'.format(settings['port']))
+        else:
+            self._home_value('party', 'settings', 'Rejoindre {}:{}'.format(settings['ip'], settings['port']))
+        # Barre d'etat : resume quand rien d'autre n'est en cours.
+        if not self.installing and self.status.cget('text') in ('Prêt', 'Tout est prêt pour jouer',
+                                                                 'Nouvelle version disponible'):
+            if newer is not None:
+                self.set_status('Nouvelle version disponible', 'warn')
+            elif local and local.get('version') and kind and kind.kind:
+                self.set_status('Tout est prêt pour jouer', 'ok')
+
+    # -- page Outils --
+    def _build_tools_page(self, page):
+        ttk = self.ttk
+        diag = self._card(page, 'Diagnostic', row=0)
+        diag.columnconfigure(0, weight=1)
+        self.diag_button = ttk.Button(diag, text='Lancer le diagnostic', style='Accent.TButton',
+                                      command=self._diagnostic)
+        self.diag_button.grid(row=0, column=1, sticky='e')
+        self.diag_list = ttk.Frame(diag, style='Card.TFrame')
+        self.diag_list.grid(row=1, column=0, columnspan=2, sticky='ew')
+        self.diag_list.columnconfigure(1, weight=1)
+        ttk.Label(self.diag_list, style='Muted.TLabel', wraplength=560, justify='left',
+                  text='Vérifie le jeu, le dossier Mods, le mod et l\'icône, le réglage, le port et le pare-feu. '
+                       'Ne modifie rien ; en Rejoindre, il essaie l\'hôte 3 s.').grid(row=0, column=0, columnspan=3,
+                                                                                        sticky='w')
+        self.diag_problems = 0
+
+        lower = ttk.Frame(page, style='Bg.TFrame')
+        lower.grid(row=1, column=0, sticky='ew', pady=(PAD + 6, 0))
+        lower.columnconfigure(0, weight=1, uniform='tools')
+        lower.columnconfigure(1, weight=1, uniform='tools')
+        folders = ttk.Frame(lower, style='Card.TFrame', padding=PAD + 4)
+        folders.grid(row=0, column=0, sticky='nsew', padx=(0, PAD // 2))
+        ttk.Label(folders, text='Dossiers', style='CardTitle.TLabel').pack(anchor='w', pady=(0, PAD))
+        for text, command in (('Dossier Mods', self._open_mods_dir),
+                              ('Sauvegardes du mod', self._open_backups_dir),
+                              ('Dossier du lanceur', self._open_launcher_dir)):
+            ttk.Button(folders, text=text, command=command).pack(fill='x', pady=(0, GAP))
+        files = ttk.Frame(lower, style='Card.TFrame', padding=PAD + 4)
+        files.grid(row=0, column=1, sticky='nsew', padx=(PAD // 2, 0))
+        files.columnconfigure(0, weight=1)
+        ttk.Label(files, text='Fichiers à envoyer en cas de souci', style='CardTitle.TLabel').grid(
+            row=0, column=0, columnspan=3, sticky='w', pady=(0, PAD))
+        rows = [('Journal du lanceur', self._open_log, self._copy_launcher_log),
+                ('Journal du mod', lambda: self._open_mod_file(MOD_LOG_NAME), self._copy_mod_log),
+                ('Rapport du mod', lambda: self._open_mod_file(MOD_REPORT_NAME), None)]
+        for i, (label, open_command, copy_command) in enumerate(rows, start=1):
+            ttk.Label(files, text=label).grid(row=i, column=0, sticky='w', pady=2)
+            ttk.Button(files, text='Ouvrir', command=open_command).grid(row=i, column=1, sticky='e', padx=(GAP, 0))
+            if copy_command is not None:
+                ttk.Button(files, text='Copier', command=copy_command).grid(row=i, column=2, sticky='e',
+                                                                            padx=(GAP, 0))
+
+    def _diagnostic(self):
+        documents = self._documents()
+        found = {}
+
+        def task():
+            lines, summary = run_diagnostic(documents)
+            found['lines'] = lines
+            return lines, summary
+        self._start_task('Diagnostic en cours...', lambda: self._run_worker(task),
+                         after=lambda: self._show_diagnostic(found.get('lines', [])))
+
+    def _show_diagnostic(self, lines):
+        """Une ligne par point : ✔ vert, ⚠ orange (a verifier), ✖ rouge (probleme)."""
+        ttk = self.ttk
+        for child in self.diag_list.winfo_children():
+            child.destroy()
+        problems = 0
+        row = 0
+        for line in lines:
+            if line.startswith('Resultat'):
+                continue
+            action = None
+            if line.startswith('ATTENTION : '):
+                text, mark, style = line[len('ATTENTION : '):], '✖', 'Error.TLabel'
+                problems += 1
+                copy = re.fullmatch(r'autre copie du mod : (.+)', text)
+                if copy:
+                    action = ('Mettre de côté', lambda p=copy.group(1): self._set_aside(p))
+            elif line.startswith(CHECK_REMINDER):
+                text, mark, style = line[len(CHECK_REMINDER):], '⚠', 'Warn.TLabel'
+            else:
+                text, mark, style = line, '✔', 'Ok.TLabel'
+            ttk.Label(self.diag_list, text=mark, style=style).grid(row=row, column=0, sticky='nw', padx=(0, GAP))
+            ttk.Label(self.diag_list, text=text, wraplength=520, justify='left').grid(row=row, column=1, sticky='w')
+            if action is not None:
+                ttk.Button(self.diag_list, text=action[0], command=action[1]).grid(row=row, column=2, sticky='e')
+            row += 1
+        self.diag_problems = problems
+        self._refresh_badges()
+
+    def _set_aside(self, path):
+        if not self._confirm('Mettre de côté',
+                             'Retirer cette ancienne copie du mod du dossier Mods ?\n\n{}\n\nElle sera rangée '
+                             'dans {}\\{} (rien n\'est supprimé).'.format(path, BACKUP_DIR_NAME, SET_ASIDE_DIR)):
+            return
+        try:
+            mods_dir = find_mods_dir(self._documents())
+            target = set_aside_copy(path, mods_dir, base_dir() / BACKUP_DIR_NAME)
+        except (LauncherError, OSError) as exc:
+            self.show(str(exc), 'error')
+            self.set_status(str(exc).splitlines()[0], 'error')
+            return
+        self.show('Copie mise de côté : {}'.format(target), 'ok')
+        self.set_status('Ancienne copie du mod mise de côté', 'ok')
+        self._diagnostic()
+
+    def _open_backups_dir(self):
+        folder = base_dir() / BACKUP_DIR_NAME
+        folder.mkdir(exist_ok=True)
+        open_path(folder)
+
+    def _mod_file(self, name):
+        try:
+            return find_mods_dir(self._documents()) / name
+        except LauncherError as exc:
+            self.show(str(exc), 'error')
+            self.set_status(str(exc).splitlines()[0], 'error')
+            return None
+
+    def _open_mod_file(self, name):
+        path = self._mod_file(name)
+        if path is None:
+            return
+        if not path.is_file():
+            self.show('{} n\'existe pas encore (lancez le jeu avec le mod).'.format(path), 'error')
+            self.set_status('{} introuvable'.format(name), 'error')
+            return
+        try:
+            open_path(path)
+        except OSError as exc:
+            self.show('Impossible d\'ouvrir {} : {}'.format(path, exc), 'error')
+
+    def _copy_text(self, text, what):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.set_status('{} copié dans le presse-papiers'.format(what), 'ok')
+
+    def _copy_launcher_log(self):
+        path = base_dir() / LOG_NAME
+        try:
+            text = path.read_text(encoding='utf-8-sig', errors='replace')
+        except OSError:
+            text = ''
+        self._copy_text('\n'.join(text.splitlines()[-COPY_TAIL_LINES:]), 'Journal du lanceur')
+
+    def _copy_mod_log(self):
+        path = self._mod_file(MOD_LOG_NAME)
+        if path is None:
+            return
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            self.show('{} n\'existe pas encore (lancez le jeu avec le mod).'.format(path), 'error')
+            self.set_status('{} introuvable'.format(MOD_LOG_NAME), 'error')
+            return
+        self._copy_text('\n'.join(text.splitlines()[-COPY_TAIL_LINES:]), 'Fin du journal du mod')
 
     def _card(self, parent, title, row):
         """Carte sombre avec un titre vert ; renvoie le cadre interieur (grid)."""
@@ -1961,15 +2519,12 @@ class LauncherApp:
         self.pages[key].tkraise()
         if key == 'mod' and hasattr(self, 'backups'):
             self._refresh_backups()
-        if key == 'options' and hasattr(self, 'tags_loaded_for') and not self.installing:
-            # Premiere visite (ou depot change) : la liste des versions se remplit seule.
-            try:
-                repo = validate_repo(self.repo.get())
-            except ValueError:
-                repo = None
-            if repo is not None and repo != self.tags_loaded_for:
-                self.tags_loaded_for = repo          # un seul essai automatique ; le bouton reste la
-                self._refresh_tags()
+        if getattr(self, '_ready', False):
+            if key in ('options', 'mod'):
+                # Depot change depuis la derniere lecture : la liste des versions se relit seule.
+                self._fetch_tags_background()
+            if key in ('accueil', 'mod'):
+                self._refresh_local()
         for name, (bar, button) in self.nav.items():
             active = name == key
             bar.configure(style='NavBarOn.TFrame' if active else 'NavBarOff.TFrame')
@@ -1985,7 +2540,8 @@ class LauncherApp:
             log(('ERREUR : ' if tag == 'error' else '') + text)
 
     def set_status(self, text, kind=None):
-        style = {'ok': 'StatusOk.TLabel', 'error': 'StatusError.TLabel'}.get(kind, 'Status.TLabel')
+        style = {'ok': 'StatusOk.TLabel', 'error': 'StatusError.TLabel',
+                 'warn': 'StatusWarn.TLabel'}.get(kind, 'Status.TLabel')
         # Une seule ligne dans la barre ; le detail reste dans Messages.
         self.status.configure(text=text.splitlines()[0] if text else 'Prêt', style=style)
 
@@ -2135,6 +2691,11 @@ class LauncherApp:
         self.tag_labels = {tag_label(t): t['tag'] for t in tags}
         self.tag_entry.configure(values=[tag_label(t) for t in tags])
         self.tags_loaded_for = repo
+        self.tags = list(tags)               # aussi pour la page Mod, l'Accueil et les pastilles
+        self._refresh_mod_page()
+        if hasattr(self, 'home_cards'):
+            self._refresh_home()
+            self._refresh_badges()
 
     def _save_config(self):
         try:
@@ -2155,8 +2716,8 @@ class LauncherApp:
         except ValueError:
             data = None
         if data:
-            version = 'tag {}'.format(data['tag']) if data['tag'] else 'dernière version stable'
-            self.source_label.configure(text='Source : {} ({})'.format(data['depot'], version), style='TLabel')
+            # La version vient du menu « Version » ci-dessous (Options : depot, et version par defaut).
+            self.source_label.configure(text='Source : {} (GitHub)'.format(data['depot']), style='TLabel')
         else:
             self.source_label.configure(text='Source non configurée : renseignez le dépôt dans Options.',
                                         style='Muted.TLabel')
@@ -2239,11 +2800,6 @@ class LauncherApp:
             lambda: run_restore(backup, documents, base_dir() / BACKUP_DIR_NAME)))
 
     # -- outils --
-    def _diagnostic(self):
-        documents = self._documents()
-        self._start_task('Diagnostic en cours...',
-                         lambda: self._run_worker(lambda: run_diagnostic(documents)))
-
     def _open_log(self):
         path = base_dir() / LOG_NAME
         if not path.exists():
@@ -2780,9 +3336,6 @@ class LauncherApp:
     def _spawn(self, worker):
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update(self):
-        self._start_task('Installation depuis GitHub...', self._update_worker)
-
     def _run_worker(self, func):
         # Execute dans le thread : le resultat passe par la file pour l'interface.
         try:
@@ -2795,11 +3348,15 @@ class LauncherApp:
             self.results.put(('error', ['Erreur inattendue : {}\nDetail dans {}'.format(
                 exc, base_dir() / LOG_NAME)], None))
 
-    def _update_worker(self):
+    def _update(self):
+        manifest_url, _ = self._install_target()        # lu ici : variables tk dans le thread principal
+        self._start_task('Installation depuis GitHub...', lambda: self._update_worker(manifest_url))
+
+    def _update_worker(self, manifest_url=None):
         allow_test = bool(self.allow_test.get())
         allow_downgrade = bool(self.allow_downgrade.get())
-
-        manifest_url = self._manifest_url()
+        if manifest_url is None:
+            manifest_url = self._install_target()[0]
 
         def task():
             return run_update(manifest_url, self._documents(), base_dir() / BACKUP_DIR_NAME,
@@ -2836,6 +3393,8 @@ class LauncherApp:
         self._apply_game_state()
         self._refresh_backups()
         self._apply_room_state()
+        if getattr(self, '_ready', False):
+            self._refresh_local()                        # version installee apres une installation
         after, self._after_task = self._after_task, None
         if kind == 'ok' and after is not None:
             after()

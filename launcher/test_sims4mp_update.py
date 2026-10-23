@@ -522,8 +522,8 @@ class UpdateWindowTest(TempDirTest):
         # Navigation : une seule entree active a la fois.
         app._show_page('mod')
         styles = {key: str(button.cget('style')) for key, (bar, button) in app.nav.items()}
-        self.assertEqual(styles, {'connexion': 'Nav.TButton', 'mod': 'NavActive.TButton',
-                                  'options': 'Nav.TButton'})
+        self.assertEqual(styles, {'accueil': 'Nav.TButton', 'connexion': 'Nav.TButton', 'mod': 'NavActive.TButton',
+                                  'outils': 'Nav.TButton', 'options': 'Nav.TButton'})
         self.assertEqual(gui.MANIFEST_URL, 'À_REMPLIR')
         app._update_worker()                     # synchrone, sans thread
         app._poll_install()
