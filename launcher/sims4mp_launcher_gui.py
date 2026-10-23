@@ -1387,7 +1387,6 @@ COLOR_ACCENT = '#1f6fd6'      # bleu Sims
 COLOR_ACCENT_HOVER = '#185fc0'
 COLOR_ACCENT_TEXT = '#ffffff'
 COLOR_NAV_ACTIVE = '#eaf2fd'
-COLOR_PLUMBOB = '#45c745'
 COLOR_OK = '#1e9e4a'
 COLOR_ERROR = '#d93025'
 
@@ -1559,17 +1558,6 @@ def apply_style(root):
     return style
 
 
-def draw_logo(canvas, cx, top, scale=1.0):
-    """Losange vert a facettes, facon plumbob (dessin original du lanceur)."""
-    w, h_up, h_down, depth = 18 * scale, 30 * scale, 44 * scale, 7 * scale
-    mid = top + h_up
-    left, right, front = (cx - w, mid), (cx + w, mid), (cx, mid + depth)
-    apex, bottom = (cx, top), (cx, mid + h_down)
-    for points, color in [((apex, left, front), '#9be86f'), ((apex, front, right), COLOR_PLUMBOB),
-                          ((left, front, bottom), '#37a83a'), ((front, right, bottom), '#26872d')]:
-        canvas.create_polygon(*[c for p in points for c in p], fill=color, outline='')
-
-
 def default_pseudo():
     """Nom d'utilisateur Windows, nettoye (pseudo modifiable, jamais enregistre)."""
     try:
@@ -1581,15 +1569,15 @@ def default_pseudo():
     return name or 'Joueur'
 
 
-def load_plumbob(root):
-    """Plumbob officiel embarque (sims4mp_assets.py) ; None si indisponible,
-    l'en-tete utilise alors le losange dessine par draw_logo."""
+def load_logo(root, name='LOGO_PNG_HEADER'):
+    """Logo Sims4MP « deux joueurs » (sims4mp_logo.py, genere par make_logo.py depuis le
+    dessin du mod, aucun element d'EA) ; None si indisponible (l'en-tete garde le texte)."""
     try:
         import tkinter as tk
-        from sims4mp_assets import PLUMBOB_PNG
-        return tk.PhotoImage(master=root, data=PLUMBOB_PNG, format='png')
+        import sims4mp_logo
+        return tk.PhotoImage(master=root, data=getattr(sims4mp_logo, name), format='png')
     except Exception:
-        log('Plumbob embarque indisponible, losange dessine utilise :\n' + traceback.format_exc())
+        log('Logo Sims4MP indisponible :\n' + traceback.format_exc())
         return None
 
 
@@ -1625,14 +1613,17 @@ class LauncherApp:
         side.pack_propagate(False)
         header = ttk.Frame(side, style='Side.TFrame')
         header.pack(fill='x', padx=PAD + 6, pady=(PAD + 10, 2 * PAD + 4))
-        self.logo_image = load_plumbob(root)
+        self.logo_image = load_logo(root)
         if self.logo_image is not None:
             # Garder la reference : sans elle, tkinter efface l'image.
             ttk.Label(header, image=self.logo_image, style='Side.TLabel').pack(side='left')
-        else:
-            logo = tk.Canvas(header, width=30, height=48, background=COLOR_SIDEBAR, highlightthickness=0)
-            logo.pack(side='left')
-            draw_logo(logo, 15, 2, scale=0.6)
+        # Icone de la fenetre et de la barre des taches (l'exe a aussi sims4mp.ico).
+        self.window_icon = load_logo(root, 'LOGO_PNG_WINDOW')
+        if self.window_icon is not None:
+            try:
+                root.iconphoto(True, self.window_icon)
+            except tk.TclError:
+                log('Icone de fenetre refusee :\n' + traceback.format_exc())
         titles = ttk.Frame(header, style='Side.TFrame')
         titles.pack(side='left', padx=(GAP + 4, 0))
         ttk.Label(titles, text='Sims4MP', style='SideTitle.TLabel').pack(anchor='w')

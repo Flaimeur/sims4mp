@@ -18,7 +18,7 @@ Projet de fan, non affilié à Electronic Arts.
 
 ```
 py -3.7 sims4mp/build.py
-py -3.12 -m PyInstaller --onefile --noconsole --noconfirm --name Sims4MP_Launcher_GUI launcher/sims4mp_launcher_gui.py
+py -3.12 -m PyInstaller --onefile --noconsole --noconfirm --name Sims4MP_Launcher_GUI --icon launcher/sims4mp.ico launcher/sims4mp_launcher_gui.py
 ```
 
 ## Tests
