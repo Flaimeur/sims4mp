@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - icone DDS (0.16.1) : l'image PNG s'affichait en lama ; l'icone est
+# Sims 4 Multiplayer - fenetre en ecrans (0.17.0) : ecran principal (en-tete : role, autre
+# joueur, ping, heure de l'hote) et sous-ecrans Partie a deux / Notifications (choix actuel
+# marque) / Outils ; Heberger et Rejoindre depuis le jeu (saisie de l'IP :
+# UiDialogTextInputOkCancel) ; logo Sims4MP en haut des fenetres.
+# Icone DDS (0.16.1) : l'image PNG s'affichait en lama ; l'icone est
 # maintenant un DDS 32 bits (Types.DDS), le format des icones qui s'affichent dans la roue.
 # Icone de la roue (0.16.0) : logo « deux joueurs » (dessin original) en
 # ressource PNG dans sims4mp_icons.package (icon_package.py) ; le bouton l'affiche via
@@ -189,7 +193,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.16.1'
+MOD_VERSION = '0.17.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -2618,16 +2622,21 @@ def _install_traffic_hook():
 MENU_NAME = 'sims4mp_menu'
 MENU_LABEL = 'Sims4MP…'
 MENU_ICON_INSTANCE = 0x80EB131F7361E9AA   # image DDS de sims4mp_icons.package (icon_package.ICON_INSTANCE)
-MENU_CHOICES = (
-    (1, 'Notifications : toutes'),
-    (2, 'Notifications : importantes seulement'),
-    (3, 'Notifications : aucune'),
-    (4, 'État de la partie'),
-    (7, 'Resynchroniser maintenant'),
-    (8, 'Enregistrer un rapport'),
-    (5, 'Jouer seul (se déconnecter)'),
-    (6, 'Fermer'),
+# Fenetre en ecrans (0.17.0). Identifiants des boutons :
+MENU_CLOSE, MENU_BACK = 6, 9
+MENU_PARTY, MENU_NOTIFY, MENU_TOOLS = 10, 11, 12
+MENU_HOST, MENU_JOIN = 20, 21
+MENU_STATUS, MENU_RESYNC, MENU_REPORT, MENU_SOLO = 4, 7, 8, 5
+MENU_CHOICES = (                                       # ecran principal
+    (MENU_PARTY, 'Partie à deux…'),
+    (MENU_NOTIFY, 'Notifications…'),
+    (MENU_TOOLS, 'Outils…'),
+    (MENU_CLOSE, 'Fermer'),
 )
+NOTIFY_CHOICES = ((1, 'Notifications : toutes'), (2, 'Notifications : importantes seulement'),
+                  (3, 'Notifications : aucune'))
+MENU_CURRENT = ' (choix actuel)'                       # marque du reglage en cours
+JOIN_INPUT = 'ip'                                      # nom du champ de saisie « Rejoindre »
 _menu = {'affordance': None, 'error': None, 'opened': 0, 'seen': set()}
 MENU_SEEN_MAX = 20                                    # diagnostics de roue differents notes au plus
 
@@ -2659,21 +2668,96 @@ def menu_status_lines():
     return lines + sync_lines(session)
 
 
-def on_menu_choice(choice):
-    """Reponse de la fenetre du menu."""
-    if choice in (1, 2, 3):
+def menu_header_lines():
+    """En-tete de la fenetre : connexion, role, autre joueur, ping, heure de l'hote."""
+    session = _session
+    lines = ['Sims4MP {}'.format(MOD_VERSION)]
+    if session is None:
+        lines.append('Vous jouez seul : aucune partie à deux.')
+        if _auto['solo']:
+            lines.append('Mode solo jusqu\'à la fermeture du jeu (mp.solo).')
+        elif _auto['target'] is not None:
+            lines.append('Connexion automatique prévue : {}.'.format(
+                'hôte' if _auto['target'][0] == 'host' else 'invité vers {}'.format(_auto['target'][1])))
+        return lines
+    connected = session.handshake_done and session.endpoint.is_connected
+    lines.append('Vous êtes {}.'.format('l\'hôte' if session.role == 'host' else 'l\'invité'))
+    if connected:
+        ping = ', ping {:.0f} ms'.format(session.rtt_ms) if session.rtt_ms is not None else ''
+        lines.append('Autre joueur : connecté{}.'.format(ping))
+    else:
+        lines.append('Autre joueur : en attente de connexion.')
+    if session.role == 'host':
+        host_time = bridge_game_time()
+    else:
+        host_time = (session.state_received or {}).get('game_time')
+    if host_time:
+        lines.append('Heure de l\'hôte : {}.'.format(host_time))
+    if _gate['waiting']:
+        lines.append('Jeu en pause : en attente de l\'autre joueur.')
+    return lines
+
+
+def menu_screen(screen):
+    """(titre, lignes, choix) d'un ecran de la fenetre Sims4MP."""
+    header = menu_header_lines()
+    if screen == 'party':
+        lines = header[1:]
+        if _session is None:
+            choices = [(MENU_HOST, 'Héberger la partie'), (MENU_JOIN, 'Rejoindre un hôte…')]
+        else:
+            if _session.role == 'host':
+                ips = _local_ips()
+                lines.append('IP de ce PC : {} , port {}.'.format(', '.join(ips) or 'inconnue',
+                                                                  _session.endpoint.port))
+            choices = [(MENU_RESYNC, 'Resynchroniser maintenant'), (MENU_SOLO, 'Jouer seul (se déconnecter)')]
+        return 'Partie à deux', lines, choices + [(MENU_STATUS, 'État de la partie'), (MENU_BACK, 'Retour')]
+    if screen == 'notify':
+        current = NOTIFY_LEVELS.index(_notify['level']) + 1 if _notify['level'] in NOTIFY_LEVELS else None
+        choices = [(choice, label + (MENU_CURRENT if choice == current else ''))
+                   for choice, label in NOTIFY_CHOICES]
+        lines = ['Toutes : chaque action de l\'autre joueur.',
+                 'Importantes : connexion, alertes et écarts seulement.',
+                 'Aucune : aucune notification Sims4MP.']
+        return 'Notifications', lines, choices + [(MENU_BACK, 'Retour')]
+    if screen == 'tools':
+        return ('Outils', ['Rapport : fichier sims4mp_rapport.txt dans Mods, à envoyer en cas de souci.'],
+                [(MENU_REPORT, 'Enregistrer un rapport'), (MENU_STATUS, 'État de la partie'), (MENU_BACK, 'Retour')])
+    return 'Sims4MP', header + ['Notifications : {}.'.format(_notify['level'])], list(MENU_CHOICES)
+
+
+def open_menu(screen='main'):
+    if screen == 'main':
+        _menu['opened'] += 1
+    title, lines, choices = menu_screen(screen)
+    bridge_show_dialog(title, '\n'.join(lines), choices, lambda choice: on_menu_choice(choice, screen))
+
+
+def on_menu_choice(choice, screen='main'):
+    """Reponse d'un ecran de la fenetre ; certains choix rouvrent un ecran."""
+    if choice == MENU_PARTY:
+        open_menu('party')
+    elif choice == MENU_NOTIFY:
+        open_menu('notify')
+    elif choice == MENU_TOOLS:
+        open_menu('tools')
+    elif choice == MENU_BACK:
+        open_menu('main')
+    elif choice in (1, 2, 3):
         _notify['level'] = NOTIFY_LEVELS[choice - 1]
         log('menu : notifications {}'.format(_notify['level']))
         if choice != 3:
             bridge_notify('Notifications : {}.'.format('toutes' if choice == 1 else 'importantes seulement'))
-    elif choice == 4:
-        bridge_show_dialog('État de la partie', '\n'.join(menu_status_lines()), ((6, 'Fermer'),), None)
-    elif choice == 7:
+        open_menu('notify')                          # le nouveau choix apparait marque
+    elif choice == MENU_STATUS:
+        bridge_show_dialog('État de la partie', '\n'.join(menu_status_lines()), ((MENU_BACK, 'Retour'),),
+                           lambda answer: open_menu(screen) if answer == MENU_BACK else None)
+    elif choice == MENU_RESYNC:
         request_resync()
-    elif choice == 8:
+    elif choice == MENU_REPORT:
         path = write_report()
         bridge_notify('Rapport enregistré : {}'.format(path) if path else 'Rapport impossible (voir le journal).')
-    elif choice == 5:
+    elif choice == MENU_SOLO:
         stopped = _auto['target'] is not None or _session is not None
         _auto['target'] = None
         if _session is not None:
@@ -2681,15 +2765,97 @@ def on_menu_choice(choice):
         _gate_tick(time.monotonic())
         _release_clock_if_unused(None)
         log('menu : jouer seul ({})'.format('partie a deux arretee' if stopped else 'deja seul'))
+    elif choice == MENU_HOST:
+        menu_host()
+    elif choice == MENU_JOIN:
+        open_join_dialog(_menu_last_ip())
+
+
+# -- heberger / rejoindre depuis le jeu (0.17.0) --
+
+def _menu_settings():
+    settings, _ = read_settings(settings_path())
+    return settings
+
+
+def _menu_port():
+    settings = _menu_settings()
+    return settings['port'] if settings is not None else DEFAULT_PORT
+
+
+def _menu_last_ip():
+    settings = _menu_settings()
+    return settings['ip'] if settings is not None and settings['role'] == 'join' else ''
+
+
+def _menu_network_ready():
+    if NET_IMPORT_ERROR is not None or not _pump['installed']:
+        bridge_notify('Réseau Sims4MP indisponible (voir le journal).', alert=True)
+        return False
+    if _session is not None:
+        bridge_notify('Une partie à deux est déjà en cours. Menu Sims4MP → Partie à deux… → Jouer seul d\'abord.')
+        return False
+    return True
+
+
+def menu_host():
+    if not _menu_network_ready():
+        return
+    port = _menu_port()
+    ok, reason = _start_host(port)
+    if not ok:
+        bridge_notify('Impossible d\'héberger : {}.'.format(reason), alert=True)
+        return
+    ips = _local_ips()
+    log('menu : hebergement port {}'.format(port))
+    bridge_notify('Vous hébergez la partie (port {}). L\'autre joueur tape l\'IP de ce PC : {}.'.format(
+        port, ', '.join(ips) or 'inconnue'))
+
+
+def parse_join_target(text, default_port):
+    """« ip » ou « ip:port » tape par le joueur -> ((ip, port), None) ou (None, raison)."""
+    text = (text or '').strip()
+    port = default_port
+    if text.count(':') == 1:
+        text, port_text = text.split(':')
+        if not port_text.isdigit():
+            return None, 'port invalide'
+        port = int(port_text)
+    if not _valid_ipv4(text):
+        return None, 'adresse IP invalide (exemple : 192.168.1.20)'
+    if not AUTO_PORT_MIN <= port <= 65535:
+        return None, 'port invalide ({} à 65535)'.format(AUTO_PORT_MIN)
+    return (text, port), None
+
+
+def menu_join(text):
+    if not _menu_network_ready():
+        return
+    target, reason = parse_join_target(text, _menu_port())
+    if target is None:
+        bridge_notify('Rejoindre : {}.'.format(reason), alert=True)
+        open_join_dialog(text)
+        return
+    ok, reason = _start_client(*target)
+    if not ok:
+        bridge_notify('Rejoindre : {}.'.format(reason), alert=True)
+        return
+    log('menu : connexion vers {}:{}'.format(*target))
+    bridge_notify('Connexion en cours vers {}:{}…'.format(*target))
+
+
+def open_join_dialog(initial=''):
+    bridge_show_text_input('Rejoindre un hôte',
+                           'Tapez l\'IP de l\'hôte (affichée chez lui dans Partie à deux…), '
+                           'avec le port si besoin : 192.168.1.20 ou 192.168.1.20:7777.',
+                           initial, 'Rejoindre', menu_join)
 
 
 def bridge_show_dialog(title, text, choices, on_choice):
     """Fenetre du jeu avec un bouton par choix ; on_choice(id) a la reponse."""
-    import services
     from ui.ui_dialog import UiDialog, UiDialogResponse
-    client = services.client_manager().get_first_client()
-    owner = client.active_sim if client is not None else None
-    dialog = UiDialog.TunableFactory().default(owner, text=_raw(text), title=_raw(title))
+    dialog = UiDialog.TunableFactory().default(_dialog_owner(), text=_raw(text), title=_raw(title),
+                                               **_dialog_icon())
     dialog.set_responses(tuple(
         UiDialogResponse(dialog_response_id=choice_id, text=_raw(label),
                          ui_request=UiDialogResponse.UiDialogUiRequest.NO_REQUEST)
@@ -2704,9 +2870,64 @@ def bridge_show_dialog(title, text, choices, on_choice):
     dialog.show_dialog(on_response=on_response)
 
 
-def open_menu():
-    _menu['opened'] += 1
-    bridge_show_dialog('Sims4MP', '\n'.join(menu_status_lines()[:2]), MENU_CHOICES, on_menu_choice)
+class _TextInputs(dict):
+    """Champs d'une fenetre de saisie : UiDialogTextInput lit .items() (build_msg) et
+    hasattr(text_inputs, nom) (on_text_input) ; un dict avec acces par attribut suffit."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+
+class _InputLength(object):
+    """Longueur du champ (comme _TextInputLengthFixed.build_msg : msg.max_length)."""
+
+    def __init__(self, max_length):
+        self.max_length = max_length
+
+    def build_msg(self, dialog, msg, *additional_tokens):
+        msg.max_length = self.max_length
+
+
+def bridge_show_text_input(title, text, initial, ok_label, on_text):
+    """Fenetre de saisie d'une ligne (bytecode verifie : ui_dialog_generic.UiDialogTextInputOkCancel,
+    ui_text_input.UiTextInput(sort_order, ...), reponse dans dialog.text_input_responses[nom],
+    bouton OK = ui_dialog.ButtonType.DIALOG_RESPONSE_OK). on_text(texte) si OK."""
+    from ui.ui_dialog import ButtonType
+    from ui.ui_dialog_generic import UiDialogTextInputOkCancel
+    from ui.ui_text_input import UiTextInput
+    field = UiTextInput(sort_order=0, initial_value=_raw(initial) if initial else None,
+                        default_text=_raw('192.168.1.20'), title=None, restricted_characters=None,
+                        check_profanity=False, length_restriction=_InputLength(21), height=None)
+    dialog = UiDialogTextInputOkCancel.TunableFactory(text_inputs=(JOIN_INPUT,)).default(
+        _dialog_owner(), title=_raw(title), text=_raw(text), text_inputs=_TextInputs({JOIN_INPUT: field}),
+        text_ok=_raw(ok_label), text_cancel=_raw('Annuler'), **_dialog_icon())
+
+    def on_response(shown):
+        try:
+            if shown.response == ButtonType.DIALOG_RESPONSE_OK:
+                on_text(shown.text_input_responses.get(JOIN_INPUT, ''))
+        except Exception:
+            log('ERREUR saisie :\n' + traceback.format_exc())
+    dialog.show_dialog(on_response=on_response)
+
+
+def _dialog_owner():
+    import services
+    client = services.client_manager().get_first_client()
+    return client.active_sim if client is not None else None
+
+
+def _dialog_icon():
+    """Logo Sims4MP en haut des fenetres (UiDialog.build_msg appelle self.icon(resolver)),
+    seulement si sims4mp_icons.package est installe."""
+    try:
+        icon = bridge_menu_icon()
+    except Exception:
+        icon = None
+    return {'icon': icon} if icon is not None else {}
 
 
 def _menu_affordance_class(base):

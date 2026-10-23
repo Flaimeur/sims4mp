@@ -262,11 +262,13 @@ class UiDialogResponse(object):
 
 
 class FakeDialog(object):
-    def __init__(self, owner, text, title):
+    def __init__(self, owner, text, title, **kwargs):
         self.owner, self.text, self.title = owner, text(), title()
+        self.kwargs = kwargs                          # icon, text_inputs, text_ok...
         self.responses = ()
         self.response = None
         self.listener = None
+        self.text_input_responses = {}
         DIALOGS.append(self)
 
     def set_responses(self, responses):
@@ -280,14 +282,32 @@ class FakeDialog(object):
         self.listener(self)
 
 
+    def type_and_click(self, text, response_id):
+        # Comme le jeu : on_text_input remplit text_input_responses avant la reponse.
+        for name in self.kwargs['text_inputs']:
+            assert hasattr(self.kwargs['text_inputs'], name)
+            self.text_input_responses[name] = text
+        self.click(response_id)
+
+
 class UiDialog(object):
     @staticmethod
-    def TunableFactory():
-        return types.SimpleNamespace(default=lambda owner, text, title: FakeDialog(owner, text, title))
+    def TunableFactory(**factory_kwargs):
+        return types.SimpleNamespace(default=lambda owner, text, title, **kwargs: FakeDialog(owner, text, title,
+                                                                                            **kwargs))
 
 
+class UiTextInput(object):
+    def __init__(self, sort_order, **kwargs):          # AutoFactoryInit : un attribut par argument
+        self.sort_order = sort_order
+        self.__dict__.update(kwargs)
+
+
+ButtonType = types.SimpleNamespace(DIALOG_RESPONSE_OK=-1, DIALOG_RESPONSE_CANCEL=-2)
 module('ui')
-module('ui.ui_dialog', UiDialog=UiDialog, UiDialogResponse=UiDialogResponse)
+module('ui.ui_dialog', UiDialog=UiDialog, UiDialogResponse=UiDialogResponse, ButtonType=ButtonType)
+module('ui.ui_dialog_generic', UiDialogTextInputOkCancel=UiDialog)
+module('ui.ui_text_input', UiTextInput=UiTextInput)
 
 CLIENT = types.SimpleNamespace(active_sim='Elise')
 module('services', get_instance_manager=lambda kind: MANAGER,
@@ -386,48 +406,127 @@ except StopIteration as stop:
     finished = stop.value is True
 dialog = DIALOGS[-1] if DIALOGS else None
 labels = [r.text() for r in dialog.responses] if dialog else []
-report('cliquer « Sims4MP… » ouvre une fenetre du jeu avec un bouton par choix',
+report('cliquer « Sims4MP… » ouvre l\'ecran principal : Partie a deux, Notifications, Outils, Fermer',
        finished and dialog is not None and dialog.title == 'Sims4MP' and dialog.owner == 'Elise'
-       and labels == [label for _, label in mod.MENU_CHOICES]
+       and labels == ['Partie à deux…', 'Notifications…', 'Outils…', 'Fermer']
        and all(r.ui_request == 0 for r in dialog.responses), str(labels))
+report('en-tete seul : version, aucune partie, niveau de notifications',
+       dialog.text.splitlines() == ['Sims4MP {}'.format(mod.MOD_VERSION), 'Vous jouez seul : aucune partie à deux.',
+                                    'Notifications : tout.'], dialog.text)
 shown = len(DIALOGS)
 mod.mp_menu()
 report('commande mp.menu : ouvre la meme fenetre',
        len(DIALOGS) == shown + 1 and DIALOGS[-1].title == 'Sims4MP'
        and [r.text() for r in DIALOGS[-1].responses] == labels)
 
-# --- 3. Niveaux de notifications ----------------------------------------------------------
+
+def screen_labels():
+    return [r.text() for r in DIALOGS[-1].responses]
+
+
+# --- 3. Sous-ecran Notifications, choix actuel marque --------------------------------------
+DIALOGS[-1].click(mod.MENU_NOTIFY)
+report('« Notifications… » : 3 niveaux, le niveau actuel marque, Retour',
+       DIALOGS[-1].title == 'Notifications' and screen_labels() == [
+           'Notifications : toutes (choix actuel)', 'Notifications : importantes seulement',
+           'Notifications : aucune', 'Retour'], str(screen_labels()))
 del notes[:]
-dialog.click(2)
-report('« importantes seulement » : choisi et confirme', mod._notify['level'] == 'important'
-       and notes == ['Notifications : importantes seulement.'])
+DIALOGS[-1].click(2)
+report('« importantes seulement » : choisi, confirme, l\'ecran se rouvre avec la nouvelle marque',
+       mod._notify['level'] == 'important' and notes == ['Notifications : importantes seulement.']
+       and screen_labels()[1] == 'Notifications : importantes seulement (choix actuel)'
+       and screen_labels()[0] == 'Notifications : toutes')
 del notes[:]
 mod.bridge_notify('L\'autre joueur contrôle Alex.', important=False)
 mod.bridge_notify('Connexion à l\'hôte perdue.')
 report('niveau « important » : notifications secondaires masquees, importantes affichees',
        notes == ['Connexion à l\'hôte perdue.'] and mod._notify['hidden'] == 1)
-mod.open_menu()
 DIALOGS[-1].click(3)
 mod.bridge_notify('Connexion à l\'hôte perdue.')
 report('niveau « aucune » : plus rien', mod._notify['level'] == 'rien' and notes == ['Connexion à l\'hôte perdue.'])
-mod.open_menu()
 DIALOGS[-1].click(1)
 mod.bridge_notify('L\'autre joueur contrôle Alex.', important=False)
 report('niveau « toutes » : tout revient', notes[-1] == 'L\'autre joueur contrôle Alex.')
+DIALOGS[-1].click(mod.MENU_BACK)
+report('« Retour » : ecran principal', DIALOGS[-1].title == 'Sims4MP')
 
-# --- 4. Etat de la partie et jouer seul -------------------------------------------------
+# --- 4. Partie a deux : heberger, rejoindre (saisie de l'IP), etat, jouer seul -------------
+started = []
+mod._start_host = lambda port: (started.append(('host', port)) or True, None)
+mod._start_client = lambda ip, port: (started.append(('join', ip, port)) or True, None)
+mod._pump['installed'] = True
+mod._local_ips = lambda: ['192.168.1.50']
+mod.open_menu()
+DIALOGS[-1].click(mod.MENU_PARTY)
+report('« Partie à deux… » sans partie : Heberger, Rejoindre, Etat, Retour',
+       DIALOGS[-1].title == 'Partie à deux' and screen_labels() == [
+           'Héberger la partie', 'Rejoindre un hôte…', 'État de la partie', 'Retour'], str(screen_labels()))
+del notes[:]
+DIALOGS[-1].click(mod.MENU_HOST)
+report('« Héberger » : ecoute sur le port par defaut, IP de ce PC annoncee',
+       started == [('host', mod.DEFAULT_PORT)] and any('192.168.1.50' in n for n in notes), str(notes))
+mod.open_menu('party')
+DIALOGS[-1].click(mod.MENU_JOIN)
+join = DIALOGS[-1]
+field = join.kwargs['text_inputs'][mod.JOIN_INPUT]
+report('« Rejoindre un hôte… » : fenetre de saisie d\'une ligne (21 caracteres, boutons Rejoindre/Annuler)',
+       join.title == 'Rejoindre un hôte' and field.sort_order == 0 and field.check_profanity is False
+       and join.kwargs['text_ok']() == 'Rejoindre' and join.kwargs['text_cancel']() == 'Annuler'
+       and field.default_text() == '192.168.1.20')
+del started[:]
+join.type_and_click('192.168.1.20', ButtonType.DIALOG_RESPONSE_CANCEL)
+report('« Annuler » : rien n\'est lance', started == [])
+join.type_and_click('  192.168.1.20:7790 ', -1)
+report('IP:port tapes : connexion vers cet hote et ce port', started == [('join', '192.168.1.20', 7790)])
+del started[:]
+del notes[:]
+count = len(DIALOGS)
+join.type_and_click('192.168.1', -1)
+report('IP invalide : rien n\'est lance, alerte, la saisie se rouvre avec le texte tape',
+       started == [] and any('adresse IP invalide' in n for n in notes) and len(DIALOGS) == count + 1
+       and DIALOGS[-1].kwargs['text_inputs'][mod.JOIN_INPUT].initial_value() == '192.168.1')
+report('lecture de « ip[:port] »',
+       mod.parse_join_target('10.0.0.5', 7777) == (('10.0.0.5', 7777), None)
+       and mod.parse_join_target('10.0.0.5:80', 7777)[0] is None
+       and mod.parse_join_target('10.0.0.5:abc', 7777)[0] is None
+       and mod.parse_join_target('', 7777)[0] is None)
+
+guest = types.SimpleNamespace(role='client', handshake_done=True, rtt_ms=12.4,
+                              endpoint=types.SimpleNamespace(is_connected=True, port=7777),
+                              state_received={'game_time': '08:15 (jour 2, semaine 0)'})
+mod._session = guest
+header = mod.menu_header_lines()
+report('en-tete en partie : role, autre joueur connecte avec ping, heure de l\'hote',
+       header == ['Sims4MP {}'.format(mod.MOD_VERSION), 'Vous êtes l\'invité.',
+                  'Autre joueur : connecté, ping 12 ms.', 'Heure de l\'hôte : 08:15 (jour 2, semaine 0).'],
+       str(header))
+guest.role = 'host'
+mod.open_menu('party')
+report('« Partie à deux… » en partie (hote) : IP et port de ce PC, Resynchroniser, Jouer seul',
+       'IP de ce PC : 192.168.1.50 , port 7777.' in DIALOGS[-1].text and screen_labels() == [
+           'Resynchroniser maintenant', 'Jouer seul (se déconnecter)', 'État de la partie', 'Retour'],
+       DIALOGS[-1].text)
+del notes[:]
+mod.menu_join('192.168.1.20')
+report('deja en partie : Rejoindre refuse avec un message', any('déjà en cours' in n for n in notes))
+mod._session = None
+
 mod._auto['target'] = ('join', '192.168.1.200', 7777)
-mod.open_menu()
-DIALOGS[-1].click(4)
+mod.open_menu('tools')
+report('« Outils… » : rapport, etat, retour', screen_labels() == [
+    'Enregistrer un rapport', 'État de la partie', 'Retour'], str(screen_labels()))
+DIALOGS[-1].click(mod.MENU_STATUS)
 state = DIALOGS[-1]
-report('« État de la partie » : fenetre de resume', state.title == 'État de la partie'
-       and 'Connexion automatique prévue : invité vers 192.168.1.200.' in state.text, state.text)
-mod.open_menu()
-DIALOGS[-1].click(5)
+report('« État de la partie » : fenetre de resume avec Retour', state.title == 'État de la partie'
+       and 'Connexion automatique prévue : invité vers 192.168.1.200.' in state.text
+       and [r.text() for r in state.responses] == ['Retour'], state.text)
+state.click(mod.MENU_BACK)
+report('Retour depuis l\'etat : revient a l\'ecran d\'origine', DIALOGS[-1].title == 'Outils')
+mod.on_menu_choice(mod.MENU_SOLO)
 report('« Jouer seul » : connexion automatique arretee', mod._auto['target'] is None and mod._session is None)
 count = len(DIALOGS)
 mod.open_menu()
-DIALOGS[-1].click(6)
+DIALOGS[-1].click(mod.MENU_CLOSE)
 report('« Fermer » : rien d\'autre', len(DIALOGS) == count + 1)
 
 # --- 4b. Icone de la roue (sims4mp_icons.package) -----------------------------------------
