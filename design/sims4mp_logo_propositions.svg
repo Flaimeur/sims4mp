@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 520" font-family="Segoe UI, Arial, sans-serif">
+  <!-- Propositions de logo Sims4MP : dessins originaux, aucun element d'EA. -->
+  <defs>
+    <linearGradient id="bgA" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2d6cdf"/><stop offset="1" stop-color="#1b3f8f"/>
+    </linearGradient>
+    <linearGradient id="bgB" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#17a589"/><stop offset="1" stop-color="#0e6655"/>
+    </linearGradient>
+    <linearGradient id="bgC" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f39c12"/><stop offset="1" stop-color="#c0392b"/>
+    </linearGradient>
+
+    <!-- A : deux joueurs cote a cote -->
+    <g id="logoA">
+      <circle cx="64" cy="64" r="60" fill="url(#bgA)" stroke="#ffffff" stroke-width="6"/>
+      <circle cx="46" cy="50" r="13" fill="#ffd166"/>
+      <path d="M22 92 a24 22 0 0 1 48 0 z" fill="#ffd166"/>
+      <circle cx="82" cy="50" r="13" fill="#7ee0c3"/>
+      <path d="M58 92 a24 22 0 0 1 48 0 z" fill="#7ee0c3"/>
+    </g>
+
+    <!-- B : deux fleches qui tournent (synchro) avec un point par joueur -->
+    <g id="logoB">
+      <circle cx="64" cy="64" r="60" fill="url(#bgB)" stroke="#ffffff" stroke-width="6"/>
+      <path d="M36 58 a30 30 0 0 1 52 -18" fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round"/>
+      <path d="M92 26 l-2 22 l-20 -9 z" fill="#ffffff"/>
+      <path d="M92 70 a30 30 0 0 1 -52 18" fill="none" stroke="#ffffff" stroke-width="9" stroke-linecap="round"/>
+      <path d="M36 102 l2 -22 l20 9 z" fill="#ffffff"/>
+      <circle cx="64" cy="64" r="9" fill="#ffd166"/>
+    </g>
+
+    <!-- C : monogramme MP -->
+    <g id="logoC">
+      <circle cx="64" cy="64" r="60" fill="url(#bgC)" stroke="#ffffff" stroke-width="6"/>
+      <text x="64" y="80" text-anchor="middle" font-size="50" font-weight="800" fill="#ffffff" letter-spacing="-2">MP</text>
+    </g>
+  </defs>
+
+  <rect width="900" height="520" fill="#f4f1ea"/>
+  <text x="450" y="44" text-anchor="middle" font-size="26" font-weight="700" fill="#333">Sims4MP — propositions de logo</text>
+
+  <!-- Grand format -->
+  <use href="#logoA" transform="translate(95 80) scale(1.4)"/>
+  <use href="#logoB" transform="translate(360 80) scale(1.4)"/>
+  <use href="#logoC" transform="translate(625 80) scale(1.4)"/>
+  <text x="185" y="290" text-anchor="middle" font-size="22" font-weight="700" fill="#222">A · Deux joueurs</text>
+  <text x="450" y="290" text-anchor="middle" font-size="22" font-weight="700" fill="#222">B · Synchro</text>
+  <text x="715" y="290" text-anchor="middle" font-size="22" font-weight="700" fill="#222">C · Monogramme</text>
+
+  <!-- Taille reelle approximative dans la roue (comme le coeur de Wicked) -->
+  <text x="450" y="345" text-anchor="middle" font-size="16" fill="#555">Taille dans la roue (environ 32 px), à côté d'un bouton :</text>
+  <g transform="translate(70 375)">
+    <rect x="18" y="8" width="170" height="30" rx="15" fill="#ffffff" stroke="#c9c9c9"/>
+    <text x="110" y="29" text-anchor="middle" font-size="15" fill="#1f4fa8">Sims4MP…</text>
+    <use href="#logoA" transform="scale(0.36)"/>
+  </g>
+  <g transform="translate(345 375)">
+    <rect x="18" y="8" width="170" height="30" rx="15" fill="#ffffff" stroke="#c9c9c9"/>
+    <text x="110" y="29" text-anchor="middle" font-size="15" fill="#1f4fa8">Sims4MP…</text>
+    <use href="#logoB" transform="scale(0.36)"/>
+  </g>
+  <g transform="translate(620 375)">
+    <rect x="18" y="8" width="170" height="30" rx="15" fill="#ffffff" stroke="#c9c9c9"/>
+    <text x="110" y="29" text-anchor="middle" font-size="15" fill="#1f4fa8">Sims4MP…</text>
+    <use href="#logoC" transform="scale(0.36)"/>
+  </g>
+  <text x="450" y="480" text-anchor="middle" font-size="14" fill="#777">Dessins originaux (formes simples), aucun élément d'EA. Couleurs modifiables.</text>
+</svg>
