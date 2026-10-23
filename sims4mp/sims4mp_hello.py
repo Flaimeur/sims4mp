@@ -1,4 +1,6 @@
-# Sims 4 Multiplayer - mp.solo (0.15.1) : jouer seul jusqu'a la fermeture du jeu (session
+# Sims 4 Multiplayer - diagnostic menu (0.15.2) : create_pie_menu_message suivi, le journal
+# note si le bouton Sims4MP est dans le message final de la roue (nom, priorite).
+# mp.solo (0.15.1) : jouer seul jusqu'a la fermeture du jeu (session
 # fermee, pause levee, reglage du lanceur ignore aux chargements suivants).
 # Latence (0.15.0) : TCP_NODELAY regle par le mod sur la socket connectee
 # (transport.py inchange), envoi immediat en fin de passage de pompe et au clic (ordres,
@@ -179,7 +181,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.15.1'
+MOD_VERSION = '0.15.2'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -3044,6 +3046,40 @@ def _install_menu_diag_hook():
     ChoiceMenu.add_potential_aops = add_potential_aops
     ChoiceMenu.add_aop = add_aop
     _install_rollback_diag_hook()
+    _install_pie_message_diag_hook()
+
+
+def _install_pie_message_diag_hook():
+    """generate_choices appelle create_pie_menu_message (nom global du module
+    server_commands.interaction_commands) : on note si le bouton Sims4MP est dans le
+    message final envoye a l'affichage (champs items[].affordance_id / loc_string)."""
+    import server_commands.interaction_commands as commands_module
+    original = commands_module.create_pie_menu_message
+    if getattr(original, '_sims4mp_hook', False):
+        return
+
+    @functools.wraps(original)
+    def create_pie_menu_message(sim, choice_menu, *args, **kwargs):
+        msg = original(sim, choice_menu, *args, **kwargs)
+        try:
+            menu = _menu['affordance']
+            if menu is not None and choice_menu is not None:
+                proposed = any(getattr(getattr(item, 'aop', None), 'affordance', None) is menu
+                               for _, item in choice_menu)
+                if proposed:
+                    items = list(getattr(msg, 'items', ()))
+                    mine = [item for item in items if getattr(item, 'affordance_id', None) == menu.guid64]
+                    _menu_diag('message de la roue : {} bouton(s), Sims4MP {}{}'.format(
+                        len(items), 'present' if mine else 'ABSENT',
+                        ' (nom {!r}, priorite {!r})'.format(
+                            str(getattr(mine[0], 'loc_string', ''))[:120],
+                            getattr(mine[0], 'pie_menu_priority', None)) if mine else ''))
+        except Exception:
+            _menu_diag('erreur diagnostic message : ' + traceback.format_exc().strip().splitlines()[-1])
+        return msg
+
+    create_pie_menu_message._sims4mp_hook = True
+    commands_module.create_pie_menu_message = create_pie_menu_message
 
 
 def _install_rollback_diag_hook():

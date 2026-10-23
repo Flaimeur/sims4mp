@@ -149,6 +149,9 @@ class ChoiceMenu(object):
     def __init__(self):
         self.items = []
 
+    def __iter__(self):
+        return iter([(n, types.SimpleNamespace(aop=aop)) for n, aop in enumerate(self.items)])
+
     def add_potential_aops(self, target, context, potential_aops, scoring_gsi_handler=None):
         for aop in potential_aops:
             self.add_aop(aop, context, user_pick_target=target)
@@ -187,6 +190,18 @@ def create_pie_menu_message(items, fail):
     with ProtocolBufferRollback(items):
         if fail:
             raise TypeError('nom du bouton impossible')
+
+
+def game_pie_message(sim, choice_menu, reference_id=0, drop_guid=None):
+    """Comme interaction_commands.create_pie_menu_message : un item par aop du menu."""
+    items = [types.SimpleNamespace(affordance_id=item.aop.affordance.guid64, loc_string='nom',
+                                   pie_menu_priority=0)
+             for _, item in choice_menu if item.aop.affordance.guid64 != drop_guid]
+    return types.SimpleNamespace(items=items)
+
+
+module('server_commands')
+module('server_commands.interaction_commands', create_pie_menu_message=game_pie_message)
 
 
 class TravelWithPicker(PickerSuperInteractionMixin, ImmediateSuperInteraction):
@@ -335,6 +350,14 @@ with open(mod.LOG_PATH, encoding='utf-8') as handle:
 report('bouton retire par le jeu : erreur avalee notee avec sa trace (roue seulement)',
        buttons == ['bouton'] and 'bouton retire par le jeu' in text and 'nom du bouton impossible' in text
        and 'hors de la roue' not in text)
+commands_module = sys.modules['server_commands.interaction_commands']
+commands_module.create_pie_menu_message(None, pie)
+commands_module.create_pie_menu_message(None, pie, 0, drop_guid=menu.guid64)
+with open(mod.LOG_PATH, encoding='utf-8') as handle:
+    text = handle.read()
+report('message final : presence du bouton Sims4MP notee (present puis absent)',
+       getattr(commands_module.create_pie_menu_message, '_sims4mp_hook', False)
+       and 'Sims4MP present (nom' in text and 'Sims4MP ABSENT' in text)
 
 # --- 2. La fenetre ----------------------------------------------------------------------
 result = menu()._run_interaction_gen(None)
