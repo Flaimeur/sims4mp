@@ -62,6 +62,9 @@ PRESENCE_INTERVAL = 2.0
 PRESENCE_TIMEOUT = 10.0                  # sans nouvelles depuis 10 s : l'invite a quitte
 PRESENCE_REQUEST_TIMEOUT = 3
 MAX_GUESTS = 8
+# L'hote peut mettre son mod a jour sans fermer la room : version et liste des mods sont
+# relues avant de servir /info et /mods, au plus une fois toutes les HOST_REFRESH_GAP s.
+HOST_REFRESH_GAP = 5.0
 PSEUDO_MAX = 24
 PSEUDO_HEADER = 'X-Sims4MP-Pseudo'       # UTF-8 encode en %XX (en-tetes HTTP en latin-1)
 SESSION_HEADER = 'X-Sims4MP-Session'
@@ -331,6 +334,7 @@ class RoomServer:
         self.sharing_open = True         # la partie est-elle encore telechargeable ?
         self.launch_token = None         # dernier signal « Lancer pour tous »
         self._clock = time.monotonic     # remplacable en test
+        self._refreshed_at = None        # derniere relecture du mod et des mods de l'hote
 
     def update_guest(self, session, ip, pseudo, state, allowed):
         """Enregistre la presence d'un invite. Renvoie son accord ('attente', 'accepte',
@@ -472,7 +476,29 @@ class RoomServer:
         if self.mods_dir is not None:
             # Inventaire fait ici (tache de fond) : /mods repond ensuite sans attendre.
             self.mods = mods_cmp.mods_list(self.mods_dir, self.mods_sha, self.mods_cache)
+        self._refreshed_at = self._clock()
         return self.info
+
+    def refresh_host(self, force=False):
+        """Relit la version du mod et la liste des mods de l'hote (mise a jour pendant que la
+        room est ouverte). Au plus une fois toutes les HOST_REFRESH_GAP s, sauf force."""
+        if self.mods_dir is None or self.info is None:
+            return
+        now = self._clock()
+        with self._lock:
+            if not force and self._refreshed_at is not None and now - self._refreshed_at < HOST_REFRESH_GAP:
+                return
+            self._refreshed_at = now
+        mod = self.mods_dir / core.MOD_FILE
+        version = core.read_mod_version(mod) if mod.is_file() else 'inconnue'
+        mods = mods_cmp.mods_list(self.mods_dir, self.mods_sha, self.mods_cache)
+        with self._lock:
+            old = self.info['version_mod']
+            self.mod_version = version
+            self.info = dict(self.info, version_mod=version)
+            self.mods = mods
+        if version != old:
+            self._event('Mod de l\'hôte mis à jour : version {} (avant : {})'.format(version, old))
 
     def mod_file(self, index):
         """(chemin, entree, None) pour le n-ieme mod de la liste, sinon (None, entree ou None, raison).
@@ -528,6 +554,8 @@ class RoomServer:
                     status, reason = room.authorize(self.headers.get(SESSION_HEADER, ''), client, self.path)
                     if status is not None:
                         return self._deny(status, reason)
+                if self.path in ('/info', '/mods'):
+                    room.refresh_host()                  # mod de l'hote peut-etre mis a jour depuis
                 if self.path == '/info':
                     body = json.dumps(room.info).encode('utf-8')
                     self.send_response(200)

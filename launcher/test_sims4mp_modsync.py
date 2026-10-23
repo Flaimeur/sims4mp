@@ -68,6 +68,34 @@ class ModSyncTest(unittest.TestCase):
                 found.setdefault(path.name, []).append(path.relative_to(folder).as_posix())
         return found
 
+    def test_host_mod_updated_while_room_open(self):
+        from test_sims4mp_update import mod_bytes
+        put(self.host_mods, core.MOD_FILE, mod_bytes('0.4.0'))
+        server, port = self.open_room()
+        now = [1000.0]
+        server._clock = lambda: now[0]
+        server._refreshed_at = now[0]
+        info = room.fetch_room_info('127.0.0.1', port, CODE, SESSION)
+        self.assertEqual(info['version_mod'], '0.4.0')
+        # L'hote installe une nouvelle version et un nouveau mod sans fermer la room.
+        put(self.host_mods, core.MOD_FILE, mod_bytes('0.5.0'))
+        put(self.host_mods, 'nouveau.package', b'nouveau mod')
+        now[0] += 1.0                                   # moins de 5 s : pas encore relu
+        self.assertEqual(room.fetch_room_info('127.0.0.1', port, CODE, SESSION)['version_mod'], '0.4.0')
+        now[0] += room.HOST_REFRESH_GAP
+        info = room.fetch_room_info('127.0.0.1', port, CODE, SESSION)
+        self.assertEqual(info['version_mod'], '0.5.0')
+        self.assertTrue(any('Mod de l\'hôte mis à jour : version 0.5.0 (avant : 0.4.0)' in e
+                            for e in server.take_events()))
+        now[0] += room.HOST_REFRESH_GAP
+        listed = room.fetch_mods_list('127.0.0.1', port, CODE, SESSION)
+        self.assertIn('nouveau.package', [m['chemin'] for m in listed['mods']])
+        # L'invite compare avec la version actuelle de l'hote, pas celle de la creation de la room.
+        (self.guest_mods.parent / 'saves').mkdir(exist_ok=True)
+        (self.guest_mods / core.MOD_FILE).write_bytes(mod_bytes('0.4.0'))
+        with self.assertRaisesRegex(room.RoomError, '0.5.0'):
+            room.plan_join(info, self.guest_docs, is_running=lambda: False)
+
     def test_plan_writes_nothing(self):
         server, port = self.open_room()
         before = tree_snapshot(self.guest_mods)
