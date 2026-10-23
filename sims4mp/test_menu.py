@@ -372,6 +372,11 @@ report('cliquer « Sims4MP… » ouvre une fenetre du jeu avec un bouton par cho
        finished and dialog is not None and dialog.title == 'Sims4MP' and dialog.owner == 'Elise'
        and labels == [label for _, label in mod.MENU_CHOICES]
        and all(r.ui_request == 0 for r in dialog.responses), str(labels))
+shown = len(DIALOGS)
+mod.mp_menu()
+report('commande mp.menu : ouvre la meme fenetre',
+       len(DIALOGS) == shown + 1 and DIALOGS[-1].title == 'Sims4MP'
+       and [r.text() for r in DIALOGS[-1].responses] == labels)
 
 # --- 3. Niveaux de notifications ----------------------------------------------------------
 del notes[:]

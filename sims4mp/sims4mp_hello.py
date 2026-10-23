@@ -1,4 +1,5 @@
-# Sims 4 Multiplayer - diagnostic menu (0.15.2) : create_pie_menu_message suivi, le journal
+# Sims 4 Multiplayer - mp.menu (0.15.3) : ouvre la fenetre Sims4MP sans passer par la roue.
+# Diagnostic menu (0.15.2) : create_pie_menu_message suivi, le journal
 # note si le bouton Sims4MP est dans le message final de la roue (nom, priorite).
 # mp.solo (0.15.1) : jouer seul jusqu'a la fermeture du jeu (session
 # fermee, pause levee, reglage du lanceur ignore aux chargements suivants).
@@ -181,7 +182,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.15.2'
+MOD_VERSION = '0.15.3'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -3715,6 +3716,18 @@ def mp_disconnect(_connection=None):
     except Exception:
         log('ERREUR mp.disconnect :\n' + traceback.format_exc())
         output('Erreur dans mp.disconnect (voir le journal).')
+
+
+@sims4.commands.Command('mp.menu', command_type=sims4.commands.CommandType.Live)
+def mp_menu(_connection=None):
+    """Ouvre la fenetre Sims4MP (memes choix que l'entree de la roue Maj + clic)."""
+    output = sims4.commands.CheatOutput(_connection)
+    try:
+        open_menu()
+        log('mp.menu : fenetre Sims4MP ouverte')
+    except Exception:
+        log('ERREUR mp.menu :\n' + traceback.format_exc())
+        output('Erreur dans mp.menu (voir le journal).')
 
 
 @sims4.commands.Command('mp.solo', command_type=sims4.commands.CommandType.Live)
