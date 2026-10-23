@@ -552,6 +552,78 @@ class UpdateWindowTest(TempDirTest):
         self.assertEqual(gui.read_prefs(gui.prefs_path()), {'version_test': False, 'retour_arriere': True})
 
 
+RELEASES_URL = 'https://api.github.com/repos/Flaimeur/sims4mp/releases?per_page=30'
+
+
+class ReleaseTagsTest(unittest.TestCase):
+    def releases(self, data):
+        opener = FakeOpener({RELEASES_URL: data if isinstance(data, bytes) else json_bytes(data)})
+        return gui.fetch_release_tags('Flaimeur/sims4mp', opener), opener
+
+    def test_tags_listed_newest_first_with_status_and_date(self):
+        tags, opener = self.releases([
+            {'tag_name': 'v0.17.0', 'prerelease': True, 'draft': False, 'published_at': '2026-10-23T19:40:00Z'},
+            {'tag_name': 'v0.16.1', 'prerelease': False, 'draft': False, 'published_at': '2026-10-23T18:00:00Z'},
+            {'tag_name': 'brouillon', 'prerelease': True, 'draft': True, 'published_at': None},
+            {'tag_name': '../piege', 'prerelease': False},
+            {'tag_name': 42}, 'pas un objet',
+            {'tag_name': 'v0.1.0', 'prerelease': False, 'published_at': 'date bizarre'}])
+        self.assertEqual(opener.requested, [RELEASES_URL])
+        self.assertEqual(tags, [{'tag': 'v0.17.0', 'statut': 'test', 'date': '2026-10-23'},
+                                {'tag': 'v0.16.1', 'statut': 'stable', 'date': '2026-10-23'},
+                                {'tag': 'v0.1.0', 'statut': 'stable', 'date': ''}])
+        self.assertEqual(gui.tag_label(tags[0]), 'v0.17.0 · test · 23/10/2026')
+        self.assertEqual(gui.tag_label(tags[2]), 'v0.1.0 · stable')
+
+    def test_bad_answers_refused(self):
+        for bad in [b'pas du json', json_bytes({'message': 'API rate limit exceeded'})]:
+            with self.assertRaises(gui.LauncherError, msg=bad[:20]):
+                self.releases(bad)
+        with self.assertRaises(ValueError):
+            gui.fetch_release_tags('pas un depot', FakeOpener({}))
+
+
+class TagsWindowTest(TempDirTest):
+    def test_menu_save_and_check(self):
+        import tkinter as tk
+        (self.tmp / 'Electronic Arts').mkdir()
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        app = gui.LauncherApp(root, documents=self.tmp)
+        app.repo.set('Flaimeur/sims4mp')
+        app.tag_mode.set('tag')
+        app._on_tag_mode()
+        self.assertEqual(str(app.tags_button.cget('state')), 'normal')
+        app._fill_tags('Flaimeur/sims4mp', [{'tag': 'v0.17.0', 'statut': 'test', 'date': '2026-10-23'}])
+        self.assertEqual(list(app.tag_entry.cget('values')), ['v0.17.0 · test · 23/10/2026'])
+        app.tag.set('v0.17.0 · test · 23/10/2026')                # choix dans le menu
+        app._on_tag_selected()
+        self.assertEqual(app.tag.get(), 'v0.17.0')
+        checked = []
+        app._check_manifest = lambda: checked.append(app.tag.get())
+        app._save_config()
+        self.assertEqual(gui.read_config(gui.config_path()), {'depot': 'Flaimeur/sims4mp', 'tag': 'v0.17.0'})
+        self.assertEqual(checked, ['v0.17.0'])                    # verification juste apres
+        app.tag_mode.set('latest')
+        app._on_tag_mode()
+        self.assertEqual(str(app.tags_button.cget('state')), 'disabled')
+
+    def test_invalid_form_not_saved_nor_checked(self):
+        import tkinter as tk
+        (self.tmp / 'Electronic Arts').mkdir()
+        root = tk.Tk()
+        root.withdraw()
+        self.addCleanup(root.destroy)
+        app = gui.LauncherApp(root, documents=self.tmp)
+        app.repo.set('pas un depot')
+        checked = []
+        app._check_manifest = lambda: checked.append(1)
+        app._save_config()
+        self.assertEqual(checked, [])
+        self.assertFalse(gui.config_path().exists())
+
+
 class PrefsTest(TempDirTest):
     def test_defaults_when_missing(self):
         self.assertEqual(gui.read_prefs(self.tmp / 'absent.json'), {'version_test': False, 'retour_arriere': False})

@@ -1181,6 +1181,49 @@ def download_mod(manifest, temp_dir, opener, timeout=DOWNLOAD_TIMEOUT):
     return tmp
 
 
+RELEASES_API = 'https://api.github.com/repos/{}/releases?per_page=30'
+MAX_RELEASES_SIZE = 1024 * 1024
+
+
+def fetch_release_tags(repo, opener, timeout=DOWNLOAD_TIMEOUT):
+    """Releases publiees du depot (API publique GitHub, sans jeton) : liste de
+    {'tag', 'statut' ('stable' ou 'test'), 'date' (AAAA-MM-JJ)}, la plus recente d'abord.
+    Les brouillons et les tags invalides sont ignores."""
+    url = require_https(RELEASES_API.format(validate_repo(repo)), 'Liste des versions')
+    buffer = _BytesSink()
+    read_limited(url, buffer, MAX_RELEASES_SIZE, timeout, opener)
+    try:
+        data = json.loads(bytes(buffer.data).decode('utf-8'))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LauncherError('Liste des versions illisible (JSON invalide) : {}'.format(exc)) from None
+    if not isinstance(data, list):
+        raise LauncherError('Liste des versions illisible : liste attendue.')
+    tags = []
+    for release in data:
+        if not isinstance(release, dict) or release.get('draft') is True:
+            continue
+        tag = release.get('tag_name')
+        try:
+            if not isinstance(tag, str) or not validate_tag(tag):
+                continue
+        except ValueError:
+            continue
+        date = release.get('published_at')
+        date = date[:10] if isinstance(date, str) and re.match(r'\d{4}-\d{2}-\d{2}', date) else ''
+        tags.append({'tag': tag, 'statut': STATUS_TEST if release.get('prerelease') is True else STATUS_STABLE,
+                     'date': date})
+    return tags
+
+
+def tag_label(entry):
+    """Texte du menu deroulant : « v0.17.0 · test · 23/10/2026 »."""
+    parts = [entry['tag'], entry['statut']]
+    if entry['date']:
+        year, month, day = entry['date'].split('-')
+        parts.append('{}/{}/{}'.format(day, month, year))
+    return ' · '.join(parts)
+
+
 def fetch_icons_manifest(url, opener, timeout=DOWNLOAD_TIMEOUT):
     """Manifeste de l'icone, ou None si la release n'en a pas (HTTP 404, releases < 0.16.0)."""
     url = require_https(url, 'URL du manifeste de l\'icone')
@@ -1824,8 +1867,16 @@ class LauncherApp:
 
         ttk.Label(gh, text='Tag', style='Muted.TLabel').grid(row=4, column=0, sticky='w', pady=GAP, padx=(0, PAD))
         self.tag = tk.StringVar()
-        self.tag_entry = ttk.Entry(gh, textvariable=self.tag, width=16)
-        self.tag_entry.grid(row=4, column=1, sticky='w', pady=GAP)
+        tag_row = ttk.Frame(gh)
+        tag_row.grid(row=4, column=1, sticky='w', pady=GAP)
+        # Menu deroulant des versions publiees (on peut aussi taper un tag a la main).
+        self.tag_entry = ttk.Combobox(tag_row, textvariable=self.tag, width=30)
+        self.tag_entry.pack(side='left')
+        self.tag_entry.bind('<<ComboboxSelected>>', self._on_tag_selected)
+        self.tags_button = ttk.Button(tag_row, text='Actualiser la liste', command=self._refresh_tags)
+        self.tags_button.pack(side='left', padx=(GAP, 0))
+        self.tag_labels = {}                 # texte du menu -> tag
+        self.tags_loaded_for = None          # depot dont la liste a deja ete lue
 
         ttk.Label(gh, text='Manifeste', style='Muted.TLabel').grid(row=5, column=0, sticky='nw', pady=GAP, padx=(0, PAD))
         self.manifest_preview = ttk.Label(gh, wraplength=330, justify='left')
@@ -1838,7 +1889,7 @@ class LauncherApp:
         buttons.grid(row=7, column=0, columnspan=2, sticky='ew', pady=(PAD, 0))
         buttons.columnconfigure(0, weight=1)
         buttons.columnconfigure(1, weight=1)
-        ttk.Button(buttons, text='Enregistrer', style='Accent.TButton', command=self._save_config).grid(
+        ttk.Button(buttons, text='Enregistrer et vérifier', style='Accent.TButton', command=self._save_config).grid(
             row=0, column=0, sticky='ew', padx=(0, GAP // 2))
         self.check_button = ttk.Button(buttons, text='Tester le manifeste', command=self._check_manifest)
         self.check_button.grid(row=0, column=1, sticky='ew', padx=(GAP // 2, 0))
@@ -1919,6 +1970,15 @@ class LauncherApp:
         self.pages[key].tkraise()
         if key == 'mod' and hasattr(self, 'backups'):
             self._refresh_backups()
+        if key == 'options' and hasattr(self, 'tags_loaded_for') and not self.installing:
+            # Premiere visite (ou depot change) : la liste des versions se remplit seule.
+            try:
+                repo = validate_repo(self.repo.get())
+            except ValueError:
+                repo = None
+            if repo is not None and repo != self.tags_loaded_for:
+                self.tags_loaded_for = repo          # un seul essai automatique ; le bouton reste la
+                self._refresh_tags()
         for name, (bar, button) in self.nav.items():
             active = name == key
             bar.configure(style='NavBarOn.TFrame' if active else 'NavBarOff.TFrame')
@@ -2049,8 +2109,41 @@ class LauncherApp:
         self.manifest_preview.configure(text=text, style=style)
 
     def _on_tag_mode(self):
-        self.tag_entry.configure(state='normal' if self.tag_mode.get() == 'tag' else 'disabled')
+        state = 'normal' if self.tag_mode.get() == 'tag' else 'disabled'
+        self.tag_entry.configure(state=state)
+        self.tags_button.configure(state=state)
         self._refresh_manifest_preview()
+
+    def _on_tag_selected(self, event=None):
+        # Le menu montre « v0.17.0 · test · 23/10/2026 » ; seul le tag est garde.
+        tag = self.tag_labels.get(self.tag.get())
+        if tag is not None:
+            self.tag.set(tag)
+
+    def _refresh_tags(self):
+        try:
+            repo = validate_repo(self.repo.get())
+        except ValueError as exc:
+            self.show(str(exc), 'error')
+            self.set_status(str(exc), 'error')
+            return
+        found = {}
+
+        def task():
+            tags = fetch_release_tags(repo, make_https_opener())
+            found['tags'] = tags
+            tests = sum(1 for t in tags if t['statut'] == STATUS_TEST)
+            return (['Versions publiées sur {} : {} ({} de test)'.format(repo, len(tags), tests)],
+                    '{} version(s) trouvée(s)'.format(len(tags)))
+
+        def after():
+            self._fill_tags(repo, found.get('tags', []))
+        self._start_task('Lecture des versions publiées...', lambda: self._run_worker(task), after=after)
+
+    def _fill_tags(self, repo, tags):
+        self.tag_labels = {tag_label(t): t['tag'] for t in tags}
+        self.tag_entry.configure(values=[tag_label(t) for t in tags])
+        self.tags_loaded_for = repo
 
     def _save_config(self):
         try:
@@ -2062,6 +2155,7 @@ class LauncherApp:
         self.show('Options enregistrees : {}'.format(manifest_url_for(data['depot'], data['tag'])), 'ok')
         self.set_status('Options enregistrées', 'ok')
         self._refresh_source_label()
+        self._check_manifest()                       # verification juste apres l'enregistrement
 
     def _refresh_source_label(self):
         """Page Mod : d'ou le mod sera telecharge, d'apres les options enregistrees."""

@@ -101,8 +101,11 @@ class OptionsWindowTest(TempDirTest):
         self.assertNotIn('disabled', app.tag_entry.state())
         app.tag.set('v0.4.0')
         self.assertIn('/releases/download/v0.4.0/', app.manifest_preview.cget('text'))
+        checked = []
+        app._check_manifest = lambda: checked.append(True)       # pas de reseau dans le test
         app._save_config()
         self.assertEqual(str(app.status.cget('style')), 'StatusOk.TLabel')
+        self.assertEqual(checked, [True])                         # Enregistrer verifie aussi le manifeste
         app2 = self.make_app()
         self.assertEqual((app2.repo.get(), app2.tag_mode.get(), app2.tag.get()),
                          ('Flaimeur/sims4mp', 'tag', 'v0.4.0'))
