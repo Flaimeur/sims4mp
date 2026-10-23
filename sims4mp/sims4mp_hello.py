@@ -1,4 +1,6 @@
-# Sims 4 Multiplayer - icone de la roue (0.16.0) : logo « deux joueurs » (dessin original) en
+# Sims 4 Multiplayer - icone DDS (0.16.1) : l'image PNG s'affichait en lama ; l'icone est
+# maintenant un DDS 32 bits (Types.DDS), le format des icones qui s'affichent dans la roue.
+# Icone de la roue (0.16.0) : logo « deux joueurs » (dessin original) en
 # ressource PNG dans sims4mp_icons.package (icon_package.py) ; le bouton l'affiche via
 # pie_menu_icon quand ce fichier est dans Mods, sinon il reste sans icone.
 # Menu sans categorie (0.15.4) : le bouton « Sims4MP… » n'herite plus de
@@ -187,7 +189,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.16.0'
+MOD_VERSION = '0.16.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -2615,7 +2617,7 @@ def _install_traffic_hook():
 
 MENU_NAME = 'sims4mp_menu'
 MENU_LABEL = 'Sims4MP…'
-MENU_ICON_INSTANCE = 0x80EB131F7361E9AA   # image PNG de sims4mp_icons.package (icon_package.ICON_INSTANCE)
+MENU_ICON_INSTANCE = 0x80EB131F7361E9AA   # image DDS de sims4mp_icons.package (icon_package.ICON_INSTANCE)
 MENU_CHOICES = (
     (1, 'Notifications : toutes'),
     (2, 'Notifications : importantes seulement'),
@@ -2758,13 +2760,14 @@ def _menu_base_ok(affordance):
 
 
 def bridge_menu_icon():
-    """Icone de la roue (0.16.0) : l'image PNG du fichier sims4mp_icons.package, ou None si
-    ce fichier n'est pas dans Mods. Bytecode verifie : get_resource_key(instance, Types.PNG),
+    """Icone de la roue : l'image DDS du fichier sims4mp_icons.package, ou None si ce fichier
+    n'est pas dans Mods. Bytecode verifie : get_resource_key(instance, Types.DDS),
     sims4.resources.does_key_exist(cle), IconInfoData(icon_resource=cle) ; le jeu appelle
-    cls.pie_menu_icon(resolver) (Interaction.get_pie_menu_icon_info)."""
+    cls.pie_menu_icon(resolver) (Interaction.get_pie_menu_icon_info). 0.16.1 : DDS et non PNG
+    (une image PNG s'affichait en lama dans la roue)."""
     import sims4.resources
     from distributor.shared_messages import IconInfoData
-    key = sims4.resources.get_resource_key(MENU_ICON_INSTANCE, sims4.resources.Types.PNG)
+    key = sims4.resources.get_resource_key(MENU_ICON_INSTANCE, sims4.resources.Types.DDS)
     if not sims4.resources.does_key_exist(key):
         return None
     return lambda resolver: IconInfoData(icon_resource=key)

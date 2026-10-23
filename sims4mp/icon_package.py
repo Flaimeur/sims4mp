@@ -8,11 +8,16 @@
 #   - sims4.resources.CompoundTypes.IMAGE = [Types.PNG] : les icones sont des ressources PNG
 #     (Types.PNG = 0x2F7D0004) ;
 #   - sims4.resources.get_resource_key(instance, Types.PNG) -> Key(type, instance), groupe 0.
+# 0.16.1 : une ressource PNG est bien trouvee par la simulation mais l'affichage montre le
+# lama (image illisible). Les icones qui s'affichent dans la roue (autres mods) sont des DDS
+# (Types.DDS = 0x00B2D882) : l'icone est donc un DDS 32 bits non compresse (A8R8G8B8) avec
+# mipmaps, le format le plus simple accepte par l'affichage.
 
 import struct
 import zlib
 
 PNG_TYPE = 0x2F7D0004
+DDS_TYPE = 0x00B2D882
 # Identifiant fixe de l'icone : FNV-1a 64 bits de 'sims4mp:icon:menu', bit haut force
 # (convention des contenus personnalises). Le mod utilise la meme valeur (MENU_ICON_INSTANCE).
 ICON_NAME = 'sims4mp:icon:menu'
@@ -106,6 +111,36 @@ def encode_png(rgba, width, height):
             + _chunk(b'IEND', b''))
 
 
+# -- DDS (32 bits non compresse, octets B, G, R, A ; mipmaps jusqu'a 1 x 1) --
+
+DDS_HEADER_FLAGS = 0x0002100F    # CAPS | HEIGHT | WIDTH | PITCH | PIXELFORMAT | MIPMAPCOUNT
+DDS_PIXEL_FLAGS = 0x00000041     # RGB | ALPHAPIXELS
+DDS_CAPS = 0x00401008            # COMPLEX | TEXTURE | MIPMAP
+
+
+def mip_sizes(size):
+    sizes = [size]
+    while sizes[-1] > 1:
+        sizes.append(sizes[-1] // 2)
+    return sizes
+
+
+def encode_dds(size=ICON_SIZE):
+    """DDS carre size x size (puissance de 2), chaque niveau redessine a sa taille."""
+    levels = mip_sizes(size)
+    header = struct.pack('<4sIIIIIII44x', b'DDS ', 124, DDS_HEADER_FLAGS, size, size, size * 4, 0,
+                         len(levels))
+    header += struct.pack('<IIIIIIII', 32, DDS_PIXEL_FLAGS, 0, 32,
+                          0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000)
+    header += struct.pack('<IIIII', DDS_CAPS, 0, 0, 0, 0)
+    body = bytearray()
+    for level in levels:
+        rgba = draw_logo(level, SUPERSAMPLE if level >= 8 else 8)
+        for i in range(0, len(rgba), 4):
+            body += bytes((rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]))
+    return header + bytes(body)
+
+
 # -- .package (DBPF 2.1, ressources non compressees) --
 
 HEADER_SIZE = 96
@@ -157,4 +192,4 @@ def icon_png():
 
 
 def icon_package():
-    return build_package([(PNG_TYPE, 0, ICON_INSTANCE, icon_png())])
+    return build_package([(DDS_TYPE, 0, ICON_INSTANCE, encode_dds())])

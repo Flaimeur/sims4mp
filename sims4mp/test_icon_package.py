@@ -67,10 +67,28 @@ report('.package : en-tete DBPF 2.1, une ressource, index en fin de fichier',
        package[:4] == b'DBPF' and struct.unpack_from('<III', package, 4) == (2, 1, 0)
        and struct.unpack_from('<I', package, 36)[0] == 1
        and struct.unpack_from('<I', package, 64)[0] + struct.unpack_from('<I', package, 44)[0] == len(package))
-report('.package : ressource PNG (0x2F7D0004), groupe 0, identifiant de l\'icone, image 128 x 128',
-       len(resources) == 1 and resources[0][:3] == (ip.PNG_TYPE, 0, ip.ICON_INSTANCE)
-       and resources[0][3] == ip.icon_png()
-       and struct.unpack('>II', png_chunks(resources[0][3])[0][1][:8]) == (128, 128))
+report('.package : ressource DDS (0x00B2D882), groupe 0, identifiant de l\'icone',
+       len(resources) == 1 and resources[0][:3] == (ip.DDS_TYPE, 0, ip.ICON_INSTANCE)
+       and resources[0][3] == ip.encode_dds())
+
+# --- 5. DDS (meme en-tete que les DDS 32 bits qui s'affichent dans la roue) ---------------
+dds = resources[0][3]
+size, flags, height, width, pitch, _, mips = struct.unpack_from('<IIIIIII', dds, 4)
+pf = struct.unpack_from('<IIIIIIII', dds, 76)
+caps = struct.unpack_from('<I', dds, 108)[0]
+report('DDS : en-tete 128 octets, 128 x 128, pitch 512, 8 niveaux',
+       dds[:4] == b'DDS ' and size == 124 and flags == 0x0002100F and (width, height) == (128, 128)
+       and pitch == 512 and mips == 8 and caps == 0x00401008)
+report('DDS : pixels 32 bits A8R8G8B8 (masques standards, sans FourCC)',
+       pf == (32, 0x41, 0, 32, 0x00FF0000, 0x0000FF00, 0x000000FF, 0xFF000000))
+report('DDS : taille = en-tete + tous les niveaux (128 a 1)',
+       len(dds) == 128 + sum(s * s * 4 for s in ip.mip_sizes(128)) and ip.mip_sizes(128)[-1] == 1)
+logo = ip.draw_logo(128)
+first = dds[128:128 + 128 * 128 * 4]
+pos = (50 * 128 + 46) * 4                                          # tete du joueur de gauche (jaune)
+report('DDS : octets dans l\'ordre B, G, R, A',
+       first[pos:pos + 4] == bytes((logo[pos + 2], logo[pos + 1], logo[pos], logo[pos + 3]))
+       and first[pos + 2] == ip.YELLOW[0])
 two = ip.read_package(ip.build_package([(1, 2, 3, b'abc'), (4, 5, (7 << 32) | 9, b'')]))
 report('.package : plusieurs ressources, identifiant 64 bits decoupe haut/bas',
        two == [(1, 2, 3, b'abc'), (4, 5, (7 << 32) | 9, b'')])

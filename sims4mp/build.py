@@ -47,7 +47,7 @@ def main():
     with open(ICON_PREVIEW, 'wb') as f:
         f.write(png)
     with open(ICONS, 'wb') as f:
-        f.write(icon_package.build_package([(icon_package.PNG_TYPE, 0, icon_package.ICON_INSTANCE, png)]))
+        f.write(icon_package.icon_package())             # image DDS (le PNG ne sert que d'apercu)
     print('OK : ' + ICONS + ' (icone {:016X})'.format(icon_package.ICON_INSTANCE))
     return 0
 
