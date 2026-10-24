@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - Sim de l'invite (0.21.1) : chez l'hote, le Sim que controle l'invite a
+# Sims 4 Multiplayer - menus circulaires calcules chez l'hote (0.21.2) : le clic de l'invite qui
+# ouvre un menu (interactions.choices, interactions.phone_choices) part a l'hote, qui calcule le
+# menu pour le Sim de l'invite avec la vraie partie ; le menu s'affiche chez l'invite seulement et
+# son choix (interactions.select) est applique chez l'hote (meme revision, menu.select).
+# Sim de l'invite (0.21.1) : chez l'hote, le Sim que controle l'invite a
 # l'autonomie limitee comme un Sim selectionne (AutonomyService._on_active_sim_changed), et
 # redevient normal quand l'invite en change ou se deconnecte.
 # Simulation unique seule (0.21.0) : choix du joueur, la simulation unique
@@ -231,7 +235,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.1'
+MOD_VERSION = '0.21.2'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -1197,6 +1201,43 @@ def bridge_set_limited_autonomy(sim_id, limited):
     return True
 
 
+def bridge_pie_ids(data):
+    """(sim, client_reference_id) d'un message MSG_PIE_MENU_CREATE / MSG_PHONE_MENU_CREATE
+    (protocolbuffers.InteractionOps_pb2.PieMenuCreate, champs 1 et 3)."""
+    from protocolbuffers import InteractionOps_pb2
+    message = InteractionOps_pb2.PieMenuCreate()
+    message.ParseFromString(bytes(data))
+    return message.sim, message.client_reference_id
+
+
+def bridge_menu_for_guest(kind, args, sim_id):
+    """Hote : calcule le menu circulaire (ou du telephone) demande par l'invite pour son Sim, avec la
+    commande du jeu (interaction_commands.generate_choices / generate_phone_choices). Ces commandes
+    prennent le Sim acteur par interaction_commands._active_sim(client) : il pointe le temps de l'appel
+    sur le Sim de l'invite. Le menu range par le jeu (client.set_choices) est repris pour l'invite et
+    celui de l'hote remis en place. Renvoie le menu (ChoiceMenu) ou None."""
+    import services
+    from objects import ALL_HIDDEN_REASONS
+    from server_commands import interaction_commands
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    client = services.client_manager().get_first_client()
+    if sim is None or client is None:
+        return None
+    host_menu = client.choice_menu
+    active_sim = interaction_commands._active_sim
+    interaction_commands._active_sim = lambda _client: sim
+    try:
+        command = (interaction_commands.generate_choices if kind == 'pie'
+                   else interaction_commands.generate_phone_choices)
+        command(_connection=client.id, **args)
+        guest_menu = client.choice_menu
+    finally:
+        interaction_commands._active_sim = active_sim
+        client.set_choices(host_menu)
+    return guest_menu if guest_menu is not host_menu else None
+
+
 def bridge_cancel_by_id(interaction_id):
     """Hote : annule comme la croix du joueur l'action interaction_id de l'un des Sims presents
     (Sim.find_interaction_by_id puis find_continuation_by_id, comme
@@ -1517,6 +1558,10 @@ def _handle_host_event(session, kind, value):
                 _handle_dialog(session, data)
             elif data.get('kind') == 'bb':
                 _handle_build_buy(session, data)
+            elif data.get('kind') == 'pie':
+                _handle_pie(session, data)
+            elif data.get('kind') == 'pie_select':
+                _handle_pie_select(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -3270,6 +3315,14 @@ _mirror = {
     'dialog_applied': 0,
     'dialog_answers': 0,     # invite : reponses envoyees a l'hote
     'limited': set(),        # hote : Sims a l'autonomie limitee parce que l'invite les controle (0.21.1)
+    # Menus circulaires de l'invite calcules chez l'hote (0.21.2).
+    'pie_ids': frozenset(),  # MSG_PIE_MENU_CREATE, MSG_PHONE_MENU_CREATE
+    'pie_pending': [],       # hote : (Sim, reference du clic) des menus attendus par l'invite
+    'guest_menu': None,      # hote : dernier menu calcule pour l'invite (ChoiceMenu)
+    'menus_asked': 0,
+    'menus_sent': 0,
+    'menus_chosen': 0,
+    'menus_stale': 0,
     # Objets crees apres le chargement (0.20.2).
     'objs_new': [],          # hote : objets ajoutes depuis le dernier passage (refs faibles)
     'objs_del': [],          # hote : identifiants retires depuis le dernier passage
@@ -3343,6 +3396,8 @@ def _mirror_host_only():
         ids = _mirror['host_only'] = frozenset(found)
         _mirror['dialog_show_id'] = next((msg_id for msg_id, name in _message_names().items()
                                           if name == 'MSG_UI_DIALOG_SHOW'), None)
+        _mirror['pie_ids'] = frozenset(msg_id for msg_id, name in _message_names().items()
+                                       if name in ('MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE'))
         log('simulation unique : {} type(s) de message gardes sur l\'ecran de l\'hote'.format(len(ids)))
     return ids
 
@@ -3370,6 +3425,137 @@ def mirror_guest_autonomy(session):
         if _safe('autonomie du Sim de l\'invite', bridge_set_limited_autonomy, target, True):
             limited.add(target)
             log('[host] Sim {} controle par l\'invite : autonomie limitee, comme un Sim selectionne'.format(target))
+
+
+# -- menus circulaires (0.21.2) : calcules chez l'hote pour le Sim de l'invite --
+# Le clic de l'invite (commande interactions.choices / interactions.phone_choices) part a l'hote,
+# qui calcule le menu avec la vraie partie (bridge_menu_for_guest) ; le message du menu
+# (PieMenuCreate : Sim, reference du clic) est envoye a l'invite seulement. Son choix
+# (interactions.select : numero, revision du menu) revient a l'hote, qui l'applique comme
+# Client.select_interaction : meme revision, puis menu.select(numero).
+
+PIE_ARGS = {                              # arguments des commandes du jeu : type attendu
+    'pie': (('target_id', int), ('pick_type', int), ('x', float), ('y', float), ('z', float),
+            ('lot_id', int), ('level', int), ('control', bool), ('alt', bool), ('shift', bool),
+            ('reference_id', int), ('referred_object_id', int), ('preferred_object_id', int),
+            ('is_routable', bool)),
+    'phone': (('control', bool), ('alt', bool), ('shift', bool), ('reference_id', int),
+              ('selected_affordance_id', int)),
+}
+PIE_PENDING_MAX = 20                      # menus attendus gardes au plus
+
+
+def _pie_values(kind, arguments):
+    """Invite : arguments de la commande du jeu en valeurs simples (None si absent)."""
+    values = {}
+    for name, kind_of in PIE_ARGS[kind]:
+        value = arguments.get(name)
+        if value is None:
+            values[name] = None
+        elif kind_of is bool:
+            values[name] = bool(value)
+        elif kind_of is float:
+            values[name] = float(value)
+        else:
+            values[name] = _as_int(value)
+    return values
+
+
+def _clean_pie_args(kind, values):
+    """Hote : arguments recus verifies, ou None."""
+    if kind not in PIE_ARGS or not isinstance(values, dict):
+        return None
+    clean = {}
+    for name, kind_of in PIE_ARGS[kind]:
+        value = values.get(name)
+        if value is None:
+            continue
+        if kind_of is bool:
+            if not isinstance(value, bool):
+                return None
+        elif kind_of is float:
+            value = _clean_float(value, POSITION_MAX_COORD)
+            if value is None:
+                return None
+        else:
+            value = _clean_int(value, -2 ** 63, 2 ** 64)
+            if value is None:
+                return None
+        clean[name] = value
+    return clean
+
+
+def mirror_forward_menu(kind, arguments):
+    """Invite : le clic qui ouvrirait un menu part a l'hote. Renvoie True si envoye."""
+    session = _session
+    if not mirror_frozen() or not _connected(session):
+        return False
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {
+        'kind': 'pie', 'how': kind, 'args': _pie_values(kind, arguments)}))
+    _flush_now(session)
+    _mirror['menus_asked'] += 1
+    return True
+
+
+def mirror_forward_choice(choice_id, revision):
+    """Invite : choix dans un menu calcule par l'hote, envoye a l'hote. Renvoie True si envoye."""
+    session = _session
+    choice_id, revision = _as_int(choice_id), _as_int(revision)
+    if not mirror_frozen() or not _connected(session) or choice_id is None:
+        return False
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {
+        'kind': 'pie_select', 'choice': choice_id, 'revision': revision}))
+    _flush_now(session)
+    _mirror['menus_chosen'] += 1
+    log('[client] choix {} envoye a l\'hote (menu {})'.format(choice_id, revision))
+    return True
+
+
+def _mirror_pie_for_guest(data):
+    """Hote : vrai si ce message de menu est celui attendu par l'invite (meme Sim, meme clic)."""
+    key = bridge_pie_ids(data)
+    pending = _mirror['pie_pending']
+    if key not in pending:
+        return False
+    pending.remove(key)
+    _mirror['menus_sent'] += 1
+    return True
+
+
+def _handle_pie(session, data):
+    """Hote : calcule le menu demande par l'invite pour le Sim qu'il controle."""
+    kind = data.get('how')
+    args = _clean_pie_args(kind, data.get('args'))
+    sim_id = session.guest_sim_id
+    if args is None or not mirror_on(session):
+        log('[host] demande de menu de l\'invite invalide ignoree')
+        return
+    if sim_id is None:
+        log('[host] menu demande par l\'invite avant de connaitre son Sim : ignore')
+        return
+    pending = _mirror['pie_pending']
+    pending.append((sim_id, args.get('reference_id') or 0))
+    del pending[:-PIE_PENDING_MAX]
+    menu = _safe('menu de l\'invite', bridge_menu_for_guest, kind, args, sim_id)
+    if menu is not None:
+        _mirror['guest_menu'] = menu
+
+
+def _handle_pie_select(session, data):
+    """Hote : applique le choix de l'invite dans le menu calcule pour lui (Client.select_interaction)."""
+    choice_id = _clean_int(data.get('choice'), 0, 2 ** 64)
+    revision = _clean_int(data.get('revision'), -2 ** 63, 2 ** 64)
+    menu = _mirror['guest_menu']
+    if choice_id is None or not mirror_on(session):
+        log('[host] choix de menu de l\'invite invalide ignore')
+        return
+    if menu is None or getattr(menu, 'revision', None) != revision:
+        _mirror['menus_stale'] += 1
+        log('[host] choix de l\'invite pour un menu perime (revision {}) : ignore'.format(revision))
+        return
+    _mirror['guest_menu'] = None
+    result = _safe('choix de l\'invite dans un menu', menu.select, choice_id)
+    log('[host] choix {} de l\'invite applique : {}'.format(choice_id, result))
 
 
 # -- fenetres du jeu (0.20.1) : celles du Sim de l'invite s'ouvrent chez lui --
@@ -3461,6 +3647,9 @@ def mirror_capture(msg_id, data):
         return None
     host_only = _mirror_host_only()                  # lit aussi l'identifiant MSG_UI_DIALOG_SHOW
     if msg_id == _mirror['dialog_show_id'] and _mirror_dialog_for_guest(data):
+        _mirror['out'].append((msg_id, bytes(data)))
+        return 'guest'
+    if msg_id in _mirror['pie_ids'] and _mirror['pie_pending'] and _mirror_pie_for_guest(data):
         _mirror['out'].append((msg_id, bytes(data)))
         return 'guest'
     if msg_id in host_only:
@@ -3737,6 +3926,8 @@ def mirror_lines():
                 '  objets de l\'hôte copiés : {} (refusés : {}) , retirés : {}'.format(
                     _mirror['replicas_made'], _mirror['replicas_failed'], _mirror['replicas_removed']),
                 '  gestes de construction envoyés à l\'hôte : {}'.format(_mirror['bb_sent']),
+                '  menus demandés à l\'hôte : {} , choix envoyés : {}'.format(
+                    _mirror['menus_asked'], _mirror['menus_chosen']),
                 '  réponses aux fenêtres de l\'hôte : {} , erreurs : {}'.format(
                     _mirror['dialog_answers'], _mirror['errors'])]
     session = _session
@@ -3750,6 +3941,8 @@ def mirror_lines():
                 _mirror['objs_sent'], _mirror['objs_removed_sent']),
             '  construction de l\'invité : {} geste(s) rejoué(s), {} refusé(s)'.format(
                 _mirror['bb_applied'], _mirror['bb_failed']),
+            '  menus calculés pour l\'invité : {} envoyés , {} choix périmé(s)'.format(
+                _mirror['menus_sent'], _mirror['menus_stale']),
             '  fenêtres ouvertes chez l\'invité : {} , réponses appliquées : {}'.format(
                 _mirror['dialogs_sent'], _mirror['dialog_applied']),
             '  annulations de l\'invité : {} , erreurs : {}'.format(_mirror['cancels_applied'], _mirror['errors'])]
@@ -4140,12 +4333,47 @@ def _hook_build_buy():
     _mirror_wrap(build_buy, 'c_api_buildbuy_session_end', make_session(False))
 
 
+def _hook_pie_menus():
+    """Invite : clic ouvrant un menu (interaction_commands.generate_choices / generate_phone_choices)
+    et choix dans ce menu (select_choice) partent a l'hote au lieu du jeu fige de l'invite (0.21.2)."""
+    from server_commands import interaction_commands
+
+    def make_menu(kind):
+        def make_wrapper(original):
+            def command(*args, **kwargs):
+                if mirror_frozen():
+                    try:
+                        if mirror_forward_menu(kind, _call_args(original, args, kwargs)):
+                            return None
+                    except Exception:
+                        _mirror_error('demande de menu a l\'hote')
+                return original(*args, **kwargs)
+            return command
+        return make_wrapper
+
+    def make_select(original):
+        def select_choice(*args, **kwargs):
+            if mirror_frozen():
+                try:
+                    arguments = _call_args(original, args, kwargs)
+                    if mirror_forward_choice(arguments.get('choice_id'), arguments.get('reference_id')):
+                        return None
+                except Exception:
+                    _mirror_error('choix dans un menu de l\'hote')
+            return original(*args, **kwargs)
+        return select_choice
+
+    _mirror_wrap(interaction_commands, 'generate_choices', make_menu('pie'))
+    _mirror_wrap(interaction_commands, 'generate_phone_choices', make_menu('phone'))
+    _mirror_wrap(interaction_commands, 'select_choice', make_select)
+
+
 def _install_mirror_hooks():
     """Accroches de la simulation unique ; chacune est independante des autres."""
     for label, install in (('ligne du temps', _hook_timeline), ('horloge', _hook_clock_broadcast),
                            ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command),
                            ('fenetres', _hook_dialog_answers), ('objets', _hook_objects),
-                           ('construction', _hook_build_buy)):
+                           ('construction', _hook_build_buy), ('menus', _hook_pie_menus)):
         try:
             install()
             _mirror['hooks'].append(label)

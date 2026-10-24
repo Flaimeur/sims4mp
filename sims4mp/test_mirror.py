@@ -100,7 +100,49 @@ def cancel_common(interaction_id, context_handle=None, _connection=None, user_ca
 
 
 module('server_commands')
-module('server_commands.interaction_commands', cancel_common=cancel_common)
+GENERATED = []                                       # menus calcules par la fausse commande du jeu
+
+
+class ChoiceMenu(object):
+    revision_counter = 40
+
+    def __init__(self, sim, reference_id):
+        ChoiceMenu.revision_counter += 1
+        self.revision = ChoiceMenu.revision_counter
+        self.sim, self.reference_id, self.selected = sim, reference_id, None
+
+    def select(self, choice_id):
+        self.selected = choice_id
+        return 'action lancee'
+
+
+def generate_choices(target_id, pick_type, x, y, z, lot_id, level, control, alt, shift, reference_id,
+                     referred_object_id=0, preferred_object_id=0, is_routable=True, _connection=None):
+    commands_module = sys.modules['server_commands.interaction_commands']
+    client = sys.modules['services'].client_manager().get_first_client()
+    sim = commands_module._active_sim(client)          # comme le jeu : Sim acteur par _active_sim(client)
+    GENERATED.append(('pie', sim, target_id, reference_id, x, shift, _connection))
+    client.set_choices(ChoiceMenu(sim, reference_id))
+
+
+def generate_phone_choices(control, alt, shift, reference_id, selected_affordance_id=None, _connection=None):
+    commands_module = sys.modules['server_commands.interaction_commands']
+    client = sys.modules['services'].client_manager().get_first_client()
+    sim = commands_module._active_sim(client)
+    GENERATED.append(('phone', sim, reference_id, _connection))
+    client.set_choices(ChoiceMenu(sim, reference_id))
+
+
+LOCAL_SELECTS = []
+
+
+def select_choice(choice_id, reference_id=None, _connection=None):
+    LOCAL_SELECTS.append((choice_id, reference_id))
+
+
+module('server_commands.interaction_commands', cancel_common=cancel_common, generate_choices=generate_choices,
+       generate_phone_choices=generate_phone_choices, select_choice=select_choice,
+       _active_sim=lambda client: 'Sim actif de l\'hote')
 
 
 class TestResult(object):
@@ -130,7 +172,19 @@ module('interactions')
 module('interactions.interaction_queue', InteractionQueue=InteractionQueue)
 module('protocolbuffers')
 module('protocolbuffers.Consts_pb2', MSG_OBJECTS_VIEW_UPDATE=11, MSG_UI_DIALOG_SHOW=40,
-       MSG_UI_NOTIFICATION_SHOW=41, MSG_CONNECTION_STATUS_CONNECTED=210, MSG_SIM_MOOD_UPDATE=159)
+       MSG_UI_NOTIFICATION_SHOW=41, MSG_CONNECTION_STATUS_CONNECTED=210, MSG_SIM_MOOD_UPDATE=159,
+       MSG_PIE_MENU_CREATE=6, MSG_PHONE_MENU_CREATE=171)
+
+
+class _PieMessage(object):
+    """Faux PieMenuCreate : octets « sim:reference »."""
+
+    def ParseFromString(self, data):
+        sim, reference = data.decode('ascii').split(':')
+        self.sim, self.client_reference_id = int(sim), int(reference)
+
+
+module('protocolbuffers.InteractionOps_pb2', PieMenuCreate=_PieMessage)
 
 
 class _DialogMessage(object):
@@ -373,7 +427,8 @@ class Sim(object):
 
 SLEEP = Interaction(555)
 SIMS = [Sim(1), Sim(2, [SLEEP])]
-CLIENT = types.SimpleNamespace(id=0xABC)
+CLIENT = types.SimpleNamespace(id=0xABC, choice_menu='menu de l\'hote')
+CLIENT.set_choices = lambda menu: setattr(CLIENT, 'choice_menu', menu)
 module('services',
        client_manager=lambda: types.SimpleNamespace(get_first_client=lambda: CLIENT),
        current_zone=lambda: ZONE,
@@ -428,9 +483,9 @@ def events(endpoint, kind):
     return [m['data'] for m in endpoint.sent if m['type'] == protocol.EVENT and m['data'].get('kind') == kind]
 
 
-report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets, construction',
-       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets', 'construction'],
-       str(mod._mirror['hooks']))
+report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets, construction, menus',
+       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets', 'construction',
+                                'menus'], str(mod._mirror['hooks']))
 
 # --- 1. Hote : choix, annonce, confirmation ---------------------------------------------------
 host = mod.NetSession('host', Endpoint())
@@ -759,7 +814,55 @@ report('geste invalide : ignore', not BB_CALLS)
 mod._mirror['wanted'] = False
 mod._session = guest
 
-# --- 12. Etat, commande de secours, fin ------------------------------------------------------------
+# --- 12. Menus circulaires calcules chez l'hote (0.21.2) -------------------------------------------
+commands_module = sys.modules['server_commands.interaction_commands']
+del GENERATED[:]
+start = len(events(guest.endpoint, 'pie'))
+commands_module.generate_choices(1001, 2, 1.5, 0.0, 2.5, 5, 0, False, False, True, 77, 0, 0, True, CLIENT.id)
+commands_module.generate_phone_choices(False, False, False, 78, None, CLIENT.id)
+asked = events(guest.endpoint, 'pie')[start:]
+report('invite : le clic qui ouvre un menu part a l\'hote, rien n\'est calcule chez lui',
+       not GENERATED and [a['how'] for a in asked] == ['pie', 'phone']
+       and asked[0]['args']['target_id'] == 1001 and asked[0]['args']['x'] == 1.5
+       and asked[0]['args']['shift'] is True and asked[0]['args']['reference_id'] == 77, str(asked))
+del LOCAL_SELECTS[:]
+commands_module.select_choice(3, 41, CLIENT.id)
+chosen = events(guest.endpoint, 'pie_select')
+report('invite : son choix dans le menu part a l\'hote',
+       not LOCAL_SELECTS and chosen[-1] == {'kind': 'pie_select', 'choice': 3, 'revision': 41}, str(chosen))
+
+mod._session = host
+mod._mirror['wanted'] = True
+host.guest_sim_id = 2
+CLIENT.choice_menu = 'menu de l\'hote'
+mod._handle_pie(host, asked[0])
+guest_menu = mod._mirror['guest_menu']
+report('hote : menu calcule pour le Sim de l\'invite avec la commande du jeu, menu de l\'hote remis',
+       GENERATED == [('pie', SIMS[1], 1001, 77, 1.5, True, CLIENT.id)] and guest_menu is not None
+       and guest_menu.sim is SIMS[1] and CLIENT.choice_menu == 'menu de l\'hote'
+       and commands_module._active_sim(CLIENT) == 'Sim actif de l\'hote', str(GENERATED))
+mod._handle_pie(host, asked[1])
+report('menu du telephone calcule de la meme facon', GENERATED[-1][:3] == ('phone', SIMS[1], 78))
+mod._mirror['capturing'] = True
+del SENT[:]
+omega.send(0x1, 6, b'2:77')
+omega.send(0x1, 171, b'2:78')
+omega.send(0x1, 6, b'1:5')
+report('message du menu de l\'invite : chez l\'invite seulement ; menu de l\'hote : chez l\'hote',
+       SENT == [(0x1, 6, b'1:5')] and mod._mirror['out'][-2:] == [(6, b'2:77'), (171, b'2:78')]
+       and not mod._mirror['pie_pending'] and mod._mirror['menus_sent'] == 2, str(SENT))
+phone_menu = mod._mirror['guest_menu']
+mod._handle_pie_select(host, {'kind': 'pie_select', 'choice': 3, 'revision': 1})
+report('choix pour un menu perime : ignore, sans toucher au Sim', phone_menu.selected is None
+       and mod._mirror['menus_stale'] == 1)
+mod._handle_pie_select(host, {'kind': 'pie_select', 'choice': 3, 'revision': phone_menu.revision})
+report('choix de l\'invite applique dans son menu (meme revision)', phone_menu.selected == 3
+       and mod._mirror['guest_menu'] is None)
+mod._mirror['capturing'] = False
+mod._mirror['wanted'] = False
+mod._session = guest
+
+# --- 13. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',
