@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - correctifs (0.17.1) : autres Sims plus recales en boucle (teleportation
+# Sims 4 Multiplayer - presence (0.18.0, « l'invite recopie tout ce que l'hote a », etape 1) :
+# l'hote envoie la liste des Sims presents (roster) ; l'invite fait apparaitre ceux qui manquent
+# (SimSpawner.spawn_sim) et retire ceux que l'hote n'a pas (schedule_destroy_asap), sauf le Sim
+# qu'il controle ; au plus ROSTER_ACTIONS par liste, chaque Sim retente apres ROSTER_RETRY s.
+# Correctifs (0.17.1) : autres Sims plus recales en boucle (teleportation
 # sans effet comptee : 2 echecs -> laisse en place 60 s ; au plus une teleportation / 10 s par
 # Sim) ; action que le jeu ne sait pas recreer (« Error instantiating affordance ») plus rejouee.
 # Fenetre en ecrans (0.17.0) : ecran principal (en-tete : role, autre
@@ -196,7 +200,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.17.1'
+MOD_VERSION = '0.18.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -254,6 +258,11 @@ FIX_FAIL_MAX = 2                          # apres 2 recalages sans effet : Sim l
 FIX_PAUSE = 60.0                          # ... pendant 60 s reelles
 TELEPORT_GAP = 10.0                       # au plus une teleportation toutes les 10 s par Sim
 UNPLAYABLE_MARK = 'Error instantiating affordance'   # action que le jeu ne sait pas recreer ici
+# Presence (0.18.0) : l'invite recopie la liste des Sims presents chez l'hote.
+ROSTER_INTERVAL = 5.0                     # l'hote envoie sa liste toutes les 5 s
+ROSTER_MAX = 64                           # Sims par liste
+ROSTER_ACTIONS = 2                        # au plus 2 apparitions / departs par liste recue
+ROSTER_RETRY = 30.0                       # un meme Sim n'est retente qu'apres 30 s
 ORDER_MAX_AGE = 3600.0                    # ordre plus ancien : comme s'il n'y en avait pas
 ACTION_HOLD = 20.0                        # apres une action rejouee, le double n'est pas recale
 PLACE_MIN = 5.0                           # pose directe seulement au-dela de cet ecart
@@ -726,6 +735,35 @@ def bridge_instanced_sim_ids():
     return [sim.sim_info.sim_id for sim in services.sim_info_manager().instanced_sims_gen()]
 
 
+def bridge_spawn_sim(sim_id, x, y, z):
+    """Fait apparaitre sur ce lot un Sim de la partie (0.18.0, bytecode verifie :
+    sims.sim_spawner.SimSpawner.spawn_sim(sim_info, sim_position=Vector3) -> succes).
+    Renvoie 'ok', 'deja' (deja present), 'inconnu' (pas dans cette partie) ou 'refus'."""
+    import services
+    import sims4.math
+    from objects import ALL_HIDDEN_REASONS
+    from sims.sim_spawner import SimSpawner
+    sim_info = services.sim_info_manager().get(sim_id)
+    if sim_info is None:
+        return 'inconnu'
+    if sim_info.is_instanced(allow_hidden_flags=ALL_HIDDEN_REASONS):
+        return 'deja'
+    return 'ok' if SimSpawner.spawn_sim(sim_info, sim_position=sims4.math.Vector3(x, y, z)) else 'refus'
+
+
+def bridge_despawn_sim(sim_id):
+    """Retire de ce lot un Sim absent chez l'hote (BaseObject.schedule_destroy_asap(source, cause),
+    comme le jeu le fait pour les Sims « elimines »). Renvoie True si demande."""
+    import services
+    from objects import ALL_HIDDEN_REASONS
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    if sim is None:
+        return False
+    sim.schedule_destroy_asap(source=None, cause='Sims4MP : absent chez l\'hote')
+    return True
+
+
 def bridge_sim_snapshot(sim_id):
     """Position et action en cours d'un Sim present, comme bridge_read_position, ou None."""
     import services
@@ -1003,6 +1041,12 @@ class NetSession(object):
         self.sims_paused = 0            # Sims laisses en place apres des recalages sans effet
         self.unplayable = set()         # affordances que le jeu ne sait pas recreer ici (0.17.1)
         self.unplayable_skipped = 0
+        # Presence (0.18.0) : l'invite recopie les Sims presents chez l'hote.
+        self.roster_sent_at = 0.0
+        self.roster_retry = {}          # sim_id -> moment avant lequel on ne retente pas
+        self.roster_spawned = 0
+        self.roster_despawned = 0
+        self.roster_unknown = set()     # Sims de l'hote qui n'existent pas dans la partie de l'invite
 
 
 # ---------------------------------------------------------------------------
@@ -1248,6 +1292,8 @@ def _handle_client_event(session, kind, value):
                 _handle_cancel(session, value['data'])
             elif value['data'].get('kind') == 'digest':
                 _handle_digest(session, value['data'])
+            elif value['data'].get('kind') == 'roster':
+                _handle_roster(session, value['data'])
             else:
                 log('[client] EVENT ignore (kind {!r})'.format(value['data'].get('kind')))
         elif msg_type == protocol.BYE:
@@ -1437,7 +1483,7 @@ def _poll_session(session, now):
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
             quiet = ((value['type'] == protocol.EVENT
                       and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims',
-                                                         'digest', 'gaps')
+                                                         'digest', 'gaps', 'roster')
                            or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
                      # pings automatiques (latence) : toutes les 10 s, inutiles dans le journal
                      or (value['type'] == protocol.PING and value['data'].get('auto') is True)
@@ -1469,6 +1515,7 @@ def _poll_session(session, now):
         _walk_tick(session, now)
         _needs_tick(session, now)
         _maybe_send_sims(session, now)
+        _roster_tick(session, now)
         _auto_ping_tick(session, now)
         _summary_tick(session, now)
         _digest_tick(session, now)
@@ -2275,6 +2322,77 @@ def is_travel(name):
     return 'travel' in (name or '').lower()
 
 
+# -- presence (0.18.0) : l'invite a les memes Sims sur le lot que l'hote --
+
+def _roster_tick(session, now):
+    """Hote : liste des Sims presents (identifiant, position) toutes les ROSTER_INTERVAL s."""
+    if session.role != 'host' or not _connected(session):
+        return
+    if now - session.roster_sent_at < ROSTER_INTERVAL:
+        return
+    session.roster_sent_at = now
+    entries = []
+    for sim_id in (_safe('liste des Sims', bridge_instanced_sim_ids) or [])[:ROSTER_MAX]:
+        snapshot = _safe('position d\'un Sim', bridge_sim_snapshot, sim_id)
+        if snapshot is not None:
+            entries.append(snapshot)
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {
+        'kind': 'roster', 'zone_id': bridge_current_zone_id(), 'list': entries}))
+
+
+def _handle_roster(session, data):
+    """Invite : fait apparaitre les Sims de l'hote absents ici, retire ceux que l'hote n'a pas.
+    Le Sim controle par l'invite n'est jamais retire."""
+    entries = data.get('list')
+    zone_id = _clean_int(data.get('zone_id'), 0, 2 ** 64)
+    if not isinstance(entries, list) or len(entries) > ROSTER_MAX:
+        log('[{}] liste des Sims de l\'hote invalide ignoree'.format(session.role))
+        return
+    if _gate['waiting'] or zone_id is None or zone_id != bridge_current_zone_id():
+        return                                       # autre lot : rien a recopier ici
+    host = {}
+    for entry in entries:
+        position = validate_position(entry)
+        if position is not None:
+            host[position['sim_id']] = position
+    local = set(_safe('liste des Sims', bridge_instanced_sim_ids) or [])
+    mine = _my_active_id()
+    now = time.monotonic()
+    actions = 0
+    _sync['pushing'] = True                          # pas des actions du joueur
+    try:
+        for sim_id, position in host.items():
+            if sim_id in local or sim_id in session.roster_unknown or actions >= ROSTER_ACTIONS:
+                continue
+            if now < session.roster_retry.get(sim_id, 0.0):
+                continue
+            session.roster_retry[sim_id] = now + ROSTER_RETRY
+            actions += 1
+            result = _safe('apparition d\'un Sim', bridge_spawn_sim, sim_id, position['x'], position['y'],
+                           position['z'])
+            label = position['name'] or 'Sim {}'.format(sim_id)
+            if result == 'ok':
+                session.roster_spawned += 1
+                log('[{}] presence : {} apparait (present chez l\'hote)'.format(session.role, label))
+            elif result == 'inconnu':
+                session.roster_unknown.add(sim_id)
+                log('[{}] presence : {} n\'existe pas dans cette partie (sauvegarde differente ?)'.format(
+                    session.role, label))
+            elif result != 'deja':
+                log('[{}] presence : {} impossible a faire apparaitre ({})'.format(session.role, label, result))
+        for sim_id in sorted(local - set(host)):
+            if sim_id == mine or actions >= ROSTER_ACTIONS or now < session.roster_retry.get(sim_id, 0.0):
+                continue
+            session.roster_retry[sim_id] = now + ROSTER_RETRY
+            actions += 1
+            if _safe('depart d\'un Sim', bridge_despawn_sim, sim_id):
+                session.roster_despawned += 1
+                session.sims_remote.pop(sim_id, None)
+                log('[{}] presence : Sim {} retire (absent chez l\'hote)'.format(session.role, sim_id))
+    finally:
+        _sync['pushing'] = False
+
+
 # -- positions de tous les Sims dont ce PC fait foi (M6) --
 
 def _maybe_send_sims(session, now):
@@ -2426,6 +2544,8 @@ def sync_lines(session):
     lines.append('Autres Sims ({}) : {} suivi(s), {} en marche ; autonomie refusee ici {} fois'.format(
         'l\'hote fait foi' if session.role == 'client' else 'ce PC fait foi',
         len(session.sims_remote), moving, session.autonomy_refused))
+    lines.append('Presence (comme chez l\'hote) : {} Sim(s) apparu(s), {} retire(s), {} inconnu(s) ici'.format(
+        session.roster_spawned, session.roster_despawned, len(session.roster_unknown)))
     lines.append('Recalages sans effet : {} Sim(s) laisse(s) en place ; actions impossibles a rejouer ici : {} '
                  '({} ordre(s) ignore(s))'.format(session.sims_paused, len(session.unplayable),
                                                   session.unplayable_skipped))
