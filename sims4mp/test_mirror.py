@@ -265,10 +265,68 @@ def create_object(definition, obj_id=0, **kwargs):
     return obj
 
 
+BB_CALLS = []                                        # appels des fonctions du jeu (construction)
+
+
+def c_api_create_object(zone_id, def_id, obj_id, obj_state=None, loc_type=1, content_source=0):
+    BB_CALLS.append(('create', zone_id, def_id, obj_id, obj_state, loc_type, content_source))
+    return 'cree'
+
+
+def c_api_destroy_object(zone_id, obj_or_id):
+    BB_CALLS.append(('destroy', zone_id, getattr(obj_or_id, 'id', obj_or_id)))
+    return True
+
+
+def c_api_set_parent_object(obj_id, parent_id, transform=None, joint_name=None, slot_hash=0, zone_id=None):
+    BB_CALLS.append(('parent', obj_id, parent_id, transform, joint_name, slot_hash, zone_id))
+
+
+def c_api_clear_parent_object(obj_id, transform, zone_id, surface):
+    BB_CALLS.append(('unparent', obj_id, transform, zone_id, surface))
+
+
+def c_api_set_object_location_ex(zone_id, obj_id, routing_surface, transform, parent_id, parent_type_info, slot_hash):
+    BB_CALLS.append(('place', zone_id, obj_id, routing_surface, transform, parent_id, parent_type_info, slot_hash))
+    return True
+
+
+def c_api_set_object_location(zone_id, obj_id, routing_surface, transform):
+    BB_CALLS.append(('place_simple', zone_id, obj_id, routing_surface, transform))
+    return True
+
+
+def c_api_buildbuy_session_begin(zone_id, account_id):
+    return 'debut'
+
+
+def c_api_buildbuy_session_end(zone_id, account_id, zone_data_change=None):
+    return 'fin'
+
+
+class ClientObjectMixin(object):
+    def set_definition(self, definition_id, ignore_rig_footprint=False):
+        BB_CALLS.append(('design', self.id, definition_id))
+        return True
+
+
+module('build_buy', c_api_set_object_location_ex=c_api_set_object_location_ex,
+       c_api_set_object_location=c_api_set_object_location,
+       c_api_buildbuy_session_begin=c_api_buildbuy_session_begin,
+       c_api_buildbuy_session_end=c_api_buildbuy_session_end)
 module('objects.object_manager', ObjectManager=ObjectManager)
-module('objects.system', create_object=create_object)
-module('routing', SurfaceIdentifier=lambda zone, level, kind: ('surface', zone, level, kind),
-       SurfaceType=types.SimpleNamespace(SURFACETYPE_WORLD='monde'))
+module('objects.system', create_object=create_object, c_api_create_object=c_api_create_object,
+       c_api_destroy_object=c_api_destroy_object, c_api_set_parent_object=c_api_set_parent_object,
+       c_api_clear_parent_object=c_api_clear_parent_object)
+module('objects.client_object_mixin', ClientObjectMixin=ClientObjectMixin)
+sys.modules['objects'].system = sys.modules['objects.system']
+
+
+class SurfaceType(int):
+    SURFACETYPE_WORLD = 'monde'
+
+
+module('routing', SurfaceIdentifier=lambda zone, level, kind: ('surface', zone, level, kind), SurfaceType=SurfaceType)
 math = module('sims4.math', Vector3=lambda x, y, z: ('v', x, y, z), Quaternion=lambda x, y, z, w: ('q', x, y, z, w),
               Transform=lambda v, q: ('t', v, q))
 sys.modules['sims4'].math = math
@@ -360,8 +418,8 @@ def events(endpoint, kind):
     return [m['data'] for m in endpoint.sent if m['type'] == protocol.EVENT and m['data'].get('kind') == kind]
 
 
-report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets',
-       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets'],
+report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets, construction',
+       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets', 'construction'],
        str(mod._mirror['hooks']))
 
 # --- 1. Hote : choix, annonce, confirmation ---------------------------------------------------
@@ -611,7 +669,64 @@ report('invite : objets retires par l\'hote retires ici aussi, sans affichage en
 MANAGER.add(GameObject(5000, 7))
 report('objet ordinaire de l\'invite : affichage normal', Distributor.shown == [('ajout', 5000)])
 
-# --- 11. Etat, commande de secours, fin ------------------------------------------------------------
+# --- 11. Construction et achat faits par l'invite (0.20.3) -----------------------------------------
+import build_buy  # noqa: E402
+from objects import system as obj_system  # noqa: E402
+
+vec = types.SimpleNamespace(x=3.0, y=0.0, z=4.0)
+rot = types.SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)
+TRANSFORM = types.SimpleNamespace(translation=vec, orientation=rot)
+SURFACE = types.SimpleNamespace(secondary_id=1, type=1)
+del BB_CALLS[:]
+start = len(events(guest.endpoint, 'bb'))
+obj_system.c_api_create_object(99, 60, 3001, None, 1, 0)
+build_buy.c_api_set_object_location_ex(99, 3001, SURFACE, TRANSFORM, 0, None, 0)
+build_buy.c_api_set_object_location(99, 3001, SURFACE, TRANSFORM)
+obj_system.c_api_set_parent_object(3002, 3001, TRANSFORM, None, 7, 99)
+obj_system.c_api_clear_parent_object(3002, TRANSFORM, 99, SURFACE)
+recolored = ClientObjectMixin()
+recolored.id = 3001
+recolored.set_definition(61)                         # hors mode construction : non transmis
+build_buy.c_api_buildbuy_session_begin(99, 1)
+recolored.set_definition(61)
+build_buy.c_api_buildbuy_session_end(99, 1)
+obj_system.c_api_destroy_object(99, 3002)
+gestures = events(guest.endpoint, 'bb')[start:]
+report('invite : chaque geste est fait ici puis envoye a l\'hote',
+       len(BB_CALLS) == 8 and [g['op'] for g in gestures] == ['create', 'place', 'place', 'parent', 'unparent',
+                                                             'design', 'destroy'], str([g['op'] for g in gestures]))
+report('creation : definition, etat, emplacement ; copie sans affichage propre chez l\'invite',
+       gestures[0] == {'kind': 'bb', 'op': 'create', 'id': 3001, 'def': 60, 'state': None, 'loc': 1, 'content': 0}
+       and 3001 in mod._mirror['replicas'], str(gestures[0]))
+report('deplacement : position, rotation, etage et type de surface',
+       gestures[1]['p'] == [3.0, 0.0, 4.0] and gestures[1]['q'] == [0.0, 0.0, 0.0, 1.0] and gestures[1]['s'] == [1, 1]
+       and 'parent' not in gestures[2] and gestures[3]['parent'] == 3001 and gestures[3]['slot'] == 7, str(gestures[1]))
+report('recoloriage transmis seulement en mode construction', gestures[5] == {'kind': 'bb', 'op': 'design',
+                                                                              'id': 3001, 'def': 61})
+
+mod._session = host
+mod._mirror['wanted'] = True
+host.mirror_ready = True
+del BB_CALLS[:]
+OBJECTS[3001] = recolored
+for gesture in gestures:
+    mod._handle_build_buy(host, gesture)
+report('hote : gestes rejoues avec les memes fonctions du jeu, dans sa zone',
+       [c[0] for c in BB_CALLS] == ['create', 'place', 'place', 'parent', 'unparent', 'design', 'destroy']
+       and BB_CALLS[0] == ('create', 99, 60, 3001, None, 1, 0)
+       and BB_CALLS[1][3] == ('surface', 99, 1, 1) and BB_CALLS[1][4] == ('t', ('v', 3.0, 0.0, 4.0),
+                                                                          ('q', 0.0, 0.0, 0.0, 1.0))
+       and mod._mirror['bb_applied'] == 7, str(BB_CALLS[:2]))
+report('hote : rien n\'est renvoye a l\'invite en echo', len(events(host.endpoint, 'bb')) == 0)
+del BB_CALLS[:]
+for bad in ({'op': 'create', 'id': 1}, {'op': 'fly', 'id': 1}, {'op': 'place', 'id': 1, 'p': [0, 0], 'q': [0, 0, 0, 1],
+                                                                's': [0, 1]}, {'op': 'destroy', 'id': 'x'}):
+    mod._handle_build_buy(host, dict(bad, kind='bb'))
+report('geste invalide : ignore', not BB_CALLS)
+mod._mirror['wanted'] = False
+mod._session = guest
+
+# --- 12. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',

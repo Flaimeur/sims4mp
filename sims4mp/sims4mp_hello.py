@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - simulation unique, etape 3 (0.20.2) : les objets crees ou retires chez
+# Sims 4 Multiplayer - simulation unique, etape 4 (0.20.3) : construction et achat faits par
+# l'invite. Chaque geste (creer, detruire, deplacer, poser sur un objet, recolorer) passe par une
+# fonction Python appelee par le moteur du jeu (objects/system.pyc, build_buy.pyc) ; chez l'invite
+# elle part a l'hote, qui la rejoue avec la meme fonction. Murs, sols, terrain : non synchronises.
+# Simulation unique, etape 3 (0.20.2) : les objets crees ou retires chez
 # l'hote apres le chargement (assiettes, achats, objets poses...) le sont aussi dans le jeu Python
 # de l'invite, avec le meme identifiant, pour qu'il puisse cliquer dessus ; leur affichage vient
 # deja de l'hote (Distributor.add_object / remove_object sautes pour ces copies).
@@ -221,7 +225,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.20.2'
+MOD_VERSION = '0.20.3'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -316,6 +320,7 @@ MIRROR_HOST_ONLY_PREFIXES = ('MSG_CONNECTION_STATUS_', 'MSG_DEBUGVISUALIZATION_'
 MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique).'
 MIRROR_OBJECTS_MAX = 200                  # objets crees / retires au plus par message « objects » (0.20.2)
 MIRROR_DIALOGS_MAX = 100                  # hote : fenetres envoyees a l'invite gardees (reponses acceptees)
+MIRROR_BB_OPS = ('create', 'destroy', 'place', 'parent', 'unparent', 'design')   # gestes de l'invite (0.20.3)
 MIRROR_PICKS_MAX = 64                     # elements choisis au plus dans une reponse de liste
 
 
@@ -1110,6 +1115,61 @@ def bridge_remove_replica(obj_id):
     return True
 
 
+def bridge_pack_place(transform, surface):
+    """Position (Transform) et surface (routing.SurfaceIdentifier : zone, etage, type) en JSON."""
+    place = {}
+    if transform is not None:
+        position, orientation = transform.translation, transform.orientation
+        place['p'] = [float(position.x), float(position.y), float(position.z)]
+        place['q'] = [float(orientation.x), float(orientation.y), float(orientation.z), float(orientation.w)]
+    if surface is not None:
+        place['s'] = [int(surface.secondary_id), int(surface.type)]
+    return place
+
+
+def bridge_unpack_place(place):
+    """(Transform ou None, SurfaceIdentifier ou None) dans la zone de ce PC."""
+    import routing
+    import services
+    import sims4.math
+    transform = surface = None
+    if 'p' in place:
+        transform = sims4.math.Transform(sims4.math.Vector3(*place['p']), sims4.math.Quaternion(*place['q']))
+    if 's' in place:
+        surface = routing.SurfaceIdentifier(services.current_zone_id(), place['s'][0],
+                                            routing.SurfaceType(place['s'][1]))
+    return transform, surface
+
+
+def bridge_apply_build_buy(op, values):
+    """Hote : rejoue un geste de construction/achat de l'invite avec la meme fonction du jeu
+    (objects/system.pyc, build_buy.pyc, ClientObjectMixin.set_definition), dans la zone de l'hote.
+    Renvoie le resultat du jeu (None compte comme fait)."""
+    import build_buy
+    import services
+    from objects import system
+    zone_id = services.current_zone_id()
+    obj_id = values['id']
+    if op == 'create':
+        return system.c_api_create_object(zone_id, values['def'], obj_id, values.get('state'),
+                                          values.get('loc'), values.get('content'))
+    if op == 'destroy':
+        return system.c_api_destroy_object(zone_id, obj_id)
+    transform, surface = bridge_unpack_place(values)
+    if op == 'place':
+        return build_buy.c_api_set_object_location_ex(zone_id, obj_id, surface, transform,
+                                                      values.get('parent'), values.get('ptype'), values.get('slot'))
+    if op == 'parent':
+        return system.c_api_set_parent_object(obj_id, values['parent'], transform, values.get('joint'),
+                                              values.get('slot'), zone_id)
+    if op == 'unparent':
+        return system.c_api_clear_parent_object(obj_id, transform, zone_id, surface)
+    obj = services.object_manager().get(obj_id)
+    if obj is None:
+        return False
+    return obj.set_definition(values['def'])          # op 'design' : nouveau coloris
+
+
 def bridge_cancel_by_id(interaction_id):
     """Hote : annule comme la croix du joueur l'action interaction_id de l'un des Sims presents
     (Sim.find_interaction_by_id puis find_continuation_by_id, comme
@@ -1425,6 +1485,8 @@ def _handle_host_event(session, kind, value):
                 _handle_cancel_si(session, data)
             elif data.get('kind') == 'dialog':
                 _handle_dialog(session, data)
+            elif data.get('kind') == 'bb':
+                _handle_build_buy(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -1689,7 +1751,7 @@ def _poll_session(session, now):
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
             quiet = ((value['type'] == protocol.EVENT
                       and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims',
-                                                         'digest', 'gaps', 'roster', 'view', 'objects')
+                                                         'digest', 'gaps', 'roster', 'view', 'objects', 'bb')
                            or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
                      # pings automatiques (latence) : toutes les 10 s, inutiles dans le journal
                      or (value['type'] == protocol.PING and value['data'].get('auto') is True)
@@ -3187,6 +3249,11 @@ _mirror = {
     'replicas_failed': 0,
     'replicas_removed': 0,
     'distributor_skipped': 0,
+    # Construction et achat faits par l'invite (0.20.3).
+    'bb_session': False,     # invite : mode construction/achat ouvert (recoloriage transmis)
+    'bb_sent': 0,
+    'bb_applied': 0,
+    'bb_failed': 0,
     'sent': [0, 0],          # hote : messages, octets recopies
     'batches': 0,
     'skipped': 0,            # hote : messages propres a son ecran
@@ -3434,6 +3501,86 @@ def _clean_object_entry(entry):
             'level': _clean_int(entry.get('level'), POSITION_LEVELS[0], POSITION_LEVELS[1])}
 
 
+# -- construction et achat faits par l'invite (0.20.3) --
+# Le mode construction/achat appelle des fonctions Python du jeu (objects/system.pyc,
+# build_buy.pyc) a chaque geste : creer, detruire, deplacer, poser sur un autre objet, recolorer.
+# Chez l'invite, chaque appel part a l'hote, qui le rejoue avec la meme fonction ; l'objet cree
+# chez l'invite n'a pas d'affichage propre (copie, comme en 0.20.2) : il apparait par l'hote.
+# Murs, sols et terrain sont geres par le moteur C++ du jeu : pas par ce chemin.
+
+def mirror_forward_build_buy(op, values):
+    """Invite : envoie un geste de construction/achat a l'hote. Renvoie True si envoye."""
+    session = _session
+    if _sync['pushing'] or not mirror_frozen() or not _connected(session):
+        return False
+    session.endpoint.send(protocol.make_message(protocol.EVENT, dict(values, kind='bb', op=op)))
+    _flush_now(session)
+    _mirror['bb_sent'] += 1
+    return True
+
+
+def _clean_build_buy(data):
+    """Copie propre d'un geste recu de l'invite, ou None."""
+    op = data.get('op')
+    obj_id = _clean_int(data.get('id'), 1, 2 ** 64)
+    if op not in MIRROR_BB_OPS or obj_id is None:
+        return None
+    clean = {'id': obj_id}
+    for key in ('def', 'parent'):
+        if data.get(key) is not None:
+            value = _clean_int(data.get(key), 1, 2 ** 64)
+            if value is None:
+                return None
+            clean[key] = value
+    for key in ('state', 'loc', 'content', 'ptype', 'slot', 'joint'):
+        if data.get(key) is not None:
+            value = _clean_int(data.get(key), -2 ** 63, 2 ** 64)
+            if value is None:
+                return None
+            clean[key] = value
+    if 'p' in data or 'q' in data:
+        position, rotation = data.get('p'), data.get('q')
+        if not (isinstance(position, list) and len(position) == 3 and isinstance(rotation, list) and len(rotation) == 4):
+            return None
+        clean['p'] = [_clean_float(v, POSITION_MAX_COORD) for v in position]
+        clean['q'] = [_clean_float(v, 2.0) for v in rotation]
+        if None in clean['p'] or None in clean['q']:
+            return None
+    if 's' in data:
+        surface = data.get('s')
+        if not isinstance(surface, list) or len(surface) != 2:
+            return None
+        level, kind = _clean_int(surface[0], POSITION_LEVELS[0], POSITION_LEVELS[1]), _clean_int(surface[1], 0, 64)
+        if level is None or kind is None:
+            return None
+        clean['s'] = [level, kind]
+    needed = {'create': ('def',), 'design': ('def',), 'place': ('p', 's'), 'parent': ('parent',), 'unparent': ('p',)}
+    if any(key not in clean for key in needed.get(op, ())):
+        return None
+    return op, clean
+
+
+def _handle_build_buy(session, data):
+    """Hote : rejoue le geste de construction/achat de l'invite."""
+    parsed = _clean_build_buy(data)
+    if parsed is None or not mirror_on(session):
+        log('[host] geste de construction de l\'invite invalide ignore')
+        return
+    op, values = parsed
+    _sync['pushing'] = True
+    try:
+        result = bridge_apply_build_buy(op, values)
+        done = result is None or bool(result)
+    except Exception:
+        done = False
+        _mirror_error('construction de l\'invite ({})'.format(op))
+    finally:
+        _sync['pushing'] = False
+    _mirror['bb_applied' if done else 'bb_failed'] += 1
+    if op in ('create', 'destroy') or not done:
+        log('[host] construction de l\'invite : {} objet {} {}'.format(op, values['id'], 'fait' if done else 'refuse'))
+
+
 def _handle_objects(session, data):
     """Invite : copies des objets crees par l'hote, retrait de ceux qu'il a retires."""
     created, removed = data.get('new'), data.get('del')
@@ -3532,6 +3679,7 @@ def mirror_lines():
                     _mirror['refused'], _mirror['unsent'], _mirror['cancels_sent']),
                 '  objets de l\'hôte copiés : {} (refusés : {}) , retirés : {}'.format(
                     _mirror['replicas_made'], _mirror['replicas_failed'], _mirror['replicas_removed']),
+                '  gestes de construction envoyés à l\'hôte : {}'.format(_mirror['bb_sent']),
                 '  réponses aux fenêtres de l\'hôte : {} , erreurs : {}'.format(
                     _mirror['dialog_answers'], _mirror['errors'])]
     session = _session
@@ -3543,6 +3691,8 @@ def mirror_lines():
                 _mirror['skipped'], _mirror['too_big'], _mirror['dropped']),
             '  objets envoyés à l\'invité : {} créés , {} retirés'.format(
                 _mirror['objs_sent'], _mirror['objs_removed_sent']),
+            '  construction de l\'invité : {} geste(s) rejoué(s), {} refusé(s)'.format(
+                _mirror['bb_applied'], _mirror['bb_failed']),
             '  fenêtres ouvertes chez l\'invité : {} , réponses appliquées : {}'.format(
                 _mirror['dialogs_sent'], _mirror['dialog_applied']),
             '  annulations de l\'invité : {} , erreurs : {}'.format(_mirror['cancels_applied'], _mirror['errors'])]
@@ -3844,11 +3994,100 @@ def _hook_objects():
     _mirror_wrap(Distributor, 'remove_object', make_skip)
 
 
+def _call_args(original, args, kwargs):
+    """Arguments d'un appel par nom, valeurs par defaut comprises (inspect.signature)."""
+    import inspect
+    bound = inspect.signature(original).bind(*args, **kwargs)
+    bound.apply_defaults()
+    return bound.arguments
+
+
+def _as_int(value):
+    """Entier (ou enum) en int, sinon None : seules des valeurs simples partent sur le reseau."""
+    try:
+        return None if value is None or isinstance(value, bool) else int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hook_build_buy():
+    """Invite : chaque geste de construction/achat (fonctions appelees par le moteur du jeu) part
+    a l'hote apres avoir ete fait ici ; un objet cree ici n'a pas d'affichage propre (0.20.3)."""
+    import build_buy
+    from objects import system
+    from objects.client_object_mixin import ClientObjectMixin
+
+    def forward(op, values):
+        try:
+            mirror_forward_build_buy(op, values)
+        except Exception:
+            _mirror_error('envoi d\'un geste de construction ({})'.format(op))
+
+    def make(op, describe, before=None):
+        def make_wrapper(original):
+            def wrapper(*args, **kwargs):
+                active = mirror_frozen() and not _sync['pushing']
+                values = None
+                if active:
+                    try:
+                        values = describe(_call_args(original, args, kwargs))
+                        if before is not None and values is not None:
+                            before(values)
+                    except Exception:
+                        _mirror_error('lecture d\'un geste de construction ({})'.format(op))
+                result = original(*args, **kwargs)
+                if values is not None:
+                    forward(op, values)
+                return result
+            return wrapper
+        return make_wrapper
+
+    def place(a, parent=True):
+        values = dict(bridge_pack_place(a.get('transform'), a.get('routing_surface')), id=_as_int(a['obj_id']))
+        if parent:
+            values.update(parent=_as_int(a.get('parent_id')) or None, ptype=_as_int(a.get('parent_type_info')),
+                          slot=_as_int(a.get('slot_hash')))
+        return values
+
+    def object_id(value):
+        return _as_int(getattr(value, 'id', value))
+
+    _mirror_wrap(system, 'c_api_create_object', make(
+        'create', lambda a: {'id': _as_int(a['obj_id']), 'def': _as_int(a['def_id']), 'state': _as_int(a.get('obj_state')),
+                             'loc': _as_int(a.get('loc_type')), 'content': _as_int(a.get('content_source'))},
+        before=lambda values: _mirror['replicas'].add(values['id'])))
+    _mirror_wrap(system, 'c_api_destroy_object', make(
+        'destroy', lambda a: {'id': object_id(a['obj_or_id'])},
+        before=lambda values: _mirror['replicas'].add(values['id'])))   # son retrait s'affiche par l'hote
+    _mirror_wrap(build_buy, 'c_api_set_object_location_ex', make('place', place))
+    _mirror_wrap(build_buy, 'c_api_set_object_location', make('place', lambda a: place(a, parent=False)))
+    _mirror_wrap(system, 'c_api_set_parent_object', make(
+        'parent', lambda a: dict(bridge_pack_place(a.get('transform'), None), id=_as_int(a['obj_id']),
+                                 parent=_as_int(a['parent_id']), joint=_as_int(a.get('joint_name')),
+                                 slot=_as_int(a.get('slot_hash')))))
+    _mirror_wrap(system, 'c_api_clear_parent_object', make(
+        'unparent', lambda a: dict(bridge_pack_place(a.get('transform'), a.get('surface')), id=_as_int(a['obj_id']))))
+    _mirror_wrap(ClientObjectMixin, 'set_definition', make(
+        'design', lambda a: ({'id': a['self'].id, 'def': _as_int(getattr(a['definition_id'], 'id', a['definition_id']))}
+                             if _mirror['bb_session'] else None)))
+
+    def make_session(opened):
+        def make_wrapper(original):
+            def session(*args, **kwargs):
+                _mirror['bb_session'] = opened
+                return original(*args, **kwargs)
+            return session
+        return make_wrapper
+    _mirror_wrap(build_buy, 'c_api_buildbuy_session_begin', make_session(True))
+    _mirror_wrap(build_buy, 'c_api_buildbuy_session_end', make_session(False))
+
+
 def _install_mirror_hooks():
     """Accroches de la simulation unique ; chacune est independante des autres."""
     for label, install in (('ligne du temps', _hook_timeline), ('horloge', _hook_clock_broadcast),
                            ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command),
-                           ('fenetres', _hook_dialog_answers), ('objets', _hook_objects)):
+                           ('fenetres', _hook_dialog_answers), ('objets', _hook_objects),
+                           ('construction', _hook_build_buy)):
         try:
             install()
             _mirror['hooks'].append(label)
