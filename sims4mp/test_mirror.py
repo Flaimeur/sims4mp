@@ -357,6 +357,12 @@ class Sim(object):
         self.sim_info = types.SimpleNamespace(sim_id=sim_id, get_sim_instance=lambda **kwargs: self)
         self._interactions = {i.id: i for i in interactions}
         self.si_state = []
+        self.autonomy = None
+        self.autonomy_settings = types.SimpleNamespace(
+            set_setting=lambda state, group: setattr(self, 'autonomy', (state, group)))
+
+    def get_autonomy_settings_group(self):
+        return 'groupe'
 
     def find_interaction_by_id(self, interaction_id):
         return self._interactions.get(interaction_id)
@@ -378,7 +384,11 @@ module('services',
        get_instance_manager=lambda kind: types.SimpleNamespace(get=INTERACTIONS.get),
        ui_dialog_service=lambda: DIALOGS,
        object_manager=lambda: MANAGER,
-       current_zone_id=lambda: 99)
+       current_zone_id=lambda: 99,
+       autonomy_service=lambda: AUTONOMY_SERVICE)
+AUTONOMY_SERVICE = types.SimpleNamespace(_selected_sim_autonomy_enabled=False)
+module('autonomy')
+module('autonomy.settings', AutonomyState=types.SimpleNamespace(LIMITED_ONLY='limitee', UNDEFINED='normale'))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, 'sims4mp.log')
@@ -582,6 +592,27 @@ report('ordre avec action principale invalide : refuse',
 mod._handle_host_event(host, 'message', {'type': protocol.EVENT, 'v': 1,
                                          'data': {'kind': 'presence', 'active_sim': 2}})
 report('presence de l\'invite : l\'hote connait le Sim qu\'il controle', host.guest_sim_id == 2)
+report('Sim de l\'invite : autonomie limitee chez l\'hote, comme un Sim selectionne (0.21.1)',
+       SIMS[1].autonomy == ('limitee', 'groupe') and mod._mirror['limited'] == {2}, str(SIMS[1].autonomy))
+mod._handle_host_event(host, 'message', {'type': protocol.EVENT, 'v': 1,
+                                         'data': {'kind': 'presence', 'active_sim': 1}})
+report('l\'invite change de Sim : l\'ancien redevient autonome, le nouveau est limite',
+       SIMS[1].autonomy == ('normale', 'groupe') and SIMS[0].autonomy == ('limitee', 'groupe')
+       and mod._mirror['limited'] == {1})
+AUTONOMY_SERVICE._selected_sim_autonomy_enabled = True
+mod._handle_host_event(host, 'message', {'type': protocol.EVENT, 'v': 1,
+                                         'data': {'kind': 'presence', 'active_sim': 1}})
+report('option « autonomie du Sim selectionne » active chez l\'hote : rien n\'est limite',
+       SIMS[0].autonomy == ('normale', 'groupe') and not mod._mirror['limited'])
+AUTONOMY_SERVICE._selected_sim_autonomy_enabled = False
+mod._handle_host_event(host, 'message', {'type': protocol.EVENT, 'v': 1,
+                                         'data': {'kind': 'presence', 'active_sim': 2}})
+mod._handle_host_event(host, 'disconnected', 'test')
+report('invite deconnecte : son Sim redevient autonome chez l\'hote',
+       SIMS[1].autonomy == ('normale', 'groupe') and not mod._mirror['limited'])
+host.handshake_done = host.mirror_ready = True
+mod._handle_host_event(host, 'message', {'type': protocol.EVENT, 'v': 1,
+                                         'data': {'kind': 'presence', 'active_sim': 2}})
 mod._mirror_tick(host, 200.0)
 del SENT[:]
 omega.send(0x1, 40, b'7:2')

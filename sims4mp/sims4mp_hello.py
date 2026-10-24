@@ -1,4 +1,7 @@
-# Sims 4 Multiplayer - simulation unique seule (0.21.0) : choix du joueur, la simulation unique
+# Sims 4 Multiplayer - Sim de l'invite (0.21.1) : chez l'hote, le Sim que controle l'invite a
+# l'autonomie limitee comme un Sim selectionne (AutonomyService._on_active_sim_changed), et
+# redevient normal quand l'invite en change ou se deconnecte.
+# Simulation unique seule (0.21.0) : choix du joueur, la simulation unique
 # est toujours active (plus de bouton dans le menu) ; les deux simulations (M3 a M6) ne tournent
 # plus pendant une partie a deux. mp.mirror off la coupe encore, pour un diagnostic seulement.
 # Simulation unique, etape 4 (0.20.3) : construction et achat faits par
@@ -228,7 +231,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.0'
+MOD_VERSION = '0.21.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -1173,6 +1176,27 @@ def bridge_apply_build_buy(op, values):
     return obj.set_definition(values['def'])          # op 'design' : nouveau coloris
 
 
+def bridge_selected_autonomy_enabled():
+    """Option du jeu « autonomie du Sim selectionne » (AutonomyService._selected_sim_autonomy_enabled)."""
+    import services
+    return bool(getattr(services.autonomy_service(), '_selected_sim_autonomy_enabled', False))
+
+
+def bridge_set_limited_autonomy(sim_id, limited):
+    """Autonomie du Sim comme le jeu pour le Sim selectionne (AutonomyService._on_active_sim_changed) :
+    sim.autonomy_settings.set_setting(LIMITED_ONLY, ...) ; UNDEFINED la rend normale. True si fait."""
+    import services
+    from autonomy.settings import AutonomyState
+    from objects import ALL_HIDDEN_REASONS
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    if sim is None:
+        return False
+    state = AutonomyState.LIMITED_ONLY if limited else AutonomyState.UNDEFINED
+    sim.autonomy_settings.set_setting(state, sim.get_autonomy_settings_group())
+    return True
+
+
 def bridge_cancel_by_id(interaction_id):
     """Hote : annule comme la croix du joueur l'action interaction_id de l'un des Sims presents
     (Sim.find_interaction_by_id puis find_continuation_by_id, comme
@@ -1428,6 +1452,8 @@ def _handle_host_event(session, kind, value):
         session.handshake_done = False
         session.close_after_flush = False
         session.mirror_ready = False
+        session.guest_sim_id = None
+        mirror_guest_autonomy(session)               # le Sim de l'invite redevient autonome (0.21.1)
         _mirror_clear_out()
     elif kind == 'message':
         msg_type = value['type']
@@ -1462,6 +1488,7 @@ def _handle_host_event(session, kind, value):
                 session.peer_seen_at = time.monotonic()
                 _note_rtt(session, data.get('rtt'))
                 session.guest_sim_id = _clean_int(data.get('active_sim'), 1, 2 ** 64)   # 0.20.1
+                mirror_guest_autonomy(session)                                        # 0.21.1
             elif data.get('kind') == 'position':
                 _handle_position(session, data)
             elif data.get('kind') == 'money':
@@ -3242,6 +3269,7 @@ _mirror = {
     'dialogs_sent': 0,
     'dialog_applied': 0,
     'dialog_answers': 0,     # invite : reponses envoyees a l'hote
+    'limited': set(),        # hote : Sims a l'autonomie limitee parce que l'invite les controle (0.21.1)
     # Objets crees apres le chargement (0.20.2).
     'objs_new': [],          # hote : objets ajoutes depuis le dernier passage (refs faibles)
     'objs_del': [],          # hote : identifiants retires depuis le dernier passage
@@ -3317,6 +3345,31 @@ def _mirror_host_only():
                                           if name == 'MSG_UI_DIALOG_SHOW'), None)
         log('simulation unique : {} type(s) de message gardes sur l\'ecran de l\'hote'.format(len(ids)))
     return ids
+
+
+# -- Sim de l'invite (0.21.1) : chez l'hote, il est traite comme un Sim selectionne --
+# Comme le jeu pour le Sim actif quand l'option « autonomie du Sim selectionne » est coupee
+# (AutonomyService._on_active_sim_changed) : autonomie limitee pour le Sim que controle l'invite
+# (presence), normale de nouveau quand il en change ou se deconnecte. Option active chez l'hote :
+# rien n'est change, comme pour son propre Sim.
+
+def mirror_guest_autonomy(session):
+    """Hote : met l'autonomie limitee sur le Sim de l'invite, et seulement sur lui."""
+    target = session.guest_sim_id if mirror_on(session) else None
+    mine = _my_active_id()
+    if target is not None and (target == mine or _read('selected_autonomy', bridge_selected_autonomy_enabled)):
+        target = None                                # Sim de l'hote, ou autonomie voulue par l'option
+    limited = _mirror['limited']
+    for sim_id in list(limited):
+        if sim_id != target:
+            limited.discard(sim_id)
+            if sim_id != mine:                       # le jeu gere lui-meme le Sim de l'hote
+                _safe('autonomie du Sim de l\'invite', bridge_set_limited_autonomy, sim_id, False)
+                log('[host] Sim {} : autonomie normale (plus controle par l\'invite)'.format(sim_id))
+    if target is not None and target not in limited:
+        if _safe('autonomie du Sim de l\'invite', bridge_set_limited_autonomy, target, True):
+            limited.add(target)
+            log('[host] Sim {} controle par l\'invite : autonomie limitee, comme un Sim selectionne'.format(target))
 
 
 # -- fenetres du jeu (0.20.1) : celles du Sim de l'invite s'ouvrent chez lui --
