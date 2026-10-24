@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - presence (0.18.0, « l'invite recopie tout ce que l'hote a », etape 1) :
+# Sims 4 Multiplayer - voyage a deux (0.19.0) : quand un joueur voyage (carte, telephone,
+# rentrer...), l'autre recoit une fenetre « Suivre sur le meme lot » ; s'il accepte, son jeu
+# voyage vers le meme lot (world.travel_service). Chez l'invite, la sauvegarde est liberee
+# le temps du voyage (le jeu sauvegarde en voyageant), puis reverrouillee a l'arrivee.
+# Presence (0.18.0, « l'invite recopie tout ce que l'hote a », etape 1) :
 # l'hote envoie la liste des Sims presents (roster) ; l'invite fait apparaitre ceux qui manquent
 # (SimSpawner.spawn_sim) et retire ceux que l'hote n'a pas (schedule_destroy_asap), sauf le Sim
 # qu'il controle ; au plus ROSTER_ACTIONS par liste, chaque Sim retente apres ROSTER_RETRY s.
@@ -200,7 +204,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.18.0'
+MOD_VERSION = '0.19.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -2235,21 +2239,160 @@ def on_player_order(queue, interaction):
     if order is None:
         return
     if is_travel(order['name']):
-        session = _session
-        if _connected(session):
-            session.endpoint.send(protocol.make_message(protocol.EVENT, {
-                'kind': 'travel', 'sim_id': order['sim_id'], 'name': order['name']}))
-            log('[{}] voyage non rejoue chez l\'autre, prevenu : {}'.format(session.role, order['name']))
+        # Jamais rejoue : le lot choisi part au depart reel du voyage (on_travel_message, 0.19.0).
+        log('[{}] voyage choisi, non rejoue chez l\'autre : {}'.format(
+            _session.role if _session is not None else '-', order['name']))
         return
     send_player_order(order, interaction)
 
 
+# -- voyage a deux (0.19.0) --
+# Tous les voyages du jeu (carte, telephone, rentrer a la maison, evenement de carriere...)
+# finissent par Distributor.add_event(Consts_pb2.MSG_TRAVEL_SIMS_TO_ZONE, TravelSimsToZone)
+# (world/travel_service.pyc, world/travel_tuning.pyc TravelSimLiability.travel_player) :
+# msg.zone_id = lot d'arrivee, msg.sim_ids = Sims du voyage. Ce PC envoie alors
+# EVENT travel (zone_id, nom du lot) ; l'autre PC propose de suivre (UiDialog) et, si oui,
+# voyage avec world.travel_service.travel_sims_to_zone(sim_ids, zone_id), comme
+# careers/career_event_manager. Le lot est verifie dans sa partie
+# (persistence_service.get_zone_proto_buff(zone_id) : None si le lot n'existe pas).
+
+_travel = {'following': None, 'offered': {}, 'sent': 0, 'followed': 0}
+TRAVEL_FOLLOW, TRAVEL_STAY = 1, 2
+TRAVEL_OFFER_REPEAT = 30.0                # meme lot propose au plus une fois par 30 s
+
+
+def bridge_zone_name(zone_id):
+    """Nom du lot (texte, eventuellement vide) ou None si ce lot n'existe pas dans cette partie."""
+    import services
+    proto = services.get_persistence_service().get_zone_proto_buff(zone_id)
+    if proto is None:
+        return None
+    return getattr(proto, 'name', '') or ''
+
+
+def bridge_follow_travel(zone_id, sim_ids):
+    """Voyage du Sim actif (et des Sims du foyer partis avec l'autre joueur) vers zone_id."""
+    import services
+    from world import travel_service
+    household = services.active_household()
+    ids = []
+    mine = _active_sim()
+    if mine is not None:
+        ids.append(mine.sim_info.sim_id)
+    for sim_id in sim_ids:
+        info = services.sim_info_manager().get(sim_id)
+        if (info is not None and sim_id not in ids and household is not None
+                and info.household_id == household.id and info.get_sim_instance() is not None):
+            ids.append(sim_id)
+    if not ids:
+        return False
+    travel_service.travel_sims_to_zone(tuple(ids), zone_id)
+    return True
+
+
+def on_travel_message(zone_id, sim_ids):
+    """Le jeu de ce PC part vers zone_id : l'autre joueur est invite a suivre."""
+    session = _session
+    if _travel['following'] is not None:
+        log('voyage : ce PC suit l\'autre joueur (lot {}), pas de nouvelle invitation'.format(zone_id))
+        return
+    if not _connected(session) or zone_id == bridge_current_zone_id():
+        return
+    lot = _read('travel_lot', lambda: bridge_zone_name(zone_id)) or ''
+    mine = _read('active_sim', _active_sim)
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {
+        'kind': 'travel', 'zone_id': zone_id, 'lot': lot[:STATE_MAX_TEXT],
+        'sim_ids': list(sim_ids)[:STATE_MAX_SIMS],
+        'sim_id': _read('sim_id', lambda: mine.sim_info.sim_id) if mine is not None else None}))
+    _flush_now(session)                              # l'ecran de chargement arrive tout de suite
+    _travel['sent'] += 1
+    log('[{}] voyage vers le lot {} ({}) : l\'autre joueur est invite a suivre'.format(
+        session.role, zone_id, lot or 'sans nom'))
+
+
 def _handle_travel(session, data):
     sim_id = _clean_int(data.get('sim_id'), 1, 2 ** 64)
-    log('[{}] l\'autre joueur voyage ({})'.format(session.role, _clean_text(data.get('name'))))
-    bridge_notify('{} part sur un autre lot. Pour continuer ensemble, rejoignez-le sur le même lot '
-                  '(voyage non synchronisé).'.format(_other_label(session).capitalize()),
-                  alert=True, sim_id=sim_id, key='travel')
+    zone_id = _clean_int(data.get('zone_id'), 1, 2 ** 64)
+    who = _other_label(session).capitalize()
+    if zone_id is None:
+        # Mod plus ancien en face : seulement prevenu.
+        log('[{}] l\'autre joueur voyage ({})'.format(session.role, _clean_text(data.get('name'))))
+        bridge_notify('{} part sur un autre lot. Pour continuer ensemble, rejoignez-le sur le même lot '
+                      '(voyage non synchronisé).'.format(who), alert=True, sim_id=sim_id, key='travel')
+        return
+    now = time.monotonic()
+    if now - _travel['offered'].get(zone_id, -TRAVEL_OFFER_REPEAT) < TRAVEL_OFFER_REPEAT:
+        return
+    _travel['offered'] = {zone_id: now}
+    raw_ids = data.get('sim_ids') if isinstance(data.get('sim_ids'), list) else []
+    sim_ids = [i for i in (_clean_int(v, 1, 2 ** 64) for v in raw_ids[:STATE_MAX_SIMS]) if i is not None]
+    log('[{}] l\'autre joueur part vers le lot {}'.format(session.role, zone_id))
+    if zone_id == bridge_current_zone_id():
+        bridge_notify('{} vous rejoint sur ce lot.'.format(who), sim_id=sim_id, key='travel-here')
+        return
+    try:
+        name = bridge_zone_name(zone_id)
+    except Exception:
+        _sync_error('nom du lot d\'arrivee')
+        name = ''                                    # lecture impossible : le voyage est quand meme propose
+    if name is None:
+        bridge_notify('{} part sur un lot introuvable dans votre partie : impossible de le suivre. '
+                      'Jouez la même sauvegarde des deux côtés.'.format(who), alert=True, sim_id=sim_id,
+                      key='travel-missing')
+        return
+    lot = '« {} »'.format(name or _clean_text(data.get('lot')) or 'un autre lot')
+    try:
+        bridge_show_dialog('Voyage à deux', '{} part sur {}. Le suivre pour continuer ensemble ?'.format(who, lot),
+                           ((TRAVEL_FOLLOW, 'Suivre sur le même lot'), (TRAVEL_STAY, 'Rester ici')),
+                           lambda choice: on_travel_choice(choice, zone_id, sim_ids))
+    except Exception:
+        _sync_error('fenetre de voyage')
+        bridge_notify('{} part sur {} (voyage non suivi).'.format(who, lot), alert=True, sim_id=sim_id)
+
+
+def on_travel_choice(choice, zone_id, sim_ids):
+    if choice != TRAVEL_FOLLOW:
+        log('voyage : le joueur reste sur ce lot')
+        return
+    if zone_id == bridge_current_zone_id():
+        return
+    _travel['following'] = zone_id                   # pas d'invitation en retour, sauvegarde liberee
+    _save_lock_tick(_session)                        # invite : le jeu doit pouvoir sauvegarder pour voyager
+    try:
+        ok = bridge_follow_travel(zone_id, sim_ids)
+    except Exception:
+        ok = False
+        _sync_error('voyage pour suivre')
+    if ok:
+        _travel['followed'] += 1
+        log('voyage : ce PC suit l\'autre joueur vers le lot {}'.format(zone_id))
+    else:
+        _travel['following'] = None
+        bridge_notify('Voyage impossible pour suivre l\'autre joueur (voir le journal).', alert=True)
+
+
+def _install_travel_hook():
+    """Depart reel d'un voyage : Distributor.add_event avec MSG_TRAVEL_SIMS_TO_ZONE
+    (distributor/system.pyc : add_event(self, msg_id, msg, immediate=False))."""
+    from distributor.system import Distributor
+    from protocolbuffers import Consts_pb2
+    travel_msg = Consts_pb2.MSG_TRAVEL_SIMS_TO_ZONE
+    original = Distributor.add_event
+    if getattr(original, '_sims4mp_hook', False):
+        return
+
+    @functools.wraps(original)
+    def add_event(self, msg_id, msg, *args, **kwargs):
+        if msg_id == travel_msg:
+            try:
+                on_travel_message(msg.zone_id, list(msg.sim_ids))
+            except Exception:
+                _sync_error('suivi des voyages')
+        return original(self, msg_id, msg, *args, **kwargs)
+
+    add_event._sims4mp_hook = True
+    Distributor.add_event = add_event
+    log('voyage : departs suivis (Distributor.add_event, MSG_TRAVEL_SIMS_TO_ZONE)')
 
 
 # -- qui fait foi pour chaque Sim (M6) --
@@ -3250,8 +3393,10 @@ def bridge_unlock_save(holder):
 
 
 def _save_lock_tick(session):
-    """Invite connecte : sauvegarde verrouillee ; sinon deverrouillee."""
-    wanted = session is not None and session.role == 'client' and session.handshake_done
+    """Invite connecte : sauvegarde verrouillee ; sinon deverrouillee (aussi pendant un voyage
+    pour suivre l'autre joueur : le jeu sauvegarde en voyageant)."""
+    wanted = (session is not None and session.role == 'client' and session.handshake_done
+              and _travel['following'] is None)
     holder = _save_lock['holder']
     if wanted and holder is None:
         holder = _GuestSaveLock()
@@ -3865,6 +4010,9 @@ def on_zone_loaded():
 
 def _safe_on_zone_loaded():
     # Aucune exception ne doit remonter dans le chargement du jeu.
+    if _travel['following'] is not None:
+        log('voyage : arrive sur le lot de l\'autre joueur ({})'.format(_travel['following']))
+    _travel['following'] = None                      # voyage termine (ou nouvelle partie)
     install_menu()                                   # protege lui-meme ses erreurs
     try:
         on_zone_loaded()
@@ -4236,3 +4384,9 @@ try:
 except Exception:
     # Sans ce hook, la pause reste imposee mais la file n'est pas bloquee.
     log('ERREUR installation blocage de la file :\n' + traceback.format_exc())
+
+try:
+    _install_travel_hook()
+except Exception:
+    # Sans ce hook, l'autre joueur n'est pas invite a suivre un voyage.
+    log('ERREUR installation voyage a deux :\n' + traceback.format_exc())

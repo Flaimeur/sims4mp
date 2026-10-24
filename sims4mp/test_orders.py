@@ -57,6 +57,23 @@ class _Zone(object):
 module('zone', Zone=_Zone)
 
 
+class Distributor(object):
+    events = []
+
+    def add_event(self, msg_id, msg, immediate=False):
+        Distributor.events.append((msg_id, msg))
+
+
+module('distributor')
+module('distributor.system', Distributor=Distributor)
+Consts_pb2 = types.SimpleNamespace(MSG_TRAVEL_SIMS_TO_ZONE=184)
+module('protocolbuffers', Consts_pb2=Consts_pb2)
+TRAVELS = []                                      # voyages lances par world.travel_service
+module('world')
+module('world.travel_service', travel_sims_to_zone=lambda sim_ids, zone_id: TRAVELS.append((sim_ids, zone_id)))
+ZONES = {555: 'Maison Dupont', 777: 'Bar du Quai'}   # lots de la partie (persistence_service)
+
+
 class InteractionContext(object):
     SOURCE_PIE_MENU, SOURCE_AUTONOMY, SOURCE_SCRIPT, SOURCE_SCRIPT_WITH_USER_INTENT = 1, 2, 3, 4
 
@@ -218,7 +235,10 @@ module('services', client_manager=lambda: types.SimpleNamespace(get_first_client
            get=SIM_INFOS.get, instanced_sims_gen=lambda allow_hidden_flags=None: list(INSTANCED)),
        object_manager=lambda zone_id=None: types.SimpleNamespace(get=OBJECTS.get),
        get_instance_manager=lambda kind: types.SimpleNamespace(get=AFFORDANCES.get),
-       current_zone_id=lambda: 555, active_household=lambda: None)
+       current_zone_id=lambda: 555, active_household=lambda: None,
+       get_persistence_service=lambda: types.SimpleNamespace(
+           get_zone_proto_buff=lambda zone_id: types.SimpleNamespace(name=ZONES[zone_id]) if zone_id in ZONES
+           else None))
 module('objects', ALL_HIDDEN_REASONS='ALL')
 module('objects.terrain', TerrainPoint=TerrainPoint)
 module('routing', SurfaceIdentifier=lambda zone, level, kind: types.SimpleNamespace(level=level),
@@ -485,9 +505,9 @@ report('meme action autonome proposee 5 fois de suite : envoyee une seule fois',
 TRAVEL = affordance('Travel_DummyInteractions_Phone_TravelWith', 1300)
 before = len(events('order'))
 my_sim.queue.append(Interaction(TRAVEL, None))
-pump_until(lambda: events('travel'))
-report('voyage choisi par le joueur : pas rejoue chez l\'autre, seulement signale',
-       len(events('order')) == before and events('travel') and events('travel')[-1]['name'] == TRAVEL.__name__)
+pump_for(0.15)
+report('voyage choisi par le joueur : pas rejoue chez l\'autre (le lot part au depart reel du voyage)',
+       len(events('order')) == before and not events('travel'))
 del notes[:]
 send({'kind': 'travel', 'sim_id': 2002, 'name': 'Travel_DummyInteractions_Phone_TravelWith'})
 send({'kind': 'order', 'id': 'client-99', 'sim_id': 2002, 'affordance': 1300,
@@ -567,6 +587,70 @@ report('action que le jeu ne sait pas recreer : essayee une fois, puis plus rejo
 with open(mod.LOG_PATH, encoding='utf-8') as handle:
     report('journal : une seule ligne pour cette action',
            handle.read().count('put_down_anywhere : le jeu ne sait pas recreer cette action ici') == 1)
+
+# --- 7. Voyage a deux (0.19.0) ------------------------------------------------------------------
+report('departs de voyage suivis (Distributor.add_event enveloppe)',
+       getattr(Distributor.add_event, '_sims4mp_hook', False))
+del inbox[:]
+del Distributor.events[:]
+Distributor().add_event(184, types.SimpleNamespace(zone_id=777, sim_ids=[1001]))
+pump_until(lambda: events('travel'))
+sent = events('travel')[-1] if events('travel') else {}
+report('depart vers un autre lot : lot envoye a l\'autre joueur (id, nom, Sims), message du jeu transmis',
+       sent.get('zone_id') == 777 and sent.get('lot') == 'Bar du Quai' and sent.get('sim_ids') == [1001]
+       and sent.get('sim_id') == 1001 and len(Distributor.events) == 1, str(sent))
+del inbox[:]
+Distributor().add_event(184, types.SimpleNamespace(zone_id=555, sim_ids=[1001]))
+Distributor().add_event(12, types.SimpleNamespace(zone_id=777, sim_ids=[1001]))
+pump_for(0.15)
+report('voyage vers le lot actuel ou autre message du jeu : rien envoye',
+       not events('travel') and len(Distributor.events) == 3)
+
+dialogs = []
+mod.bridge_show_dialog = lambda title, text, choices, on_choice: dialogs.append((title, text, choices, on_choice))
+send({'kind': 'travel', 'zone_id': 777, 'lot': 'Bar du Quai', 'sim_ids': [2002, 'x'], 'sim_id': 2002})
+pump_until(lambda: dialogs)
+send({'kind': 'travel', 'zone_id': 777, 'lot': 'Bar du Quai', 'sim_ids': [2002], 'sim_id': 2002})
+pump_for(0.15)
+title, text, choices, on_choice = dialogs[0] if dialogs else (None, '', (), None)
+report('voyage de l\'autre : fenetre « Suivre sur le meme lot » (nom du lot de ma partie), une seule fois',
+       len(dialogs) == 1 and title == 'Voyage à deux' and '« Bar du Quai »' in text
+       and choices[0] == (mod.TRAVEL_FOLLOW, 'Suivre sur le même lot'), text)
+on_choice(mod.TRAVEL_STAY)
+report('« Rester ici » : aucun voyage', TRAVELS == [] and mod._travel['following'] is None)
+on_choice(mod.TRAVEL_FOLLOW)
+report('« Suivre » : mon Sim actif voyage vers le meme lot (world.travel_service)',
+       TRAVELS == [((1001,), 777)] and mod._travel['following'] == 777, str(TRAVELS))
+del inbox[:]
+Distributor().add_event(184, types.SimpleNamespace(zone_id=777, sim_ids=[1001]))   # le jeu part
+pump_for(0.15)
+report('en suivant : pas d\'invitation renvoyee a l\'autre joueur', not events('travel'))
+_Zone().on_loading_screen_animation_finished()
+report('arrivee sur le lot : voyage termine', mod._travel['following'] is None)
+
+del notes[:]
+del dialogs[:]
+send({'kind': 'travel', 'zone_id': 999, 'lot': 'Lot pirate', 'sim_id': 2002})
+send({'kind': 'travel', 'zone_id': 555, 'lot': 'Maison Dupont', 'sim_id': 2002})
+pump_until(lambda: len(notes) >= 2)
+report('lot absent de ma partie : alerte, pas de fenetre ; mon lot : « vous rejoint »',
+       not dialogs and any('introuvable' in n for n in notes) and any('vous rejoint sur ce lot' in n for n in notes),
+       str(notes))
+
+guest_lock = mod.NetSession('client', types.SimpleNamespace(is_connected=True))
+guest_lock.handshake_done = True
+locks = []
+mod.bridge_lock_save = lambda holder: locks.append('lock')
+mod.bridge_unlock_save = lambda holder: locks.append('unlock')
+mod._save_lock_tick(guest_lock)
+mod._travel['following'] = 777
+mod._save_lock_tick(guest_lock)
+mod._travel['following'] = None
+mod._save_lock_tick(guest_lock)
+report('invite : sauvegarde liberee pendant le voyage pour suivre, reverrouillee apres',
+       locks == ['lock', 'unlock', 'lock'], str(locks))
+mod._save_lock_tick(None)
+report('aucune erreur de pompe (voyage)', mod._pump['error'] is None, str(mod._pump['error']))
 
 peer.close()
 mod._close_session()
