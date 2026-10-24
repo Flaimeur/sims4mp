@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - simulation unique (0.20.0, P2 etape 1, experimental, choisie par l'hote) :
+# Sims 4 Multiplayer - simulation unique, etape 2 (0.20.1) : les actions sociales (mixers) de
+# l'invite partent avec leur action principale et l'hote les recree (AffordanceObjectPair puis
+# test_and_execute, comme le menu du jeu) ; les fenetres du jeu dont le Sim est celui de l'invite
+# (UiDialogMessage.owner_id) s'ouvrent chez lui seulement et sa reponse (bouton, liste, texte)
+# est appliquee chez l'hote. L'invite envoie le Sim qu'il controle dans sa presence.
+# Simulation unique (0.20.0, P2 etape 1, experimental, choisie par l'hote) :
 # l'hote fait tourner la seule simulation et recopie a l'invite ce qu'il envoie a son affichage
 # (omega.send, sauf ses fenetres et menus) ; chez l'invite la ligne du temps des Sims est gelee,
 # l'heure et les PNJ viennent de l'hote, ses clics partent comme ordres (M5) et sa croix annule
@@ -212,7 +217,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.20.0'
+MOD_VERSION = '0.20.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -294,7 +299,7 @@ MIRROR_REPORT_INTERVAL = 60.0             # resume dans le journal, en secondes 
 MIRROR_ERRORS_LOGGED = 20                 # erreurs d'affichage differentes notees au plus
 # Messages propres a l'ecran de l'hote (Consts_pb2) : ses fenetres, menus, notifications, camera.
 MIRROR_HOST_ONLY = frozenset([
-    'MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE', 'MSG_UI_DIALOG_SHOW', 'MSG_UI_DIALOG_CLOSE',
+    'MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE', 'MSG_UI_DIALOG_SHOW',
     'MSG_UI_NOTIFICATION_SHOW', 'MSG_UI_PHONE_RING', 'MSG_CAMERA_FOCUS_EVENT', 'MSG_TRAVEL_MENU_CREATE',
     'MSG_TRAVEL_MENU_CANCEL', 'MSG_TRAVEL_MENU_SHOW', 'MSG_GAME_SAVE_COMPLETE', 'MSG_GAME_SAVE_LOCK_UNLOCK',
     'MSG_GAME_SAVE_CHEAT_LOCK', 'MSG_SELECTABLE_SIMS_UPDATE', 'MSG_SET_CHEAT_STATUS', 'MSG_GAMEPLAY_OPTIONS',
@@ -305,6 +310,8 @@ MIRROR_HOST_ONLY = frozenset([
 MIRROR_HOST_ONLY_PREFIXES = ('MSG_CONNECTION_STATUS_', 'MSG_DEBUGVISUALIZATION_', 'MSG_TUTORIAL_', 'MSG_SOP_',
                              'MSG_NS_', 'MSG_CACHE_', 'MSG_GSI_')
 MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique).'
+MIRROR_DIALOGS_MAX = 100                  # hote : fenetres envoyees a l'invite gardees (reponses acceptees)
+MIRROR_PICKS_MAX = 64                     # elements choisis au plus dans une reponse de liste
 
 
 # ---------------------------------------------------------------------------
@@ -815,14 +822,20 @@ def bridge_sim_snapshot(sim_id):
     }
 
 
-def bridge_order_from_interaction(queue, interaction, kind='pie'):
+def bridge_order_from_interaction(queue, interaction, kind='pie', mixers=False):
     """Description d'une action pour la rejouer ailleurs, ou None. kind 'pie' : choisie au menu
-    (SOURCE_PIE_MENU) ; 'auto' : decidee par l'autonomie (SOURCE_AUTONOMY). Super-interactions seules."""
+    (SOURCE_PIE_MENU) ; 'auto' : decidee par l'autonomie (SOURCE_AUTONOMY). Super-interactions seules,
+    sauf mixers=True (simulation unique, 0.20.1) : une action sociale (mixer) part avec son action
+    principale (Interaction.super_affordance) dans 'super'."""
     if bridge_interaction_kind(interaction) != kind:
         return None
     affordance = interaction.affordance
+    super_id = None
     if not getattr(affordance, 'is_super', False):
-        return None
+        super_affordance = getattr(interaction, 'super_affordance', None) if mixers else None
+        if super_affordance is None:
+            return None
+        super_id = super_affordance.guid64
     target = interaction.target
     if target is None:
         where = {'t': 'none'}
@@ -836,11 +849,14 @@ def bridge_order_from_interaction(queue, interaction, kind='pie'):
         if getattr(target, 'is_part', False):
             target = target.part_owner                 # le jeu choisit la place (canape, lit double...)
         where = {'t': 'obj', 'id': target.id}
-    return {'sim_id': queue.sim.sim_info.sim_id, 'affordance': affordance.guid64,
-            'name': affordance.__name__, 'target': where, 'auto': kind == 'auto'}
+    order = {'sim_id': queue.sim.sim_info.sim_id, 'affordance': affordance.guid64,
+             'name': affordance.__name__, 'target': where, 'auto': kind == 'auto'}
+    if super_id is not None:
+        order['super'] = super_id
+    return order
 
 
-def bridge_replay_order(sim_id, affordance_id, where, auto=False):
+def bridge_replay_order(sim_id, affordance_id, where, auto=False, super_id=None):
     """Rejoue l'ordre : meme Sim, meme action, meme cible. Renvoie (True, None) ou (False, raison).
     Ordre du joueur : contexte SOURCE_SCRIPT_WITH_USER_INTENT, priorite haute ; action de
     l'autonomie : SOURCE_SCRIPT, priorite basse (comme une decision du Sim, pas un ordre)."""
@@ -873,11 +889,36 @@ def bridge_replay_order(sim_id, affordance_id, where, auto=False):
             context = InteractionContext(sim, InteractionContext.SOURCE_SCRIPT, Priority.Low)
         else:
             context = InteractionContext(sim, InteractionContext.SOURCE_SCRIPT_WITH_USER_INTENT, Priority.High)
-    result = sim.push_super_affordance(affordance, target, context)
+    if super_id is not None:
+        result = _replay_mixer(sim, affordance, target, context, super_id)
+        if isinstance(result, str):
+            return False, result
+    else:
+        result = sim.push_super_affordance(affordance, target, context)
     if not result:
         return False, 'refusee par le jeu ({})'.format(result)
     # EnqueueResult.interaction (event_testing/results.pyc) : l'action rejouee, pour l'annulation.
     return True, getattr(result, 'interaction', None)
+
+
+def _replay_mixer(sim, mixer, target, context, super_id):
+    """Action sociale (0.20.1) comme le menu du jeu : MixerInteraction.potential_interactions cree
+    AffordanceObjectPair(mixer, cible, action principale, action principale en cours) ; ici la meme
+    paire, avec l'action principale deja en cours sur le Sim (sim.si_state) s'il y en a une
+    (sinon le mixer la pousse lui-meme), puis aop.test_and_execute(contexte), comme ChoiceMenu.select.
+    Renvoie le resultat du jeu, ou un texte d'erreur."""
+    import services
+    import sims4.resources
+    from interactions.aop import AffordanceObjectPair
+    super_affordance = services.get_instance_manager(sims4.resources.Types.INTERACTION).get(super_id)
+    if super_affordance is None:
+        return 'action principale inconnue ici (pack ou mod different ?)'
+    running = None
+    for si in sim.si_state:
+        if si.affordance is super_affordance and not si.is_finishing:
+            running = si
+            break
+    return AffordanceObjectPair(mixer, target, super_affordance, running).test_and_execute(context)
 
 
 def bridge_cancel_interaction(interaction):
@@ -994,6 +1035,30 @@ def bridge_is_frozen_timeline(timeline):
     if zone is None or not zone.is_zone_running:
         return False
     return timeline is services.time_service().sim_timeline
+
+
+def bridge_dialog_ids(data):
+    """(dialog_id, owner_id) d'un message MSG_UI_DIALOG_SHOW (protocolbuffers.Dialog_pb2
+    .UiDialogMessage, champs 1 et 5 ; owner_id : le Sim concerne)."""
+    from protocolbuffers import Dialog_pb2
+    message = Dialog_pb2.UiDialogMessage()
+    message.ParseFromString(bytes(data))
+    return message.dialog_id, message.owner_id
+
+
+def bridge_answer_dialog(how, dialog_id, values):
+    """Hote : reponse de l'invite comme si elle venait de son propre ecran (ui/ui_dialog_service.pyc :
+    dialog_respond(dialog_id, response, client), dialog_pick_result(dialog_id, picked_results,
+    ingredient_check, prepped_ingredient_check, recipe_id), dialog_text_input(dialog_id, nom, texte)).
+    Renvoie le resultat du jeu."""
+    import services
+    service = services.ui_dialog_service()
+    if how == 'respond':
+        return service.dialog_respond(dialog_id, values[0], services.client_manager().get_first_client())
+    if how == 'pick':
+        return service.dialog_pick_result(dialog_id, tuple(values[0]), values[1], values[2], values[3])
+    service.dialog_text_input(dialog_id, values[0], values[1])
+    return True
 
 
 def bridge_cancel_by_id(interaction_id):
@@ -1120,6 +1185,7 @@ class NetSession(object):
         self.roster_unknown = set()     # Sims de l'hote qui n'existent pas dans la partie de l'invite
         # Simulation unique (0.20.0) : l'invite a gele sa simulation et affiche celle de l'hote.
         self.mirror_ready = False       # hote : l'invite a confirme (EVENT mirror_ready)
+        self.guest_sim_id = None        # hote : Sim que l'invite controle (presence), ses fenetres (0.20.1)
 
 
 # ---------------------------------------------------------------------------
@@ -1283,6 +1349,7 @@ def _handle_host_event(session, kind, value):
             if data.get('kind') == 'presence':
                 session.peer_seen_at = time.monotonic()
                 _note_rtt(session, data.get('rtt'))
+                session.guest_sim_id = _clean_int(data.get('active_sim'), 1, 2 ** 64)   # 0.20.1
             elif data.get('kind') == 'position':
                 _handle_position(session, data)
             elif data.get('kind') == 'money':
@@ -1307,6 +1374,8 @@ def _handle_host_event(session, kind, value):
                 _handle_mirror_ready(session, data)
             elif data.get('kind') == 'cancel_si':
                 _handle_cancel_si(session, data)
+            elif data.get('kind') == 'dialog':
+                _handle_dialog(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -2254,9 +2323,15 @@ def validate_order(data):
                  'level': _clean_int(where.get('level'), POSITION_LEVELS[0], POSITION_LEVELS[1])}
     else:
         return None
-    return {'id': order_id, 'sim_id': sim_id, 'affordance': affordance,
-            'name': _clean_text(data.get('name')) or str(affordance), 'target': clean,
-            'auto': data.get('auto') is True}
+    order = {'id': order_id, 'sim_id': sim_id, 'affordance': affordance,
+             'name': _clean_text(data.get('name')) or str(affordance), 'target': clean,
+             'auto': data.get('auto') is True}
+    if data.get('super') is not None:
+        super_id = _clean_int(data.get('super'), 1, 2 ** 64)
+        if super_id is None:
+            return None
+        order['super'] = super_id                    # action sociale (0.20.1)
+    return order
 
 
 def _handle_order(session, data):
@@ -2285,7 +2360,7 @@ def _handle_order(session, data):
     _sync['pushing'] = True                          # pas un ordre du joueur de ce PC
     try:
         result = _safe('ordre rejoue', bridge_replay_order, order['sim_id'], order['affordance'], order['target'],
-                       order['auto'])
+                       order['auto'], order.get('super'))
     finally:
         _sync['pushing'] = False
     ok, reason = result if result is not None else (False, 'erreur (voir le journal)')
@@ -2811,6 +2886,8 @@ def _maybe_send_presence(session, now):
     presence = {'kind': 'presence'}
     if session.role == 'client' and session.rtt_ms is not None:
         presence['rtt'] = round(session.rtt_ms, 1)        # l'hote connait ainsi la latence
+    if session.role == 'client' and _mirror['active']:
+        presence['active_sim'] = _my_active_id()          # ses fenetres lui sont envoyees (0.20.1)
     session.endpoint.send(protocol.make_message(protocol.EVENT, presence))
 
 
@@ -3003,7 +3080,8 @@ def _install_traffic_hook():
                 _traffic['errors'] += 1
         if _mirror['capturing']:
             try:
-                mirror_capture(msg_id, data)
+                if mirror_capture(msg_id, data) == 'guest':
+                    return None                      # fenetre du Sim de l'invite : chez lui seulement
             except Exception:
                 _mirror_error('recopie d\'un message')
         return original(session_id, msg_id, data, *args, **kwargs)
@@ -3043,6 +3121,11 @@ _mirror = {
     'capturing': False,      # hote : recopie en cours (invite connecte et pret)
     'out': [],               # hote : (msg_id, octets) a envoyer au prochain passage de la pompe
     'host_only': None,       # ids MSG_* jamais recopies (lus dans Consts_pb2 a la demande)
+    'dialog_show_id': None,  # MSG_UI_DIALOG_SHOW (lu en meme temps)
+    'dialogs': [],           # hote : fenetres envoyees a l'invite (identifiants), 0.20.1
+    'dialogs_sent': 0,
+    'dialog_applied': 0,
+    'dialog_answers': 0,     # invite : reponses envoyees a l'hote
     'sent': [0, 0],          # hote : messages, octets recopies
     'batches': 0,
     'skipped': 0,            # hote : messages propres a son ecran
@@ -3055,6 +3138,7 @@ _mirror = {
     'clock_skipped': 0,
     'spawns_skipped': 0,
     'refused': 0,            # invite : clics envoyes a l'hote au lieu de sa file
+    'unsent': 0,             # invite : clics que l'hote ne saurait pas rejouer
     'cancels_sent': 0,
     'cancels_applied': 0,
     'errors': 0,
@@ -3098,17 +3182,106 @@ def _mirror_host_only():
             if name in MIRROR_HOST_ONLY or name.startswith(MIRROR_HOST_ONLY_PREFIXES):
                 found.add(msg_id)
         ids = _mirror['host_only'] = frozenset(found)
+        _mirror['dialog_show_id'] = next((msg_id for msg_id, name in _message_names().items()
+                                          if name == 'MSG_UI_DIALOG_SHOW'), None)
         log('simulation unique : {} type(s) de message gardes sur l\'ecran de l\'hote'.format(len(ids)))
     return ids
 
 
+# -- fenetres du jeu (0.20.1) : celles du Sim de l'invite s'ouvrent chez lui --
+
+def _mirror_dialog_for_guest(data):
+    """Hote : vrai si la fenetre (UiDialogMessage) concerne le Sim que controle l'invite (owner_id),
+    et pas aussi celui de l'hote. Son identifiant est garde pour accepter la reponse de l'invite."""
+    session = _session
+    guest_sim = session.guest_sim_id if session is not None else None
+    if guest_sim is None:
+        return False
+    dialog_id, owner_id = bridge_dialog_ids(data)
+    if owner_id != guest_sim or owner_id == _my_active_id():
+        return False
+    routed = _mirror['dialogs']
+    routed.append(dialog_id)
+    del routed[:-MIRROR_DIALOGS_MAX]
+    _mirror['dialogs_sent'] += 1
+    log('[host] fenetre {} du Sim de l\'invite : ouverte chez lui'.format(dialog_id))
+    return True
+
+
+def mirror_forward_dialog(kind, dialog_id, values):
+    """Invite : reponse a une fenetre de l'hote (inconnue de son propre jeu), envoyee a l'hote."""
+    session = _session
+    dialog_id = _clean_int(dialog_id, 0, 2 ** 64)
+    if dialog_id is None or not _connected(session):
+        return False
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {
+        'kind': 'dialog', 'how': kind, 'id': dialog_id, 'values': values}))
+    _flush_now(session)
+    _mirror['dialog_answers'] += 1
+    log('[client] reponse a la fenetre {} envoyee a l\'hote ({})'.format(dialog_id, kind))
+    return True
+
+
+def _clean_dialog_values(how, values):
+    """Arguments d'une reponse de fenetre, verifies : None si invalides."""
+    if not isinstance(values, list) or len(values) > 8:
+        return None
+    if how == 'respond':
+        response = _clean_int(values[0], -2 ** 31, 2 ** 31) if len(values) == 1 else None
+        return [response] if response is not None else None
+    if how == 'pick':
+        if len(values) != 4 or not isinstance(values[0], list) or len(values[0]) > MIRROR_PICKS_MAX:
+            return None
+        picked = [_clean_int(v, 0, 2 ** 64) for v in values[0]]
+        if None in picked or not all(isinstance(v, bool) for v in values[1:3]):
+            return None
+        recipe = None if values[3] is None else _clean_int(values[3], 0, 2 ** 64)
+        if values[3] is not None and recipe is None:
+            return None
+        return [picked, values[1], values[2], recipe]
+    if how == 'text':
+        if len(values) != 2:
+            return None
+        name, text = values
+        if not isinstance(name, str) or not isinstance(text, str) or len(name) > 64 or len(text) > 1000:
+            return None
+        return [name, text]
+    return None
+
+
+def _handle_dialog(session, data):
+    """Hote : applique la reponse de l'invite a une fenetre qui lui a ete envoyee."""
+    dialog_id = _clean_int(data.get('id'), 0, 2 ** 64)
+    how = data.get('how')
+    values = _clean_dialog_values(how, data.get('values'))
+    if dialog_id is None or values is None or not mirror_on(session):
+        log('[host] reponse de fenetre invalide ignoree')
+        return
+    if dialog_id not in _mirror['dialogs']:
+        log('[host] reponse de l\'invite a une fenetre qui ne lui a pas ete envoyee ({}) : ignoree'.format(dialog_id))
+        return
+    _sync['pushing'] = True
+    try:
+        done = _safe('reponse de l\'invite a une fenetre', bridge_answer_dialog, how, dialog_id, values)
+    finally:
+        _sync['pushing'] = False
+    if done:
+        _mirror['dialog_applied'] += 1
+        log('[host] fenetre {} : reponse de l\'invite appliquee ({})'.format(dialog_id, how))
+
+
 def mirror_capture(msg_id, data):
-    """Hote : garde un message envoye a son affichage pour le recopier a l'invite."""
-    if msg_id in _mirror_host_only():
-        _mirror['skipped'] += 1
-        return
+    """Hote : garde un message envoye a son affichage pour le recopier a l'invite. Renvoie 'guest'
+    pour une fenetre du Sim de l'invite, qui ne doit pas s'ouvrir chez l'hote (0.20.1)."""
     if not isinstance(data, (bytes, bytearray)):
-        return
+        return None
+    host_only = _mirror_host_only()                  # lit aussi l'identifiant MSG_UI_DIALOG_SHOW
+    if msg_id == _mirror['dialog_show_id'] and _mirror_dialog_for_guest(data):
+        _mirror['out'].append((msg_id, bytes(data)))
+        return 'guest'
+    if msg_id in host_only:
+        _mirror['skipped'] += 1
+        return None
     if len(data) > MIRROR_MAX_RAW:
         _mirror['too_big'] += 1
         if _mirror['too_big'] <= 5:
@@ -3184,8 +3357,10 @@ def mirror_lines():
                     _mirror['ignored']),
                 '  gel : {} pas de simulation, {} heure(s), {} venue(s) de PNJ évités'.format(
                     _mirror['frozen'], _mirror['clock_skipped'], _mirror['spawns_skipped']),
-                '  clics envoyés à l\'hôte : {} , annulations : {} , erreurs : {}'.format(
-                    _mirror['refused'], _mirror['cancels_sent'], _mirror['errors'])]
+                '  clics envoyés à l\'hôte : {} (non transmissibles : {}) , annulations : {}'.format(
+                    _mirror['refused'], _mirror['unsent'], _mirror['cancels_sent']),
+                '  réponses aux fenêtres de l\'hôte : {} , erreurs : {}'.format(
+                    _mirror['dialog_answers'], _mirror['errors'])]
     session = _session
     state = 'active' if mirror_on(session) else 'demandée (en attente de l\'invité)'
     return ['Simulation unique : {}.'.format(state),
@@ -3193,6 +3368,8 @@ def mirror_lines():
                 _mirror['sent'][0], _mirror['batches'], _mirror['sent'][1] / 1024.0),
             '  gardés sur votre écran : {} , trop gros : {} , abandonnés : {}'.format(
                 _mirror['skipped'], _mirror['too_big'], _mirror['dropped']),
+            '  fenêtres ouvertes chez l\'invité : {} , réponses appliquées : {}'.format(
+                _mirror['dialogs_sent'], _mirror['dialog_applied']),
             '  annulations de l\'invité : {} , erreurs : {}'.format(_mirror['cancels_applied'], _mirror['errors'])]
 
 
@@ -3289,7 +3466,16 @@ def mirror_takes_order(queue, interaction):
     if _sync['pushing'] or not mirror_frozen() or not _is_user_directed(interaction):
         return False
     _mirror['refused'] += 1
-    on_player_order(queue, interaction)
+    # Actions sociales comprises (0.20.1) : chez l'invite elles ne peuvent tourner nulle part ailleurs.
+    order = _safe('lecture de l\'ordre', bridge_order_from_interaction, queue, interaction, 'pie', True)
+    if order is None:
+        _mirror['unsent'] += 1
+        log('[client] clic non transmissible a l\'hote ({})'.format(
+            _read('affordance', lambda: interaction.affordance.__name__)))
+    elif is_travel(order['name']):
+        log('[client] voyage de l\'invite non transmis : l\'hote mene les voyages ({})'.format(order['name']))
+    else:
+        send_player_order(order, interaction)
     return True
 
 
@@ -3392,10 +3578,59 @@ def _hook_cancel_command():
     _mirror_wrap(interaction_commands, 'cancel_common', make)
 
 
+def _hook_dialog_answers():
+    """Invite : une reponse a une fenetre que son jeu ne connait pas (UiDialogService.get_dialog
+    renvoie None) vient d'une fenetre de l'hote ; elle part a l'hote (0.20.1)."""
+    from ui.ui_dialog_service import UiDialogService
+
+    def for_host(service, dialog_id):
+        return mirror_frozen() and service.get_dialog(dialog_id) is None
+
+    def make_respond(original):
+        def dialog_respond(self, dialog_id, response, *args, **kwargs):
+            try:
+                if for_host(self, dialog_id) and mirror_forward_dialog('respond', dialog_id, [int(response)]):
+                    return True
+            except Exception:
+                _mirror_error('reponse a une fenetre')
+            return original(self, dialog_id, response, *args, **kwargs)
+        return dialog_respond
+
+    def make_pick(original):
+        def dialog_pick_result(self, dialog_id, picked_results=(), ingredient_check=False,
+                               prepped_ingredient_check=False, recipe_id=None, *args, **kwargs):
+            try:
+                if for_host(self, dialog_id) and mirror_forward_dialog('pick', dialog_id, [
+                        [int(v) for v in picked_results or ()], bool(ingredient_check),
+                        bool(prepped_ingredient_check), None if recipe_id is None else int(recipe_id)]):
+                    return True
+            except Exception:
+                _mirror_error('choix dans une fenetre')
+            return original(self, dialog_id, picked_results, ingredient_check, prepped_ingredient_check,
+                            recipe_id, *args, **kwargs)
+        return dialog_pick_result
+
+    def make_text(original):
+        def dialog_text_input(self, dialog_id, text_input_name, text_input_value, *args, **kwargs):
+            try:
+                if for_host(self, dialog_id) and mirror_forward_dialog(
+                        'text', dialog_id, [str(text_input_name), str(text_input_value)]):
+                    return None
+            except Exception:
+                _mirror_error('texte saisi dans une fenetre')
+            return original(self, dialog_id, text_input_name, text_input_value, *args, **kwargs)
+        return dialog_text_input
+
+    _mirror_wrap(UiDialogService, 'dialog_respond', make_respond)
+    _mirror_wrap(UiDialogService, 'dialog_pick_result', make_pick)
+    _mirror_wrap(UiDialogService, 'dialog_text_input', make_text)
+
+
 def _install_mirror_hooks():
     """Accroches de la simulation unique ; chacune est independante des autres."""
     for label, install in (('ligne du temps', _hook_timeline), ('horloge', _hook_clock_broadcast),
-                           ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command)):
+                           ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command),
+                           ('fenetres', _hook_dialog_answers)):
         try:
             install()
             _mirror['hooks'].append(label)

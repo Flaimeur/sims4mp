@@ -132,6 +132,82 @@ module('protocolbuffers')
 module('protocolbuffers.Consts_pb2', MSG_OBJECTS_VIEW_UPDATE=11, MSG_UI_DIALOG_SHOW=40,
        MSG_UI_NOTIFICATION_SHOW=41, MSG_CONNECTION_STATUS_CONNECTED=210, MSG_SIM_MOOD_UPDATE=159)
 
+
+class _DialogMessage(object):
+    """Faux UiDialogMessage : octets « dialog_id:owner_id »."""
+
+    def ParseFromString(self, data):
+        dialog_id, owner_id = data.decode('ascii').split(':')
+        self.dialog_id, self.owner_id = int(dialog_id), int(owner_id)
+
+
+module('protocolbuffers.Dialog_pb2', UiDialogMessage=_DialogMessage)
+
+
+class UiDialogService(object):
+    def __init__(self):
+        self.known = {}
+        self.calls = []
+
+    def get_dialog(self, dialog_id):
+        return self.known.get(dialog_id)
+
+    def dialog_respond(self, dialog_id, response, client=None):
+        self.calls.append(('respond', dialog_id, response, client))
+        return True
+
+    def dialog_pick_result(self, dialog_id, picked_results=(), ingredient_check=False,
+                           prepped_ingredient_check=False, recipe_id=None):
+        self.calls.append(('pick', dialog_id, tuple(picked_results), ingredient_check, prepped_ingredient_check,
+                           recipe_id))
+        return True
+
+    def dialog_text_input(self, dialog_id, text_input_name, text_input_value):
+        self.calls.append(('text', dialog_id, text_input_name, text_input_value))
+
+
+DIALOGS = UiDialogService()
+module('ui')
+module('ui.ui_dialog_service', UiDialogService=UiDialogService)
+resources = module('sims4.resources', Types=types.SimpleNamespace(INTERACTION='INTERACTION'))
+sys.modules['sims4'].resources = resources
+
+
+class InteractionContext(object):
+    SOURCE_PIE_MENU, SOURCE_AUTONOMY, SOURCE_SCRIPT, SOURCE_SCRIPT_WITH_USER_INTENT = 'pie', 'auto', 's', 'su'
+
+    def __init__(self, sim, source, priority):
+        self.sim, self.source, self.priority = sim, source, priority
+
+
+module('interactions.context', InteractionContext=InteractionContext)
+module('interactions.priority', Priority=types.SimpleNamespace(High='haute', Low='basse'))
+module('objects', ALL_HIDDEN_REASONS='tous')
+
+
+class _Played(object):
+    interaction = 'mixer rejoue'
+
+    def __bool__(self):
+        return True
+
+
+class AffordanceObjectPair(object):
+    made = []
+
+    def __init__(self, affordance, target, sa, si):
+        AffordanceObjectPair.made.append((affordance, target, sa, si))
+
+    def test_and_execute(self, context):
+        AffordanceObjectPair.made.append(('contexte', context.source, context.priority))
+        return _Played()
+
+
+module('interactions.aop', AffordanceObjectPair=AffordanceObjectPair)
+MIXER = types.SimpleNamespace(guid64=77, __name__='mixer_social_Chat', is_super=False)
+SOCIAL = types.SimpleNamespace(guid64=88, __name__='socials_SocialSuper', is_super=True)
+INTERACTIONS = {77: MIXER, 88: SOCIAL}
+
 SIM_TIMELINE = Timeline('sims')
 WALL_TIMELINE = Timeline('horloge murale')
 ZONE = _Zone()
@@ -149,9 +225,12 @@ class Interaction(object):
 
 
 class Sim(object):
+    is_sim = True
+
     def __init__(self, sim_id, interactions=()):
-        self.sim_info = types.SimpleNamespace(sim_id=sim_id)
+        self.sim_info = types.SimpleNamespace(sim_id=sim_id, get_sim_instance=lambda **kwargs: self)
         self._interactions = {i.id: i for i in interactions}
+        self.si_state = []
 
     def find_interaction_by_id(self, interaction_id):
         return self._interactions.get(interaction_id)
@@ -162,11 +241,16 @@ class Sim(object):
 
 SLEEP = Interaction(555)
 SIMS = [Sim(1), Sim(2, [SLEEP])]
+CLIENT = types.SimpleNamespace(id=0xABC)
 module('services',
-       client_manager=lambda: types.SimpleNamespace(get_first_client=lambda: types.SimpleNamespace(id=0xABC)),
+       client_manager=lambda: types.SimpleNamespace(get_first_client=lambda: CLIENT),
        current_zone=lambda: ZONE,
        time_service=lambda: types.SimpleNamespace(sim_timeline=SIM_TIMELINE),
-       sim_info_manager=lambda: types.SimpleNamespace(instanced_sims_gen=lambda: iter(SIMS)))
+       sim_info_manager=lambda: types.SimpleNamespace(
+           instanced_sims_gen=lambda: iter(SIMS),
+           get=lambda sim_id: next((s.sim_info for s in SIMS if s.sim_info.sim_id == sim_id), None)),
+       get_instance_manager=lambda kind: types.SimpleNamespace(get=INTERACTIONS.get),
+       ui_dialog_service=lambda: DIALOGS)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, 'sims4mp.log')
@@ -179,6 +263,8 @@ from server_commands import interaction_commands  # noqa: E402
 
 results = []
 notes = []
+real_kind = mod.bridge_interaction_kind
+real_order = mod.bridge_order_from_interaction
 mod.show_notification = lambda title, text, *args, **kwargs: notes.append(text)
 TMP = tempfile.mkdtemp(prefix='sims4mp_mirror_')
 mod.LOG_PATH = os.path.join(TMP, 'sims4mp.log')
@@ -204,8 +290,8 @@ def events(endpoint, kind):
     return [m['data'] for m in endpoint.sent if m['type'] == protocol.EVENT and m['data'].get('kind') == kind]
 
 
-report('accroches installees : ligne du temps, horloge, PNJ, croix',
-       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix'], str(mod._mirror['hooks']))
+report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres',
+       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres'], str(mod._mirror['hooks']))
 
 # --- 1. Hote : choix, annonce, confirmation ---------------------------------------------------
 host = mod.NetSession('host', Endpoint())
@@ -312,7 +398,7 @@ mod._handle_view(guest, {'kind': 'view', 'm': 'pas une liste'})
 report('entrees invalides ignorees', not SENT and mod._mirror['ignored'] == 4)
 
 # --- 7. Invite : clics et croix partent a l'hote --------------------------------------------------
-mod.bridge_order_from_interaction = lambda q, i, kind='pie': {
+mod.bridge_order_from_interaction = lambda q, i, kind='pie', mixers=False: {
     'sim_id': 2, 'affordance': 77, 'name': 'bed_sleep', 'target': {'t': 'obj', 'id': 9}, 'auto': False}
 click = Interaction(42)
 refused = queue.append(click)
@@ -331,7 +417,79 @@ mod._handle_order(guest, {'kind': 'order', 'id': 'host-9', 'sim_id': 2, 'afforda
                           'target': {'t': 'none'}, 'name': 'x'})
 report('ordre recu de l\'hote : jamais rejoue chez l\'invite', guest.orders_replayed == 0 and guest.orders_failed == 0)
 
-# --- 8. Etat, commande de secours, fin -------------------------------------------------------------
+# --- 8. Actions sociales (0.20.1) -----------------------------------------------------------------
+mod.bridge_interaction_kind = real_kind
+mod.bridge_order_from_interaction = real_order
+chat = Interaction(44)
+chat.source, chat.affordance, chat.super_affordance, chat.target = 'pie', MIXER, SOCIAL, SIMS[0]
+queue.append(chat)
+orders = events(guest.endpoint, 'order')
+report('action sociale de l\'invite : envoyee avec son action principale',
+       orders[-1]['affordance'] == 77 and orders[-1].get('super') == 88
+       and orders[-1]['target'] == {'t': 'sim', 'id': 1}, str(orders[-1]))
+report('hors simulation unique, une action sociale reste non transmise (option A inchangee)',
+       real_order(queue, chat) is None)
+mod._session = host
+mod._mirror['wanted'] = True
+host.mirror_ready = True
+running = types.SimpleNamespace(affordance=SOCIAL, is_finishing=False)
+SIMS[1].si_state = [running]
+del AffordanceObjectPair.made[:]
+mod._handle_order(host, dict(orders[-1]))
+report('hote : action sociale recreee comme le menu du jeu (meme paire, action principale en cours)',
+       AffordanceObjectPair.made == [(MIXER, SIMS[0], SOCIAL, running), ('contexte', 'su', 'haute')]
+       and host.orders_replayed == 1, str(AffordanceObjectPair.made))
+SIMS[1].si_state = []
+del AffordanceObjectPair.made[:]
+mod._handle_order(host, dict(orders[-1], id='client-99'))
+report('sans action principale en cours : le mixer la pousse lui-meme (si = None)',
+       AffordanceObjectPair.made[0] == (MIXER, SIMS[0], SOCIAL, None))
+report('ordre avec action principale invalide : refuse',
+       mod.validate_order(dict(orders[-1], super='x')) is None)
+
+# --- 9. Fenetres du Sim de l'invite (0.20.1) -------------------------------------------------------
+mod._handle_host_event(host, 'message', {'type': protocol.EVENT, 'v': 1,
+                                         'data': {'kind': 'presence', 'active_sim': 2}})
+report('presence de l\'invite : l\'hote connait le Sim qu\'il controle', host.guest_sim_id == 2)
+mod._mirror_tick(host, 200.0)
+del SENT[:]
+omega.send(0x1, 40, b'7:2')
+report('fenetre du Sim de l\'invite : envoyee a l\'invite, pas ouverte chez l\'hote',
+       not SENT and mod._mirror['out'][-1] == (40, b'7:2') and 7 in mod._mirror['dialogs'])
+omega.send(0x1, 40, b'8:1')
+report('fenetre d\'un autre Sim : reste chez l\'hote', SENT == [(0x1, 40, b'8:1')] and 8 not in mod._mirror['dialogs'])
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'respond', 'id': 7, 'values': [3]})
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'pick', 'id': 7, 'values': [[11, 12], True, False, None]})
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'text', 'id': 7, 'values': ['nom', 'Bob']})
+report('reponses de l\'invite appliquees chez l\'hote (bouton, liste, texte)',
+       DIALOGS.calls == [('respond', 7, 3, CLIENT), ('pick', 7, (11, 12), True, False, None), ('text', 7, 'nom', 'Bob')]
+       and mod._mirror['dialog_applied'] == 3, str(DIALOGS.calls))
+del DIALOGS.calls[:]
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'respond', 'id': 8, 'values': [1]})
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'respond', 'id': 7, 'values': ['x']})
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'pick', 'id': 7, 'values': [[1], 'oui', False, None]})
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'drop', 'id': 7, 'values': [1]})
+report('fenetre non envoyee a l\'invite ou reponse invalide : ignoree', not DIALOGS.calls)
+
+mod._session = guest
+mod._mirror['wanted'] = False
+del DIALOGS.calls[:]
+DIALOGS.dialog_respond(7, 3, CLIENT)
+DIALOGS.dialog_pick_result(7, (11, 12), True, False, None)
+DIALOGS.dialog_text_input(7, 'nom', 'Bob')
+answers = events(guest.endpoint, 'dialog')
+report('invite : reponses a une fenetre de l\'hote envoyees a l\'hote, pas a son propre jeu',
+       not DIALOGS.calls and [a['how'] for a in answers] == ['respond', 'pick', 'text']
+       and answers[1]['values'] == [[11, 12], True, False, None], str(answers))
+DIALOGS.known[5] = object()
+DIALOGS.dialog_respond(5, 1, CLIENT)
+report('invite : ses propres fenetres (menu Sims4MP) restent chez lui',
+       DIALOGS.calls == [('respond', 5, 1, CLIENT)] and len(events(guest.endpoint, 'dialog')) == 3)
+mod._maybe_send_presence(guest, 1000.0)
+report('presence de l\'invite : le Sim qu\'il controle part avec (None si inconnu)',
+       'active_sim' in events(guest.endpoint, 'presence')[-1])
+
+# --- 10. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',
