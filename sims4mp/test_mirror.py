@@ -427,11 +427,13 @@ host = mod.NetSession('host', Endpoint())
 host.handshake_done = True
 mod._session = host
 mod._gate['waiting'] = False
-report('desactivee par defaut : rien n\'est recopie', not mod.mirror_on(host) and not mod._mirror['capturing'])
-text = mod.mirror_set_wanted(True)
-report('menu de l\'hote : simulation unique demandee a l\'invite',
-       events(host.endpoint, 'mirror') == [{'kind': 'mirror', 'on': True}] and 'demandée' in text, text)
-report('pas encore active tant que l\'invite n\'a pas confirme', not mod.mirror_on(host))
+report('seul mode (0.21.0) : voulue des le chargement, l\'ancienne synchro ne tourne pas chez l\'hote',
+       mod._mirror['wanted'] and mod.mirror_on(host))
+mod._mirror_announce(host)
+report('annoncee a l\'invite des sa connexion',
+       events(host.endpoint, 'mirror') == [{'kind': 'mirror', 'on': True}])
+mod._mirror_tick(host, 99.0)
+report('pas de recopie tant que l\'invite n\'a pas gele sa simulation', not mod._mirror['capturing'])
 mod._handle_mirror_ready(host, {'kind': 'mirror_ready', 'on': True})
 report('confirmation de l\'invite : active chez l\'hote', mod.mirror_on(host) and host.mirror_ready)
 mod._mirror_tick(host, 100.0)

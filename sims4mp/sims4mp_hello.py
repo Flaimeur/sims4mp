@@ -1,4 +1,7 @@
-# Sims 4 Multiplayer - simulation unique, etape 4 (0.20.3) : construction et achat faits par
+# Sims 4 Multiplayer - simulation unique seule (0.21.0) : choix du joueur, la simulation unique
+# est toujours active (plus de bouton dans le menu) ; les deux simulations (M3 a M6) ne tournent
+# plus pendant une partie a deux. mp.mirror off la coupe encore, pour un diagnostic seulement.
+# Simulation unique, etape 4 (0.20.3) : construction et achat faits par
 # l'invite. Chaque geste (creer, detruire, deplacer, poser sur un objet, recolorer) passe par une
 # fonction Python appelee par le moteur du jeu (objects/system.pyc, build_buy.pyc) ; chez l'invite
 # elle part a l'hote, qui la rejoue avec la meme fonction. Murs, sols, terrain : non synchronises.
@@ -225,7 +228,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.20.3'
+MOD_VERSION = '0.21.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -3229,7 +3232,7 @@ def _install_traffic_hook():
 # Les clics de l'invite partent comme ordres (M5) et sont refuses dans sa file ; l'hote les rejoue.
 
 _mirror = {
-    'wanted': False,         # hote : simulation unique demandee
+    'wanted': True,          # hote : simulation unique (seul mode depuis 0.21.0 ; mp.mirror off : diagnostic)
     'active': False,         # invite : simulation locale gelee, affichage recu de l'hote
     'capturing': False,      # hote : recopie en cours (invite connecte et pret)
     'out': [],               # hote : (msg_id, octets) a envoyer au prochain passage de la pompe
@@ -3277,12 +3280,12 @@ _mirror = {
 
 
 def mirror_on(session):
-    """Vrai si la simulation unique est en cours pour cette session
-    (hote : l'invite a confirme ; invite : sa simulation est gelee)."""
+    """Vrai si la simulation unique est en cours pour cette session (hote : voulue, seul mode depuis
+    0.21.0, l'ancienne synchro ne tourne pas ; invite : sa simulation est gelee)."""
     if session is None:
         return False
     if session.role == 'host':
-        return _mirror['wanted'] and session.mirror_ready
+        return _mirror['wanted']
     return _mirror['active']
 
 
@@ -3650,7 +3653,8 @@ def _mirror_flush(session):
 
 def _mirror_tick(session, now):
     """Appele a chaque passage de la pompe : demarre ou arrete la recopie, envoie, resume."""
-    capturing = session.role == 'host' and _connected(session) and mirror_on(session)
+    # Recopie seulement quand l'invite a gele sa simulation (EVENT mirror_ready).
+    capturing = session.role == 'host' and _connected(session) and mirror_on(session) and session.mirror_ready
     if capturing != _mirror['capturing']:
         _mirror['capturing'] = capturing
         if not capturing:
@@ -3683,7 +3687,7 @@ def mirror_lines():
                 '  réponses aux fenêtres de l\'hôte : {} , erreurs : {}'.format(
                     _mirror['dialog_answers'], _mirror['errors'])]
     session = _session
-    state = 'active' if mirror_on(session) else 'demandée (en attente de l\'invité)'
+    state = 'active' if session is not None and session.mirror_ready else 'en attente de l\'invité'
     return ['Simulation unique : {}.'.format(state),
             '  affichage recopié : {} message(s) en {} lot(s), {:.0f} Ko'.format(
                 _mirror['sent'][0], _mirror['batches'], _mirror['sent'][1] / 1024.0),
@@ -3708,7 +3712,8 @@ def _mirror_announce(session):
 
 
 def mirror_set_wanted(on):
-    """Hote (menu, mp.mirror) : demande ou coupe la simulation unique. Renvoie le texte a afficher."""
+    """Hote (mp.mirror, diagnostic) : remet ou coupe la simulation unique, seul mode depuis 0.21.0.
+    Renvoie le texte a afficher."""
     session = _session
     if session is not None and session.role == 'client':
         return 'Seul l\'hôte choisit la simulation unique.'
@@ -3720,7 +3725,7 @@ def mirror_set_wanted(on):
         return ('Simulation unique demandée à l\'invité.' if on else
                 'Simulation unique coupée : chaque jeu recalcule de son côté.')
     return ('Simulation unique activée : elle démarrera à la connexion de l\'invité.' if on else
-            'Simulation unique désactivée.')
+            'Simulation unique coupée (diagnostic) : chaque jeu recalculera de son côté.')
 
 
 def _handle_mirror(session, data):
@@ -4118,7 +4123,6 @@ MENU_ICON_INSTANCE = 0x80EB131F7361E9AA   # image DDS de sims4mp_icons.package (
 MENU_CLOSE, MENU_BACK = 6, 9
 MENU_PARTY, MENU_NOTIFY, MENU_TOOLS = 10, 11, 12
 MENU_HOST, MENU_JOIN = 20, 21
-MENU_MIRROR = 22                                       # simulation unique (0.20.0), hote seulement
 MENU_STATUS, MENU_RESYNC, MENU_REPORT, MENU_SOLO = 4, 7, 8, 5
 MENU_CHOICES = (                                       # ecran principal
     (MENU_PARTY, 'Partie à deux…'),
@@ -4205,9 +4209,7 @@ def menu_screen(screen):
                                                                   _session.endpoint.port))
             choices = [(MENU_RESYNC, 'Resynchroniser maintenant'), (MENU_SOLO, 'Jouer seul (se déconnecter)')]
         if _session is None or _session.role == 'host':
-            lines.append('Simulation unique (expérimental) : votre jeu calcule tout, l\'invité voit votre partie.')
-            choices.append((MENU_MIRROR, 'Simulation unique : {}'.format(
-                'activée (cliquer pour couper)' if _mirror['wanted'] else 'désactivée (cliquer pour activer)')))
+            lines.append('Simulation unique : votre jeu calcule la partie, l\'invité voit votre jeu.')
         elif _mirror['active']:
             lines.append('Simulation unique : vous voyez le jeu de l\'hôte.')
         return 'Partie à deux', lines, choices + [(MENU_STATUS, 'État de la partie'), (MENU_BACK, 'Retour')]
@@ -4268,9 +4270,6 @@ def on_menu_choice(choice, screen='main'):
         menu_host()
     elif choice == MENU_JOIN:
         open_join_dialog(_menu_last_ip())
-    elif choice == MENU_MIRROR:
-        bridge_notify(mirror_set_wanted(not _mirror['wanted']))
-        open_menu('party')                           # le nouveau choix apparait
 
 
 # -- heberger / rejoindre depuis le jeu (0.17.0) --

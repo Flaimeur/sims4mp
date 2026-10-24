@@ -42,6 +42,7 @@ LOG_EXISTED = os.path.exists(LOG_FILE)
 import protocol  # noqa: E402
 import transport  # noqa: E402
 import sims4mp_hello as mod  # noqa: E402
+mod._mirror['wanted'] = False                        # ancienne synchro (option A) : mp.mirror off depuis 0.21.0
 
 results = []
 mod.show_notification = lambda title, text, *args: None
