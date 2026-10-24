@@ -204,6 +204,74 @@ class AffordanceObjectPair(object):
 
 
 module('interactions.aop', AffordanceObjectPair=AffordanceObjectPair)
+
+
+class Distributor(object):
+    shown = []
+
+    def add_object(self, obj):
+        Distributor.shown.append(('ajout', obj.id))
+
+    def remove_object(self, obj):
+        Distributor.shown.append(('retrait', obj.id))
+
+
+module('distributor')
+module('distributor.system', Distributor=Distributor)
+OBJECTS = {}
+
+
+class ObjectManager(object):
+    def add(self, obj):
+        OBJECTS[obj.id] = obj
+        Distributor().add_object(obj)
+
+    def remove(self, obj):
+        OBJECTS.pop(obj.id, None)
+        Distributor().remove_object(obj)
+
+    def get(self, obj_id):
+        return OBJECTS.get(obj_id)
+
+
+MANAGER = ObjectManager()
+
+
+class GameObject(object):
+    is_sim = False
+
+    def __init__(self, obj_id, def_id, position=(1.0, 0.0, 2.0)):
+        self.id = obj_id
+        self.definition = types.SimpleNamespace(id=def_id)
+        vector = types.SimpleNamespace(x=position[0], y=position[1], z=position[2])
+        self.transform = types.SimpleNamespace(translation=vector,
+                                               orientation=types.SimpleNamespace(x=0.0, y=0.7071, z=0.0, w=0.7071))
+        self.level = 0
+        self.moved = None
+
+    def move_to(self, **kwargs):
+        self.moved = kwargs
+
+
+CREATED = []
+
+
+def create_object(definition, obj_id=0, **kwargs):
+    CREATED.append((definition, obj_id))
+    if definition == 666:
+        return None
+    obj = GameObject(obj_id, definition)
+    MANAGER.add(obj)
+    return obj
+
+
+module('objects.object_manager', ObjectManager=ObjectManager)
+module('objects.system', create_object=create_object)
+module('routing', SurfaceIdentifier=lambda zone, level, kind: ('surface', zone, level, kind),
+       SurfaceType=types.SimpleNamespace(SURFACETYPE_WORLD='monde'))
+math = module('sims4.math', Vector3=lambda x, y, z: ('v', x, y, z), Quaternion=lambda x, y, z, w: ('q', x, y, z, w),
+              Transform=lambda v, q: ('t', v, q))
+sys.modules['sims4'].math = math
 MIXER = types.SimpleNamespace(guid64=77, __name__='mixer_social_Chat', is_super=False)
 SOCIAL = types.SimpleNamespace(guid64=88, __name__='socials_SocialSuper', is_super=True)
 INTERACTIONS = {77: MIXER, 88: SOCIAL}
@@ -250,7 +318,9 @@ module('services',
            instanced_sims_gen=lambda: iter(SIMS),
            get=lambda sim_id: next((s.sim_info for s in SIMS if s.sim_info.sim_id == sim_id), None)),
        get_instance_manager=lambda kind: types.SimpleNamespace(get=INTERACTIONS.get),
-       ui_dialog_service=lambda: DIALOGS)
+       ui_dialog_service=lambda: DIALOGS,
+       object_manager=lambda: MANAGER,
+       current_zone_id=lambda: 99)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(HERE, 'sims4mp.log')
@@ -290,8 +360,9 @@ def events(endpoint, kind):
     return [m['data'] for m in endpoint.sent if m['type'] == protocol.EVENT and m['data'].get('kind') == kind]
 
 
-report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres',
-       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres'], str(mod._mirror['hooks']))
+report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets',
+       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets'],
+       str(mod._mirror['hooks']))
 
 # --- 1. Hote : choix, annonce, confirmation ---------------------------------------------------
 host = mod.NetSession('host', Endpoint())
@@ -489,7 +560,58 @@ mod._maybe_send_presence(guest, 1000.0)
 report('presence de l\'invite : le Sim qu\'il controle part avec (None si inconnu)',
        'active_sim' in events(guest.endpoint, 'presence')[-1])
 
-# --- 10. Etat, commande de secours, fin ------------------------------------------------------------
+# --- 10. Objets crees ou retires apres le chargement (0.20.2) --------------------------------------
+mod._session = host
+mod._mirror['wanted'] = True
+host.mirror_ready = True
+mod._mirror_tick(host, 300.0)
+plate = GameObject(1001, 50)
+MANAGER.add(plate)
+sim_obj = GameObject(2, 1)
+sim_obj.is_sim = True
+MANAGER.add(sim_obj)
+flash = GameObject(1002, 51)
+MANAGER.add(flash)
+MANAGER.remove(flash)
+old = GameObject(900, 40)
+OBJECTS[900] = old
+MANAGER.remove(old)
+mod._mirror_tick(host, 301.0)
+sent = events(host.endpoint, 'objects')
+report('hote : objet cree envoye (definition, position, rotation), objet retire envoye',
+       len(sent) == 1 and sent[0]['new'] == [{'id': 1001, 'def': 50, 'p': [1.0, 0.0, 2.0],
+                                              'q': [0.0, 0.7071, 0.0, 0.7071], 'level': 0}]
+       and sent[0]['del'] == [900], str(sent))
+report('Sims (presence) et objet cree puis retire dans le meme passage : non envoyes',
+       all(e['id'] not in (2, 1002) for e in sent[0]['new']))
+mod._mirror['capturing'] = False
+OBJECTS.clear()
+
+mod._session = guest
+mod._mirror['wanted'] = False
+del Distributor.shown[:]
+del CREATED[:]
+mod._handle_objects(guest, {'kind': 'objects', 'new': [sent[0]['new'][0], {'id': 1003, 'def': 666, 'p': [0, 0, 0],
+                                                                              'q': [0, 0, 0, 1], 'level': 0},
+                                                       {'id': 'x'}], 'del': []})
+replica = OBJECTS.get(1001)
+report('invite : copie de l\'objet avec le meme identifiant, posee au meme endroit, sans affichage propre',
+       replica is not None and CREATED[0] == (50, 1001) and not Distributor.shown
+       and replica.moved == {'transform': ('t', ('v', 1.0, 0.0, 2.0), ('q', 0.0, 0.7071, 0.0, 0.7071)),
+                             'routing_surface': ('surface', 99, 0, 'monde')}, str(replica and replica.moved))
+report('objet refuse par le jeu ou mal forme : compte, sans copie',
+       mod._mirror['replicas_failed'] == 1 and 1003 not in OBJECTS and 1003 not in mod._mirror['replicas'])
+mod._handle_objects(guest, {'kind': 'objects', 'new': [sent[0]['new'][0]], 'del': []})
+report('objet deja present : pas de deuxieme copie', CREATED.count((50, 1001)) == 1)
+save_obj = GameObject(900, 40)
+OBJECTS[900] = save_obj
+mod._handle_objects(guest, {'kind': 'objects', 'new': [], 'del': [900, 1001, 4242]})
+report('invite : objets retires par l\'hote retires ici aussi, sans affichage en double',
+       900 not in OBJECTS and 1001 not in OBJECTS and not Distributor.shown and mod._mirror['replicas_removed'] == 2)
+MANAGER.add(GameObject(5000, 7))
+report('objet ordinaire de l\'invite : affichage normal', Distributor.shown == [('ajout', 5000)])
+
+# --- 11. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',

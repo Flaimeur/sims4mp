@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - simulation unique, etape 2 (0.20.1) : les actions sociales (mixers) de
+# Sims 4 Multiplayer - simulation unique, etape 3 (0.20.2) : les objets crees ou retires chez
+# l'hote apres le chargement (assiettes, achats, objets poses...) le sont aussi dans le jeu Python
+# de l'invite, avec le meme identifiant, pour qu'il puisse cliquer dessus ; leur affichage vient
+# deja de l'hote (Distributor.add_object / remove_object sautes pour ces copies).
+# Simulation unique, etape 2 (0.20.1) : les actions sociales (mixers) de
 # l'invite partent avec leur action principale et l'hote les recree (AffordanceObjectPair puis
 # test_and_execute, comme le menu du jeu) ; les fenetres du jeu dont le Sim est celui de l'invite
 # (UiDialogMessage.owner_id) s'ouvrent chez lui seulement et sa reponse (bouton, liste, texte)
@@ -217,7 +221,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.20.1'
+MOD_VERSION = '0.20.2'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -310,6 +314,7 @@ MIRROR_HOST_ONLY = frozenset([
 MIRROR_HOST_ONLY_PREFIXES = ('MSG_CONNECTION_STATUS_', 'MSG_DEBUGVISUALIZATION_', 'MSG_TUTORIAL_', 'MSG_SOP_',
                              'MSG_NS_', 'MSG_CACHE_', 'MSG_GSI_')
 MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique).'
+MIRROR_OBJECTS_MAX = 200                  # objets crees / retires au plus par message « objects » (0.20.2)
 MIRROR_DIALOGS_MAX = 100                  # hote : fenetres envoyees a l'invite gardees (reponses acceptees)
 MIRROR_PICKS_MAX = 64                     # elements choisis au plus dans une reponse de liste
 
@@ -1061,6 +1066,50 @@ def bridge_answer_dialog(how, dialog_id, values):
     return True
 
 
+def bridge_object_snapshot(obj):
+    """Hote : ce qu'il faut a l'invite pour une copie de l'objet : definition, position, rotation, etage."""
+    transform = obj.transform
+    position, orientation = transform.translation, transform.orientation
+    return {'id': obj.id, 'def': obj.definition.id,
+            'p': [round(float(position.x), 3), round(float(position.y), 3), round(float(position.z), 3)],
+            'q': [round(float(orientation.x), 4), round(float(orientation.y), 4), round(float(orientation.z), 4),
+                  round(float(orientation.w), 4)],
+            'level': obj.level}
+
+
+def bridge_create_replica(entry):
+    """Invite : copie Python d'un objet de l'hote, meme identifiant (objects.system.create_object(
+    definition, obj_id=...)), posee au meme endroit (ClientObjectMixin.move_to : location.clone(
+    transform, routing_surface)). Son affichage vient de l'hote : Distributor.add_object est saute
+    pour elle. Renvoie 'ok', 'deja' ou 'refus'."""
+    import routing
+    import services
+    import sims4.math
+    from objects.system import create_object
+    if services.object_manager().get(entry['id']) is not None:
+        return 'deja'
+    obj = create_object(entry['def'], obj_id=entry['id'])
+    if obj is None:
+        return 'refus'
+    transform = sims4.math.Transform(sims4.math.Vector3(*entry['p']), sims4.math.Quaternion(*entry['q']))
+    surface = routing.SurfaceIdentifier(services.current_zone_id(), entry['level'] or 0,
+                                        routing.SurfaceType.SURFACETYPE_WORLD)
+    obj.move_to(transform=transform, routing_surface=surface)
+    return 'ok'
+
+
+def bridge_remove_replica(obj_id):
+    """Invite : retire l'objet que l'hote a retire (ObjectManager.remove, sans passer par la ligne du
+    temps gelee). Renvoie True s'il existait ici."""
+    import services
+    manager = services.object_manager()
+    obj = manager.get(obj_id)
+    if obj is None:
+        return False
+    manager.remove(obj)
+    return True
+
+
 def bridge_cancel_by_id(interaction_id):
     """Hote : annule comme la croix du joueur l'action interaction_id de l'un des Sims presents
     (Sim.find_interaction_by_id puis find_continuation_by_id, comme
@@ -1446,6 +1495,8 @@ def _handle_client_event(session, kind, value):
                 _handle_roster(session, value['data'])
             elif value['data'].get('kind') == 'view':
                 _handle_view(session, value['data'])
+            elif value['data'].get('kind') == 'objects':
+                _handle_objects(session, value['data'])
             elif value['data'].get('kind') == 'mirror':
                 _handle_mirror(session, value['data'])
             else:
@@ -1638,7 +1689,7 @@ def _poll_session(session, now):
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
             quiet = ((value['type'] == protocol.EVENT
                       and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims',
-                                                         'digest', 'gaps', 'roster', 'view')
+                                                         'digest', 'gaps', 'roster', 'view', 'objects')
                            or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
                      # pings automatiques (latence) : toutes les 10 s, inutiles dans le journal
                      or (value['type'] == protocol.PING and value['data'].get('auto') is True)
@@ -3126,6 +3177,16 @@ _mirror = {
     'dialogs_sent': 0,
     'dialog_applied': 0,
     'dialog_answers': 0,     # invite : reponses envoyees a l'hote
+    # Objets crees apres le chargement (0.20.2).
+    'objs_new': [],          # hote : objets ajoutes depuis le dernier passage (refs faibles)
+    'objs_del': [],          # hote : identifiants retires depuis le dernier passage
+    'objs_sent': 0,
+    'objs_removed_sent': 0,
+    'replicas': set(),       # invite : objets dont l'affichage vient de l'hote (Distributor saute)
+    'replicas_made': 0,
+    'replicas_failed': 0,
+    'replicas_removed': 0,
+    'distributor_skipped': 0,
     'sent': [0, 0],          # hote : messages, octets recopies
     'batches': 0,
     'skipped': 0,            # hote : messages propres a son ecran
@@ -3299,6 +3360,115 @@ def _mirror_clear_out():
     if _mirror['out']:
         _mirror['dropped'] += len(_mirror['out'])
         del _mirror['out'][:]
+    del _mirror['objs_new'][:]
+    del _mirror['objs_del'][:]
+
+
+# -- objets crees ou retires apres le chargement (0.20.2) --
+# L'affichage d'un objet de l'hote arrive deja chez l'invite (messages recopies), mais son jeu Python
+# ne le connait pas : pas de menu dessus, clics perdus. L'hote envoie donc chaque objet ajoute a son
+# ObjectManager (hors Sims, recopies par la presence) et chaque objet retire ; l'invite en fait une
+# copie de meme identifiant sans affichage propre (Distributor.add_object / remove_object sautes).
+
+def mirror_object_added(obj):
+    """Hote (ObjectManager.add) : objet a envoyer a l'invite au prochain passage."""
+    if getattr(obj, 'is_sim', False):
+        return
+    try:
+        ref = weakref.ref(obj)
+    except TypeError:
+        ref = lambda: obj                            # objet sans weakref (tests) : reference simple
+    _mirror['objs_new'].append(ref)
+
+
+def mirror_object_removed(obj):
+    """Hote (ObjectManager.remove) : objet retire, a retirer chez l'invite."""
+    if getattr(obj, 'is_sim', False):
+        return
+    obj_id = getattr(obj, 'id', None)
+    pending = [ref for ref in _mirror['objs_new'] if ref() is not obj]
+    if len(pending) != len(_mirror['objs_new']):
+        _mirror['objs_new'][:] = pending             # cree et retire dans le meme passage : rien a envoyer
+        return
+    if isinstance(obj_id, int):
+        _mirror['objs_del'].append(obj_id)
+
+
+def _mirror_flush_objects(session):
+    """Hote : envoie a l'invite les objets crees et retires depuis le dernier passage."""
+    created = []
+    for ref in _mirror['objs_new']:
+        obj = ref()
+        if obj is None:
+            continue
+        snapshot = _safe('copie d\'un objet pour l\'invite', bridge_object_snapshot, obj)
+        if snapshot is not None:
+            created.append(snapshot)
+    removed = list(_mirror['objs_del'])
+    del _mirror['objs_new'][:]
+    del _mirror['objs_del'][:]
+    while created or removed:
+        part_new, created = created[:MIRROR_OBJECTS_MAX], created[MIRROR_OBJECTS_MAX:]
+        part_del, removed = removed[:MIRROR_OBJECTS_MAX], removed[MIRROR_OBJECTS_MAX:]
+        if session.endpoint.send(protocol.make_message(protocol.EVENT, {
+                'kind': 'objects', 'new': part_new, 'del': part_del})):
+            _mirror['objs_sent'] += len(part_new)
+            _mirror['objs_removed_sent'] += len(part_del)
+
+
+def _clean_object_entry(entry):
+    """Copie propre d'un objet recu de l'hote, ou None."""
+    if not isinstance(entry, dict):
+        return None
+    obj_id = _clean_int(entry.get('id'), 1, 2 ** 64)
+    def_id = _clean_int(entry.get('def'), 1, 2 ** 64)
+    position, rotation = entry.get('p'), entry.get('q')
+    if (obj_id is None or def_id is None or not isinstance(position, list) or len(position) != 3
+            or not isinstance(rotation, list) or len(rotation) != 4):
+        return None
+    p = [_clean_float(v, POSITION_MAX_COORD) for v in position]
+    q = [_clean_float(v, 2.0) for v in rotation]
+    if None in p or None in q:
+        return None
+    return {'id': obj_id, 'def': def_id, 'p': p, 'q': q,
+            'level': _clean_int(entry.get('level'), POSITION_LEVELS[0], POSITION_LEVELS[1])}
+
+
+def _handle_objects(session, data):
+    """Invite : copies des objets crees par l'hote, retrait de ceux qu'il a retires."""
+    created, removed = data.get('new'), data.get('del')
+    if (not isinstance(created, list) or not isinstance(removed, list)
+            or len(created) > MIRROR_OBJECTS_MAX or len(removed) > MIRROR_OBJECTS_MAX):
+        log('[client] objets de l\'hote invalides ignores')
+        return
+    if not _mirror['active']:
+        return
+    for raw in created:
+        entry = _clean_object_entry(raw)
+        if entry is None:
+            continue
+        _mirror['replicas'].add(entry['id'])         # avant la creation : son affichage vient de l'hote
+        try:
+            result = bridge_create_replica(entry)
+        except Exception:
+            result = 'refus'
+            _mirror_error('copie de l\'objet {} (definition {})'.format(entry['id'], entry['def']))
+        if result == 'ok':
+            _mirror['replicas_made'] += 1
+        elif result == 'refus':
+            _mirror['replicas_failed'] += 1
+            _mirror['replicas'].discard(entry['id'])
+    for raw in removed:
+        obj_id = _clean_int(raw, 1, 2 ** 64)
+        if obj_id is None:
+            continue
+        _mirror['replicas'].add(obj_id)              # son retrait est deja affiche par l'hote
+        try:
+            if bridge_remove_replica(obj_id):
+                _mirror['replicas_removed'] += 1
+        except Exception:
+            _mirror_error('retrait de l\'objet {}'.format(obj_id))
+        _mirror['replicas'].discard(obj_id)
 
 
 def mirror_batches(items):
@@ -3340,6 +3510,7 @@ def _mirror_tick(session, now):
             _mirror_clear_out()
         log('simulation unique : recopie de l\'affichage {}'.format('demarree' if capturing else 'arretee'))
     if capturing:
+        _mirror_flush_objects(session)               # avant l'affichage qui parle de ces objets
         _mirror_flush(session)
     if mirror_on(session) and now - _mirror['reported_at'] >= MIRROR_REPORT_INTERVAL:
         _mirror['reported_at'] = now
@@ -3359,6 +3530,8 @@ def mirror_lines():
                     _mirror['frozen'], _mirror['clock_skipped'], _mirror['spawns_skipped']),
                 '  clics envoyés à l\'hôte : {} (non transmissibles : {}) , annulations : {}'.format(
                     _mirror['refused'], _mirror['unsent'], _mirror['cancels_sent']),
+                '  objets de l\'hôte copiés : {} (refusés : {}) , retirés : {}'.format(
+                    _mirror['replicas_made'], _mirror['replicas_failed'], _mirror['replicas_removed']),
                 '  réponses aux fenêtres de l\'hôte : {} , erreurs : {}'.format(
                     _mirror['dialog_answers'], _mirror['errors'])]
     session = _session
@@ -3368,6 +3541,8 @@ def mirror_lines():
                 _mirror['sent'][0], _mirror['batches'], _mirror['sent'][1] / 1024.0),
             '  gardés sur votre écran : {} , trop gros : {} , abandonnés : {}'.format(
                 _mirror['skipped'], _mirror['too_big'], _mirror['dropped']),
+            '  objets envoyés à l\'invité : {} créés , {} retirés'.format(
+                _mirror['objs_sent'], _mirror['objs_removed_sent']),
             '  fenêtres ouvertes chez l\'invité : {} , réponses appliquées : {}'.format(
                 _mirror['dialogs_sent'], _mirror['dialog_applied']),
             '  annulations de l\'invité : {} , erreurs : {}'.format(_mirror['cancels_applied'], _mirror['errors'])]
@@ -3427,6 +3602,7 @@ def _mirror_stop_guest(reason):
     if not _mirror['active']:
         return
     _mirror['active'] = False
+    _mirror['replicas'].clear()                      # les copies redeviennent des objets ordinaires
     log('simulation unique : simulation locale relancee ({})'.format(reason))
     bridge_notify('Simulation unique arrêtée ({}) : votre jeu calcule de nouveau seul. Rechargez la '
                   'partie de l\'hôte pour repartir du même état.'.format(reason), alert=True)
@@ -3626,11 +3802,53 @@ def _hook_dialog_answers():
     _mirror_wrap(UiDialogService, 'dialog_text_input', make_text)
 
 
+def _hook_objects():
+    """Hote : objets ajoutes / retires de l'ObjectManager (objects/object_manager.pyc, add et remove)
+    pendant la recopie. Invite : Distributor.add_object / remove_object (distributor/system.pyc)
+    sautes pour les copies dont l'affichage vient de l'hote (0.20.2)."""
+    from distributor.system import Distributor
+    from objects.object_manager import ObjectManager
+
+    def make_add(original):
+        def add(self, obj, *args, **kwargs):
+            result = original(self, obj, *args, **kwargs)
+            if _mirror['capturing']:
+                try:
+                    mirror_object_added(obj)
+                except Exception:
+                    _mirror_error('objet ajoute')
+            return result
+        return add
+
+    def make_remove(original):
+        def remove(self, obj, *args, **kwargs):
+            if _mirror['capturing']:
+                try:
+                    mirror_object_removed(obj)
+                except Exception:
+                    _mirror_error('objet retire')
+            return original(self, obj, *args, **kwargs)
+        return remove
+
+    def make_skip(original):
+        def distribute(self, obj, *args, **kwargs):
+            if _mirror['active'] and getattr(obj, 'id', None) in _mirror['replicas'] and mirror_frozen():
+                _mirror['distributor_skipped'] += 1
+                return None                          # affichage deja donne par l'hote
+            return original(self, obj, *args, **kwargs)
+        return distribute
+
+    _mirror_wrap(ObjectManager, 'add', make_add)
+    _mirror_wrap(ObjectManager, 'remove', make_remove)
+    _mirror_wrap(Distributor, 'add_object', make_skip)
+    _mirror_wrap(Distributor, 'remove_object', make_skip)
+
+
 def _install_mirror_hooks():
     """Accroches de la simulation unique ; chacune est independante des autres."""
     for label, install in (('ligne du temps', _hook_timeline), ('horloge', _hook_clock_broadcast),
                            ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command),
-                           ('fenetres', _hook_dialog_answers)):
+                           ('fenetres', _hook_dialog_answers), ('objets', _hook_objects)):
         try:
             install()
             _mirror['hooks'].append(label)
