@@ -2266,7 +2266,7 @@ class LauncherApp:
                 ttk.Label(card, text=label, style='Muted.TLabel').grid(row=i, column=0, sticky='w', pady=2)
                 values[name] = ttk.Label(card, text='…', style='Value.TLabel')
                 values[name].grid(row=i, column=1, sticky='e', pady=2)
-            buttons = ttk.Frame(card, style='Card.TFrame')
+            buttons = ttk.Frame(card)
             buttons.grid(row=len(rows) + 1, column=0, columnspan=2, sticky='w', pady=(PAD, 0))
             self.home_cards[key] = values
             values['_buttons'] = buttons
@@ -2365,10 +2365,10 @@ class LauncherApp:
         self.diag_button = ttk.Button(diag, text='Lancer le diagnostic', style='Accent.TButton',
                                       command=self._diagnostic)
         self.diag_button.grid(row=0, column=1, sticky='e')
-        self.diag_list = ttk.Frame(diag, style='Card.TFrame')
+        self.diag_list = ttk.Frame(diag)                 # cadre interieur : sans bordure de carte
         self.diag_list.grid(row=1, column=0, columnspan=2, sticky='ew')
         self.diag_list.columnconfigure(1, weight=1)
-        ttk.Label(self.diag_list, style='Muted.TLabel', wraplength=560, justify='left',
+        ttk.Label(self.diag_list, style='Muted.TLabel', wraplength=520, justify='left',
                   text='Vérifie le jeu, le dossier Mods, le mod et l\'icône, le réglage, le port et le pare-feu. '
                        'Ne modifie rien ; en Rejoindre, il essaie l\'hôte 3 s.').grid(row=0, column=0, columnspan=3,
                                                                                         sticky='w')

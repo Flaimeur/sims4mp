@@ -1,4 +1,7 @@
-# Sims 4 Multiplayer - fenetre en ecrans (0.17.0) : ecran principal (en-tete : role, autre
+# Sims 4 Multiplayer - correctifs (0.17.1) : autres Sims plus recales en boucle (teleportation
+# sans effet comptee : 2 echecs -> laisse en place 60 s ; au plus une teleportation / 10 s par
+# Sim) ; action que le jeu ne sait pas recreer (« Error instantiating affordance ») plus rejouee.
+# Fenetre en ecrans (0.17.0) : ecran principal (en-tete : role, autre
 # joueur, ping, heure de l'hote) et sous-ecrans Partie a deux / Notifications (choix actuel
 # marque) / Outils ; Heberger et Rejoindre depuis le jeu (saisie de l'IP :
 # UiDialogTextInputOkCancel) ; logo Sims4MP en haut des fenetres.
@@ -193,7 +196,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.17.0'
+MOD_VERSION = '0.17.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -245,6 +248,12 @@ WALK_RETARGET = 0.5                       # nouvelle destination si elle a bouge
 WALK_RETRY = 3.0                          # secondes reelles avant de redonner le meme ordre
 WALK_TIMEOUT = 15.0                       # toujours loin apres : teleportation
 TELEPORT_DIST = 40.0                      # plus loin, ou autre niveau : teleportation directe
+# Autres Sims (0.17.1) : un recalage qui ne rapproche pas le Sim est « sans effet ».
+FIX_FAIL_RATIO = 0.8                      # ecart encore >= 80 % de l'ecart d'avant : sans effet
+FIX_FAIL_MAX = 2                          # apres 2 recalages sans effet : Sim laisse en place
+FIX_PAUSE = 60.0                          # ... pendant 60 s reelles
+TELEPORT_GAP = 10.0                       # au plus une teleportation toutes les 10 s par Sim
+UNPLAYABLE_MARK = 'Error instantiating affordance'   # action que le jeu ne sait pas recreer ici
 ORDER_MAX_AGE = 3600.0                    # ordre plus ancien : comme s'il n'y en avait pas
 ACTION_HOLD = 20.0                        # apres une action rejouee, le double n'est pas recale
 PLACE_MIN = 5.0                           # pose directe seulement au-dela de cet ecart
@@ -990,6 +999,10 @@ class NetSession(object):
         self.sims_walk = {}             # sim_id -> marche en cours
         self.sims_status = {}           # sim_id -> dernier etat
         self.sims_followed_at = 0.0
+        self.sims_fix = {}              # sim_id -> suivi des recalages (efficacite, pause, teleportation)
+        self.sims_paused = 0            # Sims laisses en place apres des recalages sans effet
+        self.unplayable = set()         # affordances que le jeu ne sait pas recreer ici (0.17.1)
+        self.unplayable_skipped = 0
 
 
 # ---------------------------------------------------------------------------
@@ -1918,8 +1931,10 @@ def _maybe_walk(session, now):
         _alert_missing_sim(session, remote, status)
 
 
-def _move_toward(session, remote, now, walk):
-    """Rapproche l'exemplaire local du Sim de la position recue. Renvoie (etat ou None, marche en cours)."""
+def _move_toward(session, remote, now, walk, guard=None):
+    """Rapproche l'exemplaire local du Sim de la position recue. Renvoie (etat ou None, marche en cours).
+    guard (autres Sims seulement) : verifie que les teleportations rapprochent vraiment le Sim, les
+    espace (TELEPORT_GAP) et laisse le Sim en place FIX_PAUSE s apres FIX_FAIL_MAX echecs."""
     found = bridge_local_sim_position(remote['sim_id'])
     if found is None:
         return 'lecture du Sim impossible (voir le journal)', walk
@@ -1930,12 +1945,30 @@ def _move_toward(session, remote, now, walk):
     x, y, z, level = found[1]
     gap = ((x - remote['x']) ** 2 + (z - remote['z']) ** 2) ** 0.5
     target = (remote['x'], remote['z'], remote['level'])
+    if guard is not None and guard.get('teleported_gap') is not None:
+        # Premier regard apres une teleportation : a-t-elle rapproche le Sim ?
+        if gap >= guard['teleported_gap'] * FIX_FAIL_RATIO and gap >= WALK_MIN:
+            guard['fails'] = guard.get('fails', 0) + 1
+        else:
+            guard['fails'] = 0
+        guard['teleported_gap'] = None
+        if guard['fails'] >= FIX_FAIL_MAX:
+            guard['fails'] = 0
+            guard['paused_until'] = now + FIX_PAUSE
+            session.sims_paused += 1
+            log('[{}] Sim {} : recalage sans effet ({:.1f} d\'ecart), laisse en place {:.0f} s'.format(
+                session.role, remote['sim_id'], gap, FIX_PAUSE))
+            return 'recalage sans effet : laisse en place', None
     if gap < WALK_MIN and (remote['level'] is None or level == remote['level']):
+        if guard is not None:
+            guard['fails'] = 0
         return 'en place', None
     same = (walk is not None and walk['target'][2] == target[2]
             and ((walk['target'][0] - target[0]) ** 2 + (walk['target'][1] - target[1]) ** 2) ** 0.5 < WALK_RETARGET)
     teleport = ((remote['level'] is not None and level is not None and level != remote['level'])
                 or gap > TELEPORT_DIST or (same and now - walk['started'] > WALK_TIMEOUT))
+    if teleport and guard is not None and now - guard.get('teleported_at', -TELEPORT_GAP) < TELEPORT_GAP:
+        return None, walk                            # teleportation recente : on attend
     if same and not teleport:
         return None, walk                            # deja en route vers ce point
     if walk is not None and not same and not teleport and now - walk['at'] < 1.0:
@@ -1964,6 +1997,8 @@ def _move_toward(session, remote, now, walk):
         return 'impossible de le deplacer (voir le journal)', walk
     if teleport:
         session.teleports += 1
+        if guard is not None:
+            guard['teleported_gap'], guard['teleported_at'] = gap, now
         log('[{}] Sim {} teleporte ({:.1f} d\'ecart)'.format(session.role, remote['sim_id'], gap))
         return 'teleporte', None
     session.walks += 1
@@ -2103,6 +2138,10 @@ def _handle_order(session, data):
     if is_travel(order['name']):
         log('[{}] voyage recu non rejoue : {}'.format(session.role, order['name']))
         return                                       # (mod plus ancien en face) : jamais de voyage rejoue
+    if order['affordance'] in session.unplayable:
+        session.unplayable_skipped += 1              # deja echouee ainsi : inutile de reessayer
+        session.last_order = '{} : non rejouee (le jeu ne sait pas la recreer ici)'.format(order['name'])
+        return
     _sync['pushing'] = True                          # pas un ordre du joueur de ce PC
     try:
         result = _safe('ordre rejoue', bridge_replay_order, order['sim_id'], order['affordance'], order['target'],
@@ -2123,6 +2162,11 @@ def _handle_order(session, data):
     else:
         session.orders_failed += 1
         session.last_order = '{} : non rejouee, {}'.format(label, reason)
+        if UNPLAYABLE_MARK in str(reason) and order['affordance'] not in session.unplayable:
+            # Ex. put_down_anywhere : le jeu calcule ses parametres sur place, une copie ne suffit pas.
+            session.unplayable.add(order['affordance'])
+            log('[{}] {} : le jeu ne sait pas recreer cette action ici, plus rejouee pendant cette partie'.format(
+                session.role, order['name']))
         if not order['auto']:
             bridge_notify('Action de {} non rejouée chez vous : {} ({}).'.format(
                 _other_label(session), order['name'], reason), alert=True, sim_id=order['sim_id'],
@@ -2266,7 +2310,11 @@ def _follow_sim(session, sim_id, now):
     hold = session.action_hold.get(sim_id)
     if hold is not None and now < hold:
         return
-    status, session.sims_walk[sim_id] = _move_toward(session, position, now, session.sims_walk.get(sim_id))
+    guard = session.sims_fix.setdefault(sim_id, {})
+    if now < guard.get('paused_until', 0.0):
+        return                                       # recalages sans effet : laisse en place un moment
+    status, session.sims_walk[sim_id] = _move_toward(session, position, now, session.sims_walk.get(sim_id),
+                                                     guard)
     if status is not None:
         session.sims_status[sim_id] = status
         _alert_missing_sim(session, position, status)
@@ -2378,6 +2426,9 @@ def sync_lines(session):
     lines.append('Autres Sims ({}) : {} suivi(s), {} en marche ; autonomie refusee ici {} fois'.format(
         'l\'hote fait foi' if session.role == 'client' else 'ce PC fait foi',
         len(session.sims_remote), moving, session.autonomy_refused))
+    lines.append('Recalages sans effet : {} Sim(s) laisse(s) en place ; actions impossibles a rejouer ici : {} '
+                 '({} ordre(s) ignore(s))'.format(session.sims_paused, len(session.unplayable),
+                                                  session.unplayable_skipped))
     return lines
 
 

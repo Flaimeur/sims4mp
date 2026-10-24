@@ -506,6 +506,68 @@ report('mp.positions : actions et besoins', 'Actions : 7 envoyee(s), 3 rejouee(s
        and 'Besoins : 1 valeur' in text, text[-300:])
 report('aucune erreur de pompe', mod._pump['error'] is None, str(mod._pump['error']))
 
+# --- 6. Correctifs 0.17.1 : pas de recalage en boucle, actions impossibles plus rejouees ----------
+# Ici la teleportation du faux jeu ne deplace pas le Sim : chaque recalage est « sans effet ».
+guest.sims_fix.clear()
+guest.sims_walk.clear()
+guest.action_hold.clear()
+npc.position = Vector3(20.0, 0.0, 0.0)
+guest.sims_remote[3003] = dict(guest.sims_remote[3003], x=80.0)      # 60 d'ecart : teleportation
+t0 = 1000.0
+base = guest.teleports
+mod._follow_sim(guest, 3003, t0)
+mod._follow_sim(guest, 3003, t0 + 1)
+mod._follow_sim(guest, 3003, t0 + 5)
+report('PNJ loin : une teleportation, puis aucune autre avant {:.0f} s'.format(mod.TELEPORT_GAP),
+       guest.teleports == base + 1, str(guest.teleports - base))
+mod._follow_sim(guest, 3003, t0 + 11)
+mod._follow_sim(guest, 3003, t0 + 12)
+report('2 teleportations sans effet : Sim laisse en place, note une fois',
+       guest.teleports == base + 2 and guest.sims_paused == 1
+       and guest.sims_status[3003] == 'recalage sans effet : laisse en place')
+for t in (t0 + 25, t0 + 40, t0 + 70):
+    mod._follow_sim(guest, 3003, t)
+report('pendant {:.0f} s : plus aucun recalage'.format(mod.FIX_PAUSE), guest.teleports == base + 2)
+mod._follow_sim(guest, 3003, t0 + 12 + mod.FIX_PAUSE + 1)
+report('apres la pause : nouvel essai', guest.teleports == base + 3)
+npc.position = Vector3(79.0, 0.0, 0.0)                               # cette fois le Sim est arrive
+mod._follow_sim(guest, 3003, t0 + 100)
+report('recalage efficace : rien n\'est compte comme echec', guest.sims_fix[3003]['fails'] == 0
+       and guest.sims_paused == 1)
+
+
+class Unplayable(object):
+    """Comme l'EnqueueResult du jeu pour put_down_anywhere chez l'autre PC."""
+
+    def __bool__(self):
+        return False
+
+    def __str__(self):
+        return ('<EnqueueResult: True <ExecuteResult: False: (Error instantiating affordance: __init__() missing '
+                '7 required keyword-only arguments: \'slot_types_and_costs\')>>')
+
+
+PUT_DOWN = affordance('put_down_anywhere', 1400)
+AFFORDANCES[1400] = PUT_DOWN                                       # connue du faux jeu
+calls = []
+real_push = double.push_super_affordance
+double.push_super_affordance = lambda *a: calls.append(a) or Unplayable()
+skipped = session.unplayable_skipped
+send({'kind': 'order', 'id': 'client-70', 'sim_id': 2002, 'affordance': 1400, 'name': 'put_down_anywhere',
+      'target': {'t': 'none'}, 'auto': True})
+pump_until(lambda: calls)
+send({'kind': 'order', 'id': 'client-71', 'sim_id': 2002, 'affordance': 1400, 'name': 'put_down_anywhere',
+      'target': {'t': 'none'}, 'auto': True})
+pump_for(0.2)
+double.push_super_affordance = real_push
+report('action que le jeu ne sait pas recreer : essayee une fois, puis plus rejouee pendant la partie',
+       len(calls) == 1 and 1400 in session.unplayable and session.unplayable_skipped == skipped + 1,
+       '{} essai(s), ignores {} ; dernier ordre : {}'.format(len(calls), session.unplayable_skipped - skipped,
+                                                            session.last_order))
+with open(mod.LOG_PATH, encoding='utf-8') as handle:
+    report('journal : une seule ligne pour cette action',
+           handle.read().count('put_down_anywhere : le jeu ne sait pas recreer cette action ici') == 1)
+
 peer.close()
 mod._close_session()
 shutil.rmtree(TMP, ignore_errors=True)
