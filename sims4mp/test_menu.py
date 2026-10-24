@@ -458,9 +458,10 @@ mod._pump['installed'] = True
 mod._local_ips = lambda: ['192.168.1.50']
 mod.open_menu()
 DIALOGS[-1].click(mod.MENU_PARTY)
-report('« Partie à deux… » sans partie : Heberger, Rejoindre, Etat, Retour',
+report('« Partie à deux… » sans partie : Heberger, Rejoindre, Simulation unique, Etat, Retour',
        DIALOGS[-1].title == 'Partie à deux' and screen_labels() == [
-           'Héberger la partie', 'Rejoindre un hôte…', 'État de la partie', 'Retour'], str(screen_labels()))
+           'Héberger la partie', 'Rejoindre un hôte…', 'Simulation unique : désactivée (cliquer pour activer)',
+           'État de la partie', 'Retour'], str(screen_labels()))
 del notes[:]
 DIALOGS[-1].click(mod.MENU_HOST)
 report('« Héberger » : ecoute sur le port par defaut, IP de ce PC annoncee',
@@ -504,7 +505,8 @@ guest.role = 'host'
 mod.open_menu('party')
 report('« Partie à deux… » en partie (hote) : IP et port de ce PC, Resynchroniser, Jouer seul',
        'IP de ce PC : 192.168.1.50 , port 7777.' in DIALOGS[-1].text and screen_labels() == [
-           'Resynchroniser maintenant', 'Jouer seul (se déconnecter)', 'État de la partie', 'Retour'],
+           'Resynchroniser maintenant', 'Jouer seul (se déconnecter)',
+           'Simulation unique : désactivée (cliquer pour activer)', 'État de la partie', 'Retour'],
        DIALOGS[-1].text)
 del notes[:]
 mod.menu_join('192.168.1.20')

@@ -1,4 +1,10 @@
-# Sims 4 Multiplayer - voyage a deux (0.19.0) : quand un joueur voyage (carte, telephone,
+# Sims 4 Multiplayer - simulation unique (0.20.0, P2 etape 1, experimental, choisie par l'hote) :
+# l'hote fait tourner la seule simulation et recopie a l'invite ce qu'il envoie a son affichage
+# (omega.send, sauf ses fenetres et menus) ; chez l'invite la ligne du temps des Sims est gelee,
+# l'heure et les PNJ viennent de l'hote, ses clics partent comme ordres (M5) et sa croix annule
+# l'action chez l'hote. Positions, besoins, autonomie (M3 a M6) et detecteur d'ecarts sont
+# coupes dans ce mode. Voir la section « Simulation unique ».
+# Voyage a deux (0.19.0) : quand un joueur voyage (carte, telephone,
 # rentrer...), l'autre recoit une fenetre « Suivre sur le meme lot » ; s'il accepte, son jeu
 # voyage vers le meme lot (world.travel_service). Chez l'invite, la sauvegarde est liberee
 # le temps du voyage (le jeu sauvegarde en voyageant), puis reverrouillee a l'arrivee.
@@ -194,6 +200,8 @@
 # compter messages et octets par type (noms MSG_* de Consts_pb2) et par
 # session, puis appelle l'original sans rien changer.
 
+import base64
+import binascii
 import functools
 import json
 import os
@@ -204,7 +212,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.19.0'
+MOD_VERSION = '0.20.0'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -277,6 +285,26 @@ NEEDS_RESEND = 30.0                       # renvoi complet meme sans changement
 NEEDS_EPSILON = 1.0                       # ecart minimal (sur ~ -100..100) pour envoyer ou ecrire
 NEEDS_MAX = 64                            # besoins acceptes par message
 NEEDS_LIMIT = 100000.0
+# Simulation unique (0.20.0) : l'hote recopie son affichage a l'invite.
+MIRROR_BATCH_BYTES = 256 * 1024           # octets bruts au plus par message « view » (base64 : x 4/3)
+MIRROR_MAX_RAW = 600 * 1024               # message d'affichage plus gros : jamais recopie (journal)
+MIRROR_QUEUE_MAX = 5000                   # hote : messages en attente au plus, sinon la file est videe
+MIRROR_VIEW_MAX = 2000                    # messages acceptes par « view » recu
+MIRROR_REPORT_INTERVAL = 60.0             # resume dans le journal, en secondes reelles
+MIRROR_ERRORS_LOGGED = 20                 # erreurs d'affichage differentes notees au plus
+# Messages propres a l'ecran de l'hote (Consts_pb2) : ses fenetres, menus, notifications, camera.
+MIRROR_HOST_ONLY = frozenset([
+    'MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE', 'MSG_UI_DIALOG_SHOW', 'MSG_UI_DIALOG_CLOSE',
+    'MSG_UI_NOTIFICATION_SHOW', 'MSG_UI_PHONE_RING', 'MSG_CAMERA_FOCUS_EVENT', 'MSG_TRAVEL_MENU_CREATE',
+    'MSG_TRAVEL_MENU_CANCEL', 'MSG_TRAVEL_MENU_SHOW', 'MSG_GAME_SAVE_COMPLETE', 'MSG_GAME_SAVE_LOCK_UNLOCK',
+    'MSG_GAME_SAVE_CHEAT_LOCK', 'MSG_SELECTABLE_SIMS_UPDATE', 'MSG_SET_CHEAT_STATUS', 'MSG_GAMEPLAY_OPTIONS',
+    'MSG_SHOW_MAP_VIEW', 'MSG_SHOW_PLEX_VIEW', 'MSG_OPEN_INVENTORY', 'MSG_OPEN_INVENTORY_WITH_FILTERS',
+    'MSG_SHOW_OBJECT_INVENTORY', 'MSG_SELECT_CAREER_UI', 'MSG_SIM_SERVER_RESPONSE_FAILED',
+    'MSG_TRAVEL_SIMS_TO_ZONE',
+])
+MIRROR_HOST_ONLY_PREFIXES = ('MSG_CONNECTION_STATUS_', 'MSG_DEBUGVISUALIZATION_', 'MSG_TUTORIAL_', 'MSG_SOP_',
+                             'MSG_NS_', 'MSG_CACHE_', 'MSG_GSI_')
+MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique).'
 
 
 # ---------------------------------------------------------------------------
@@ -938,10 +966,49 @@ def bridge_paused_value():
     return int(ClockSpeedMode.PAUSED)
 
 
-def bridge_refused_action():
+def bridge_refused_action(reason=None):
     """Resultat renvoye par InteractionQueue.append pour une action refusee."""
     from event_testing.results import TestResult
-    return TestResult(False, 'Sims4MP : en attente de l\'autre joueur.')
+    return TestResult(False, reason or 'Sims4MP : en attente de l\'autre joueur.')
+
+
+# --- Simulation unique (0.20.0) ---------------------------------------------------
+
+def bridge_deliver_view(msg_id, data):
+    """Invite : remet a l'affichage de ce PC un message de l'hote, comme le fait
+    server.client.Client.send_message (omega.send(client.id, msg_id, octets)). False sans client."""
+    import omega
+    import services
+    client = services.client_manager().get_first_client()
+    if client is None:
+        return False
+    omega.send(client.id, msg_id, data)
+    return True
+
+
+def bridge_is_frozen_timeline(timeline):
+    """Vrai pour la ligne du temps des Sims (services.time_service().sim_timeline) pendant que
+    la zone tourne (zone.is_zone_running) : chargements et voyages ne sont jamais geles."""
+    import services
+    zone = services.current_zone()
+    if zone is None or not zone.is_zone_running:
+        return False
+    return timeline is services.time_service().sim_timeline
+
+
+def bridge_cancel_by_id(interaction_id):
+    """Hote : annule comme la croix du joueur l'action interaction_id de l'un des Sims presents
+    (Sim.find_interaction_by_id puis find_continuation_by_id, comme
+    interaction_commands.cancel_common). Renvoie True si une action a ete trouvee."""
+    import services
+    for sim in services.sim_info_manager().instanced_sims_gen():
+        interaction = sim.find_interaction_by_id(interaction_id)
+        if interaction is None:
+            interaction = sim.find_continuation_by_id(interaction_id)
+        if interaction is not None:
+            interaction.cancel_user(cancel_reason_msg='Sims4MP : annulee par l\'invite')
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1118,8 @@ class NetSession(object):
         self.roster_spawned = 0
         self.roster_despawned = 0
         self.roster_unknown = set()     # Sims de l'hote qui n'existent pas dans la partie de l'invite
+        # Simulation unique (0.20.0) : l'invite a gele sa simulation et affiche celle de l'hote.
+        self.mirror_ready = False       # hote : l'invite a confirme (EVENT mirror_ready)
 
 
 # ---------------------------------------------------------------------------
@@ -1180,6 +1249,8 @@ def _handle_host_event(session, kind, value):
         session.peer = None
         session.handshake_done = False
         session.close_after_flush = False
+        session.mirror_ready = False
+        _mirror_clear_out()
     elif kind == 'message':
         msg_type = value['type']
         data = value['data']
@@ -1195,6 +1266,7 @@ def _handle_host_event(session, kind, value):
                     bridge_notify('Versions du mod différentes (vous {}, l\'invité {!s:.16}). '
                                   'Installez la même version des deux côtés.'.format(
                                       MOD_VERSION, data.get('mod_version')), alert=True)
+                _mirror_announce(session)
             else:
                 _send(session, protocol.reject('protocole {} attendu, recu {}'.format(
                     protocol.PROTOCOL_VERSION, data.get('protocol'))))
@@ -1231,6 +1303,10 @@ def _handle_host_event(session, kind, value):
                 _handle_cancel(session, data)
             elif data.get('kind') == 'gaps':
                 _handle_gaps(session, data)
+            elif data.get('kind') == 'mirror_ready':
+                _handle_mirror_ready(session, data)
+            elif data.get('kind') == 'cancel_si':
+                _handle_cancel_si(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -1249,6 +1325,7 @@ def _handle_client_event(session, kind, value):
     elif kind == 'disconnected':
         log('[client] session terminee')
         _session = None
+        _mirror_stop_guest('connexion perdue')
         if _auto['target'] is not None:
             # Pas de nouvelle tentative en boucle : la prochaine dans 30 s au plus tot.
             _auto['next_try'] = time.monotonic() + AUTO_RETRY_INTERVAL
@@ -1298,12 +1375,17 @@ def _handle_client_event(session, kind, value):
                 _handle_digest(session, value['data'])
             elif value['data'].get('kind') == 'roster':
                 _handle_roster(session, value['data'])
+            elif value['data'].get('kind') == 'view':
+                _handle_view(session, value['data'])
+            elif value['data'].get('kind') == 'mirror':
+                _handle_mirror(session, value['data'])
             else:
                 log('[client] EVENT ignore (kind {!r})'.format(value['data'].get('kind')))
         elif msg_type == protocol.BYE:
             client.close()
             _session = None
             log('[client] host deconnecte (BYE)')
+            _mirror_stop_guest('l\'hôte a quitté la partie')
 
 
 def _handle_pong(session, data):
@@ -1487,7 +1569,7 @@ def _poll_session(session, now):
             # Les etats sont journalises en resume par _handle_state, les presences pas du tout.
             quiet = ((value['type'] == protocol.EVENT
                       and (value['data'].get('kind') in ('state', 'presence', 'position', 'clock', 'needs', 'sims',
-                                                         'digest', 'gaps', 'roster')
+                                                         'digest', 'gaps', 'roster', 'view')
                            or (value['data'].get('kind') == 'order' and value['data'].get('auto') is True)))
                      # pings automatiques (latence) : toutes les 10 s, inutiles dans le journal
                      or (value['type'] == protocol.PING and value['data'].get('auto') is True)
@@ -1513,16 +1595,19 @@ def _poll_session(session, now):
         _maybe_send_state(session, now)
     if _session is session:
         _maybe_send_presence(session, now)
-        _maybe_send_position(session, now)
         _money_tick(session, now)
         _clock_tick(session, now)
-        _walk_tick(session, now)
-        _needs_tick(session, now)
-        _maybe_send_sims(session, now)
+        if not mirror_on(session):
+            # Deux simulations (option A) : inutiles quand l'hote calcule seul (0.20.0).
+            _maybe_send_position(session, now)
+            _walk_tick(session, now)
+            _needs_tick(session, now)
+            _maybe_send_sims(session, now)
+            _digest_tick(session, now)
         _roster_tick(session, now)
         _auto_ping_tick(session, now)
         _summary_tick(session, now)
-        _digest_tick(session, now)
+        _mirror_tick(session, now)
         _flush_now(session)
 
 
@@ -2065,6 +2150,8 @@ def send_player_order(order, interaction=None):
     session = _session
     if session is None or not session.handshake_done or not session.endpoint.is_connected or _gate['waiting']:
         return None
+    if session.role == 'host' and mirror_on(session):
+        return None                                  # simulation unique : l'invite voit deja le resultat
     session.order_counter += 1
     message = dict(order, kind='order', id='{}-{}'.format(session.role, session.order_counter))
     if not session.endpoint.send(protocol.make_message(protocol.EVENT, message)):
@@ -2110,8 +2197,8 @@ def order_of(interaction):
 def on_user_cancel(interaction):
     """La croix du joueur de ce PC sur une action reliee : l'annulation part vers l'autre PC."""
     session = _session
-    if _sync['pushing'] or not _connected(session):
-        return
+    if _sync['pushing'] or not _connected(session) or mirror_on(session):
+        return                                       # simulation unique : la croix passe par cancel_si
     order_id = order_of(interaction)
     if order_id is None:
         return
@@ -2184,6 +2271,8 @@ def _handle_order(session, data):
     if _gate['waiting']:
         session.last_order = '{} : ignore (attente de l\'autre joueur)'.format(order['name'])
         return
+    if session.role == 'client' and mirror_on(session):
+        return                                       # simulation unique : rien ne se rejoue chez l'invite
     if order['auto'] and _needs_authority(session, order['sim_id'], _my_active_id()):
         return                                       # action autonome d'un Sim dont ce PC fait foi
     if is_travel(order['name']):
@@ -2428,6 +2517,8 @@ def autonomy_refused(queue, interaction):
     session = _session
     if _sync['pushing'] or not _connected(session) or bridge_interaction_kind(interaction) != 'auto':
         return False
+    if mirror_on(session):
+        return False                                 # simulation unique : l'hote decide pour tous les Sims
     sim_id = queue.sim.sim_info.sim_id
     if _needs_authority(session, sim_id, _my_active_id()):
         return False
@@ -2440,7 +2531,7 @@ def on_autonomy_action(queue, interaction):
     au plus une par Sim et par AUTO_ORDER_GAP s, et jamais la meme deux fois de suite
     dans les AUTO_ORDER_REPEAT s (l'autonomie repropose souvent la meme action)."""
     session = _session
-    if not _connected(session):
+    if not _connected(session) or mirror_on(session):
         return
     sim_id = queue.sim.sim_info.sim_id
     if not _needs_authority(session, sim_id, _my_active_id()):
@@ -2910,12 +3001,407 @@ def _install_traffic_hook():
                 traffic_record(session_id, msg_id, data)
             except Exception:
                 _traffic['errors'] += 1
+        if _mirror['capturing']:
+            try:
+                mirror_capture(msg_id, data)
+            except Exception:
+                _mirror_error('recopie d\'un message')
         return original(session_id, msg_id, data, *args, **kwargs)
 
     send._sims4mp_hook = True
     omega.send = send
     _traffic['installed'] = True
     log('trafic : omega.send enveloppe (mesure arretee par defaut, mp.traffic on)')
+
+
+# ---------------------------------------------------------------------------
+# Simulation unique (P2 etape 1, 0.20.0, experimental) : l'hote calcule, l'invite affiche
+# ---------------------------------------------------------------------------
+# Choisie par l'hote (menu Partie a deux, ou mp.mirror en secours), annoncee a l'invite
+# (EVENT mirror), confirmee par lui (EVENT mirror_ready). Verifie dans simulation.zip :
+#   - server.client.Client.send_message(msg_id, msg) appelle omega.send(client.id, msg_id,
+#     msg.SerializeToString()) : l'enveloppe de omega.send (mesure du trafic) garde chez l'hote
+#     chaque message, sauf ceux de son ecran (MIRROR_HOST_ONLY), et la pompe les envoie par lots
+#     (EVENT view, octets en base64) ; l'invite les remet a son affichage par
+#     omega.send(son client.id, msg_id, octets), dans l'ordre.
+#   - scheduling.Timeline.simulate(until, max_elements, max_time_ms) renvoie True quand tout est
+#     fait (areaserver.c_api_server_tick) : chez l'invite, la ligne du temps des Sims
+#     (services.time_service().sim_timeline) n'avance plus pendant que la zone tourne
+#     (Zone.is_zone_running) ; chargements et voyages ne sont jamais geles.
+#   - clock.GameClock._sync_clock_and_broadcast_gameclock(immediate) envoie l'heure a l'affichage
+#     (op SetGameTime) : coupe chez l'invite, qui affiche celle de l'hote.
+#   - sims.sim_spawner_service.SimSpawnerService.update, appele par Zone.update hors ligne du temps,
+#     fait venir les PNJ : coupe chez l'invite (la presence 0.18.0 recopie ceux de l'hote).
+#   - server_commands.interaction_commands.cancel_common(interaction_id, context_handle,
+#     _connection, user_canceled), appele par interactions.cancel_si : la croix de l'invite vise une
+#     action de l'hote (EVENT cancel_si) ; l'hote la retrouve par Sim.find_interaction_by_id.
+# Les clics de l'invite partent comme ordres (M5) et sont refuses dans sa file ; l'hote les rejoue.
+
+_mirror = {
+    'wanted': False,         # hote : simulation unique demandee
+    'active': False,         # invite : simulation locale gelee, affichage recu de l'hote
+    'capturing': False,      # hote : recopie en cours (invite connecte et pret)
+    'out': [],               # hote : (msg_id, octets) a envoyer au prochain passage de la pompe
+    'host_only': None,       # ids MSG_* jamais recopies (lus dans Consts_pb2 a la demande)
+    'sent': [0, 0],          # hote : messages, octets recopies
+    'batches': 0,
+    'skipped': 0,            # hote : messages propres a son ecran
+    'too_big': 0,
+    'dropped': 0,
+    'received': [0, 0],      # invite : messages, octets recus
+    'delivered': 0,
+    'ignored': 0,
+    'frozen': 0,             # invite : passages de la ligne du temps sautes
+    'clock_skipped': 0,
+    'spawns_skipped': 0,
+    'refused': 0,            # invite : clics envoyes a l'hote au lieu de sa file
+    'cancels_sent': 0,
+    'cancels_applied': 0,
+    'errors': 0,
+    'errors_seen': set(),
+    'reported_at': 0.0,
+    'hooks': [],             # accroches installees
+}
+
+
+def mirror_on(session):
+    """Vrai si la simulation unique est en cours pour cette session
+    (hote : l'invite a confirme ; invite : sa simulation est gelee)."""
+    if session is None:
+        return False
+    if session.role == 'host':
+        return _mirror['wanted'] and session.mirror_ready
+    return _mirror['active']
+
+
+def mirror_frozen():
+    """Invite en simulation unique : sa simulation ne doit plus avancer d'elle-meme."""
+    session = _session
+    return _mirror['active'] and session is not None and session.role == 'client'
+
+
+def _mirror_error(where):
+    """Erreur de la simulation unique : comptee, et journalisee une fois par sorte."""
+    _mirror['errors'] += 1
+    text = traceback.format_exc()
+    key = (where, text.strip().splitlines()[-1])
+    if key not in _mirror['errors_seen'] and len(_mirror['errors_seen']) < MIRROR_ERRORS_LOGGED:
+        _mirror['errors_seen'].add(key)
+        log('simulation unique : erreur ({}) :\n{}'.format(where, text))
+
+
+def _mirror_host_only():
+    ids = _mirror['host_only']
+    if ids is None:
+        found = set()
+        for msg_id, name in _message_names().items():
+            if name in MIRROR_HOST_ONLY or name.startswith(MIRROR_HOST_ONLY_PREFIXES):
+                found.add(msg_id)
+        ids = _mirror['host_only'] = frozenset(found)
+        log('simulation unique : {} type(s) de message gardes sur l\'ecran de l\'hote'.format(len(ids)))
+    return ids
+
+
+def mirror_capture(msg_id, data):
+    """Hote : garde un message envoye a son affichage pour le recopier a l'invite."""
+    if msg_id in _mirror_host_only():
+        _mirror['skipped'] += 1
+        return
+    if not isinstance(data, (bytes, bytearray)):
+        return
+    if len(data) > MIRROR_MAX_RAW:
+        _mirror['too_big'] += 1
+        if _mirror['too_big'] <= 5:
+            log('simulation unique : message {} trop gros ({} octets), non recopie'.format(msg_id, len(data)))
+        return
+    out = _mirror['out']
+    out.append((msg_id, bytes(data)))
+    if len(out) > MIRROR_QUEUE_MAX:
+        _mirror['dropped'] += len(out)
+        log('simulation unique : file pleine, {} messages abandonnes (resynchro conseillee)'.format(len(out)))
+        del out[:]
+
+
+def _mirror_clear_out():
+    if _mirror['out']:
+        _mirror['dropped'] += len(_mirror['out'])
+        del _mirror['out'][:]
+
+
+def mirror_batches(items):
+    """Decoupe [(msg_id, octets)] en lots d'au plus MIRROR_BATCH_BYTES octets bruts (un message
+    plus gros part seul) ; chaque element devient [msg_id, texte base64]."""
+    batch, size = [], 0
+    for msg_id, data in items:
+        if batch and size + len(data) > MIRROR_BATCH_BYTES:
+            yield batch
+            batch, size = [], 0
+        batch.append([msg_id, base64.b64encode(data).decode('ascii')])
+        size += len(data)
+    if batch:
+        yield batch
+
+
+def _mirror_flush(session):
+    """Hote : envoie a l'invite les messages gardes depuis le dernier passage."""
+    out = _mirror['out']
+    if not out:
+        return
+    items = list(out)
+    del out[:]
+    for batch in mirror_batches(items):
+        if not session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'view', 'm': batch})):
+            _mirror['dropped'] += len(batch)
+            continue
+        _mirror['batches'] += 1
+        _mirror['sent'][0] += len(batch)
+    _mirror['sent'][1] += sum(len(data) for _, data in items)
+
+
+def _mirror_tick(session, now):
+    """Appele a chaque passage de la pompe : demarre ou arrete la recopie, envoie, resume."""
+    capturing = session.role == 'host' and _connected(session) and mirror_on(session)
+    if capturing != _mirror['capturing']:
+        _mirror['capturing'] = capturing
+        if not capturing:
+            _mirror_clear_out()
+        log('simulation unique : recopie de l\'affichage {}'.format('demarree' if capturing else 'arretee'))
+    if capturing:
+        _mirror_flush(session)
+    if mirror_on(session) and now - _mirror['reported_at'] >= MIRROR_REPORT_INTERVAL:
+        _mirror['reported_at'] = now
+        log('simulation unique :\n  ' + '\n  '.join(mirror_lines()))
+
+
+def mirror_lines():
+    """Compteurs pour le journal, mp.mirror et la fenetre « Etat de la partie »."""
+    if not (_mirror['wanted'] or _mirror['active']):
+        return ['Simulation unique : désactivée.']
+    if _mirror['active']:
+        return ['Simulation unique : vous voyez le jeu de l\'hôte.',
+                '  affichage reçu : {} message(s), {:.0f} Ko, {} remis, {} ignoré(s)'.format(
+                    _mirror['received'][0], _mirror['received'][1] / 1024.0, _mirror['delivered'],
+                    _mirror['ignored']),
+                '  gel : {} pas de simulation, {} heure(s), {} venue(s) de PNJ évités'.format(
+                    _mirror['frozen'], _mirror['clock_skipped'], _mirror['spawns_skipped']),
+                '  clics envoyés à l\'hôte : {} , annulations : {} , erreurs : {}'.format(
+                    _mirror['refused'], _mirror['cancels_sent'], _mirror['errors'])]
+    session = _session
+    state = 'active' if mirror_on(session) else 'demandée (en attente de l\'invité)'
+    return ['Simulation unique : {}.'.format(state),
+            '  affichage recopié : {} message(s) en {} lot(s), {:.0f} Ko'.format(
+                _mirror['sent'][0], _mirror['batches'], _mirror['sent'][1] / 1024.0),
+            '  gardés sur votre écran : {} , trop gros : {} , abandonnés : {}'.format(
+                _mirror['skipped'], _mirror['too_big'], _mirror['dropped']),
+            '  annulations de l\'invité : {} , erreurs : {}'.format(_mirror['cancels_applied'], _mirror['errors'])]
+
+
+def _mirror_announce(session):
+    """Hote : dit a l'invite (connexion, choix au menu) si la simulation unique est voulue."""
+    if session is None or session.role != 'host' or not session.handshake_done:
+        return
+    if not _mirror['wanted']:
+        session.mirror_ready = False
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'mirror', 'on': _mirror['wanted']}))
+
+
+def mirror_set_wanted(on):
+    """Hote (menu, mp.mirror) : demande ou coupe la simulation unique. Renvoie le texte a afficher."""
+    session = _session
+    if session is not None and session.role == 'client':
+        return 'Seul l\'hôte choisit la simulation unique.'
+    _mirror['wanted'] = bool(on)
+    log('simulation unique {} par l\'hote'.format('demandee' if on else 'coupee'))
+    if session is not None and session.handshake_done:
+        _mirror_announce(session)
+        _flush_now(session)
+        return ('Simulation unique demandée à l\'invité.' if on else
+                'Simulation unique coupée : chaque jeu recalcule de son côté.')
+    return ('Simulation unique activée : elle démarrera à la connexion de l\'invité.' if on else
+            'Simulation unique désactivée.')
+
+
+def _handle_mirror(session, data):
+    """Invite : l'hote active ou coupe la simulation unique ; la reponse confirme l'etat."""
+    on = data.get('on') is True
+    if on and not _mirror['active']:
+        _mirror['active'] = True
+        _mirror['reported_at'] = time.monotonic()
+        log('[client] simulation unique : simulation locale gelee, affichage recu de l\'hote')
+        bridge_notify('Simulation unique : l\'hôte calcule la partie, vous voyez son jeu. '
+                      'Vos actions sont envoyées à l\'hôte.')
+    elif not on and _mirror['active']:
+        _mirror_stop_guest('coupée par l\'hôte')
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'mirror_ready', 'on': _mirror['active']}))
+
+
+def _handle_mirror_ready(session, data):
+    """Hote : l'invite confirme (ou non) que sa simulation est gelee."""
+    ready = data.get('on') is True and _mirror['wanted']
+    if ready != session.mirror_ready:
+        session.mirror_ready = ready
+        log('[host] simulation unique {} chez l\'invite'.format('prete' if ready else 'arretee'))
+        if ready:
+            bridge_notify('Simulation unique active : votre jeu calcule la partie des deux joueurs.')
+
+
+def _mirror_stop_guest(reason):
+    """Invite : la simulation locale reprend (fin de connexion ou choix de l'hote)."""
+    if not _mirror['active']:
+        return
+    _mirror['active'] = False
+    log('simulation unique : simulation locale relancee ({})'.format(reason))
+    bridge_notify('Simulation unique arrêtée ({}) : votre jeu calcule de nouveau seul. Rechargez la '
+                  'partie de l\'hôte pour repartir du même état.'.format(reason), alert=True)
+
+
+def _handle_view(session, data):
+    """Invite : remet a son affichage les messages recopies par l'hote, dans l'ordre."""
+    entries = data.get('m')
+    if not isinstance(entries, list) or len(entries) > MIRROR_VIEW_MAX:
+        log('[client] affichage de l\'hote invalide ignore')
+        return
+    if not _mirror['active']:
+        _mirror['ignored'] += len(entries)
+        return
+    for entry in entries:
+        if (not isinstance(entry, list) or len(entry) != 2 or _clean_int(entry[0], 0, 2 ** 31 - 1) is None
+                or not isinstance(entry[1], str)):
+            _mirror['ignored'] += 1
+            continue
+        try:
+            raw = base64.b64decode(entry[1].encode('ascii'), validate=True)
+        except (binascii.Error, ValueError, UnicodeEncodeError):
+            _mirror['ignored'] += 1
+            continue
+        _mirror['received'][0] += 1
+        _mirror['received'][1] += len(raw)
+        try:
+            if bridge_deliver_view(entry[0], raw):
+                _mirror['delivered'] += 1
+        except Exception:
+            _mirror_error('affichage du message {}'.format(entry[0]))
+
+
+def mirror_takes_order(queue, interaction):
+    """Invite en simulation unique : un clic du joueur part a l'hote (ordre M5) et n'entre pas
+    dans la file locale, gelee. Renvoie True si l'action doit etre refusee ici."""
+    if _sync['pushing'] or not mirror_frozen() or not _is_user_directed(interaction):
+        return False
+    _mirror['refused'] += 1
+    on_player_order(queue, interaction)
+    return True
+
+
+def mirror_forward_cancel(interaction_id):
+    """Invite : la croix vise une action de l'hote, l'annulation part a l'hote."""
+    session = _session
+    interaction_id = _clean_int(interaction_id, 1, 2 ** 64)
+    if interaction_id is None or not _connected(session):
+        return False
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'cancel_si', 'id': interaction_id}))
+    _flush_now(session)
+    _mirror['cancels_sent'] += 1
+    log('[client] croix envoyee a l\'hote (action {})'.format(interaction_id))
+    return True
+
+
+def _handle_cancel_si(session, data):
+    """Hote : annule l'action visee par la croix de l'invite."""
+    interaction_id = _clean_int(data.get('id'), 1, 2 ** 64)
+    if interaction_id is None or not mirror_on(session):
+        return
+    _sync['pushing'] = True
+    try:
+        found = _safe('annulation de l\'invite', bridge_cancel_by_id, interaction_id)
+    finally:
+        _sync['pushing'] = False
+    if found:
+        _mirror['cancels_applied'] += 1
+        log('[host] action {} annulee par l\'invite'.format(interaction_id))
+    else:
+        log('[host] croix de l\'invite : action {} deja terminee'.format(interaction_id))
+
+
+def _mirror_wrap(owner, name, make):
+    """Remplace owner.name par make(original), une seule fois."""
+    original = getattr(owner, name)
+    if getattr(original, '_sims4mp_hook', False):
+        return
+    wrapped = functools.wraps(original)(make(original))
+    wrapped._sims4mp_hook = True
+    setattr(owner, name, wrapped)
+
+
+def _hook_timeline():
+    import scheduling
+
+    def make(original):
+        def simulate(self, *args, **kwargs):
+            if _mirror['active']:
+                try:
+                    if mirror_frozen() and bridge_is_frozen_timeline(self):
+                        _mirror['frozen'] += 1
+                        return True                  # « tout est fait » : rien ne s'execute ici
+                except Exception:
+                    _mirror_error('gel de la ligne du temps')
+            return original(self, *args, **kwargs)
+        return simulate
+    _mirror_wrap(scheduling.Timeline, 'simulate', make)
+
+
+def _hook_clock_broadcast():
+    import clock
+
+    def make(original):
+        def sync_and_broadcast(self, *args, **kwargs):
+            if mirror_frozen():
+                _mirror['clock_skipped'] += 1
+                return None                          # l'heure affichee vient de l'hote
+            return original(self, *args, **kwargs)
+        return sync_and_broadcast
+    _mirror_wrap(clock.GameClock, '_sync_clock_and_broadcast_gameclock', make)
+
+
+def _hook_npc_spawner():
+    from sims.sim_spawner_service import SimSpawnerService
+
+    def make(original):
+        def update(self, *args, **kwargs):
+            if mirror_frozen():
+                _mirror['spawns_skipped'] += 1
+                return None                          # les PNJ viennent de l'hote (presence)
+            return original(self, *args, **kwargs)
+        return update
+    _mirror_wrap(SimSpawnerService, 'update', make)
+
+
+def _hook_cancel_command():
+    from server_commands import interaction_commands
+
+    def make(original):
+        def cancel_common(interaction_id, *args, **kwargs):
+            if mirror_frozen():
+                try:
+                    if mirror_forward_cancel(interaction_id):
+                        return True
+                except Exception:
+                    _mirror_error('croix de l\'invite')
+            return original(interaction_id, *args, **kwargs)
+        return cancel_common
+    _mirror_wrap(interaction_commands, 'cancel_common', make)
+
+
+def _install_mirror_hooks():
+    """Accroches de la simulation unique ; chacune est independante des autres."""
+    for label, install in (('ligne du temps', _hook_timeline), ('horloge', _hook_clock_broadcast),
+                           ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command)):
+        try:
+            install()
+            _mirror['hooks'].append(label)
+        except Exception:
+            log('ERREUR simulation unique : accroche {} impossible :\n{}'.format(label, traceback.format_exc()))
+    log('simulation unique : accroches installees : {}'.format(', '.join(_mirror['hooks']) or 'aucune'))
 
 
 # ---------------------------------------------------------------------------
@@ -2940,6 +3426,7 @@ MENU_ICON_INSTANCE = 0x80EB131F7361E9AA   # image DDS de sims4mp_icons.package (
 MENU_CLOSE, MENU_BACK = 6, 9
 MENU_PARTY, MENU_NOTIFY, MENU_TOOLS = 10, 11, 12
 MENU_HOST, MENU_JOIN = 20, 21
+MENU_MIRROR = 22                                       # simulation unique (0.20.0), hote seulement
 MENU_STATUS, MENU_RESYNC, MENU_REPORT, MENU_SOLO = 4, 7, 8, 5
 MENU_CHOICES = (                                       # ecran principal
     (MENU_PARTY, 'Partie à deux…'),
@@ -2979,7 +3466,7 @@ def menu_status_lines():
         lines.append('Sauvegarde désactivée ici : seul l\'hôte sauvegarde.')
     if session.last_gaps is not None:
         lines.append('Derniers écarts : {}'.format(', '.join(session.last_gaps) or 'aucun'))
-    return lines + sync_lines(session)
+    return lines + mirror_lines() + sync_lines(session)
 
 
 def menu_header_lines():
@@ -3025,6 +3512,12 @@ def menu_screen(screen):
                 lines.append('IP de ce PC : {} , port {}.'.format(', '.join(ips) or 'inconnue',
                                                                   _session.endpoint.port))
             choices = [(MENU_RESYNC, 'Resynchroniser maintenant'), (MENU_SOLO, 'Jouer seul (se déconnecter)')]
+        if _session is None or _session.role == 'host':
+            lines.append('Simulation unique (expérimental) : votre jeu calcule tout, l\'invité voit votre partie.')
+            choices.append((MENU_MIRROR, 'Simulation unique : {}'.format(
+                'activée (cliquer pour couper)' if _mirror['wanted'] else 'désactivée (cliquer pour activer)')))
+        elif _mirror['active']:
+            lines.append('Simulation unique : vous voyez le jeu de l\'hôte.')
         return 'Partie à deux', lines, choices + [(MENU_STATUS, 'État de la partie'), (MENU_BACK, 'Retour')]
     if screen == 'notify':
         current = NOTIFY_LEVELS.index(_notify['level']) + 1 if _notify['level'] in NOTIFY_LEVELS else None
@@ -3083,6 +3576,9 @@ def on_menu_choice(choice, screen='main'):
         menu_host()
     elif choice == MENU_JOIN:
         open_join_dialog(_menu_last_ip())
+    elif choice == MENU_MIRROR:
+        bridge_notify(mirror_set_wanted(not _mirror['wanted']))
+        open_menu('party')                           # le nouveau choix apparait
 
 
 # -- heberger / rejoindre depuis le jeu (0.17.0) --
@@ -3718,6 +4214,8 @@ def _install_queue_hook():
         try:
             if queue_refuses(interaction) or autonomy_refused(self, interaction):
                 refused = bridge_refused_action()
+            elif mirror_takes_order(self, interaction):
+                refused = bridge_refused_action(MIRROR_REFUSE_REASON)
         except Exception:
             # En cas d'erreur du mod, le jeu garde son comportement normal.
             log('ERREUR file d\'attente :\n' + traceback.format_exc())
@@ -3794,6 +4292,9 @@ def _close_session(send_bye=False):
         log('ERREUR envoi BYE :\n' + traceback.format_exc())
     session.endpoint.close()
     log('[{}] session fermee'.format(session.role))
+    _mirror['capturing'] = False
+    _mirror_clear_out()
+    _mirror_stop_guest('partie à deux arrêtée')
 
 
 def _local_ips():
@@ -4308,6 +4809,22 @@ def mp_menu(_connection=None):
         output('Erreur dans mp.menu (voir le journal).')
 
 
+@sims4.commands.Command('mp.mirror', command_type=sims4.commands.CommandType.Live)
+def mp_mirror(action=None, _connection=None):
+    """Secours du menu : mp.mirror on|off (hote) choisit la simulation unique ; sans argument, l'etat."""
+    output = sims4.commands.CheatOutput(_connection)
+    try:
+        if action in ('on', 'off'):
+            output(mirror_set_wanted(action == 'on'))
+        elif action is not None:
+            output('Usage : mp.mirror [on|off]')
+        for line in mirror_lines():
+            output(line)
+    except Exception:
+        log('ERREUR mp.mirror :\n' + traceback.format_exc())
+        output('Erreur dans mp.mirror (voir le journal).')
+
+
 @sims4.commands.Command('mp.solo', command_type=sims4.commands.CommandType.Live)
 def mp_solo(_connection=None):
     """Jouer seul jusqu'a la fermeture du jeu : ferme la partie a deux, leve la pause et
@@ -4384,6 +4901,9 @@ try:
 except Exception:
     # Sans ce hook, la pause reste imposee mais la file n'est pas bloquee.
     log('ERREUR installation blocage de la file :\n' + traceback.format_exc())
+
+# Simulation unique (0.20.0) : chaque accroche protege elle-meme ses erreurs.
+_install_mirror_hooks()
 
 try:
     _install_travel_hook()
