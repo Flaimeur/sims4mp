@@ -192,6 +192,10 @@ def send_to_work(sim_id, career_uid, _connection=None):
 
 
 module('server_commands.career_commands', send_to_work=send_to_work)
+PAUSES = []
+module('server_commands.clock_commands',
+       request_pause=lambda pause_handle_name=None, _connection=None: PAUSES.append(('pause', pause_handle_name)),
+       unrequest_pause=lambda pause_handle_name=None, _connection=None: PAUSES.append(('reprise', pause_handle_name)))
 CHEATS = []
 module('server_commands.sim_commands', motherlode=lambda _connection=None: CHEATS.append(('motherlode', _connection)))
 
@@ -1141,7 +1145,49 @@ report('invite : sans reponse du lanceur apres 5 min, il est prevenu et n\'atten
 mod._session = guest
 shutil.rmtree(RESYNC_DIR, ignore_errors=True)
 
-# --- 15. Etat, commande de secours, fin ------------------------------------------------------------
+# --- 15. Premiers retours en jeu : pauses et voyage (0.21.9) ----------------------------------------
+mod._session = guest
+mod._mirror['active'] = True
+del PAUSES[:]
+_execute('clock.request_pause ui_dialog', CLIENT.id)
+report('invite : la pause demandee par sa fenetre part a l\'hote, son jeu fige n\'est pas mis en pause',
+       not PAUSES and events(guest.endpoint, 'cmd')[-1] == {'kind': 'cmd', 'name': 'clock.request_pause',
+                                                            'args': ['ui_dialog']})
+mod._session = host
+mod._mirror['wanted'] = True
+host.guest_sim_id = 2
+mod._handle_command(host, {'kind': 'cmd', 'name': 'clock.request_pause', 'args': ['ui_dialog']})
+report('hote : pause posee sous une poignee propre a l\'invite',
+       PAUSES == [('pause', 'sims4mp_invite_ui_dialog')] and mod._mirror['guest_pauses'] == {'sims4mp_invite_ui_dialog'})
+mod.mirror_release_guest_pauses(host)
+report('invite parti pendant la pause : l\'hote la leve tout seul',
+       PAUSES[-1] == ('reprise', 'sims4mp_invite_ui_dialog') and not mod._mirror['guest_pauses'])
+mod._handle_command(host, {'kind': 'cmd', 'name': 'clock.request_pause', 'args': ['ui_dialog']})
+mod._handle_command(host, {'kind': 'cmd', 'name': 'clock.unrequest_pause', 'args': ['ui_dialog']})
+report('fenetre fermee chez l\'invite : la pause est levee chez l\'hote',
+       PAUSES[-1] == ('reprise', 'sims4mp_invite_ui_dialog') and not mod._mirror['guest_pauses'])
+mod._mirror['wanted'] = False
+
+mod._session = guest
+followed = []
+mod.bridge_zone_name = lambda zone_id: 'Parc'
+mod.bridge_follow_travel = lambda zone_id, sim_ids: followed.append((zone_id, list(sim_ids), mod._mirror['traveling'])) or True
+del DIALOGS.calls[:]
+mod._travel['offered'] = {}
+mod._handle_travel(guest, {'kind': 'travel', 'zone_id': 120, 'lot': 'Parc', 'sim_ids': [2, 3000], 'sim_id': 1})
+report('voyage de l\'hote : l\'invite le suit sans fenetre de choix, avec les Sims du voyage',
+       followed == [(120, [2, 3000], True)] and mod._travel['following'] == 120, str(followed))
+SIM_TIMELINE.runs = 0
+SIM_TIMELINE.simulate(5)
+report('pendant le voyage : la ligne du temps de l\'invite tourne (le voyage du jeu en a besoin)',
+       SIM_TIMELINE.runs == 1)
+mod.install_menu = lambda: None
+mod.on_zone_loaded = lambda: None
+mod._safe_on_zone_loaded()
+SIM_TIMELINE.simulate(6)
+report('arrive sur le lot : ligne du temps de nouveau gelee', SIM_TIMELINE.runs == 1 and not mod._mirror['traveling'])
+
+# --- 16. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',

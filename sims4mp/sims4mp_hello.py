@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - renvoi de la partie par le lanceur (0.21.8, partie mod) : le menu de l'hote
+# Sims 4 Multiplayer - premiers retours en jeu (0.21.9) : en simulation unique, l'invite suit le
+# voyage de l'hote sans fenetre de choix, et sa ligne du temps tourne jusqu'a l'arrivee (le voyage du
+# jeu en a besoin pour partir) ; les pauses demandees par son interface (fenetre ouverte : clock
+# .request_pause / unrequest_pause ; mode construction : clock.build_buy_pause_unpause) mettent
+# l'hote en pause, sous une poignee prefixee, levee si l'invite part.
+# Renvoi de la partie par le lanceur (0.21.8, partie mod) : le menu de l'hote
 # « Renvoyer ma partie a l'invite » enregistre la partie et ecrit sims4mp_resync.json pour le
 # lanceur ; le lanceur de l'invite ecrit sims4mp_resync_done.json une fois la partie installee, et
 # le mod de l'invite demande alors de la recharger. Voir la section « renvoi de la partie ».
@@ -262,7 +267,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.8'
+MOD_VERSION = '0.21.9'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -429,7 +434,18 @@ MIRROR_COMMANDS = {
     'notebook.hide_category': ('notebook.notebook_commands', 'hide_category'),
     'sims.set_first_name': ('server_commands.sim_commands', 'set_first_name'),
     'sims.set_last_name': ('server_commands.sim_commands', 'set_last_name'),
+    # 0.21.9 : pauses demandees par l'interface de l'invite (fenetre ouverte, mode construction) : chez
+    # l'hote, sinon seul le jeu fige de l'invite se mettait en pause.
+    'clock.request_pause': ('server_commands.clock_commands', 'request_pause'),
+    'clock.pause': ('server_commands.clock_commands', 'request_pause'),
+    'clock.unrequest_pause': ('server_commands.clock_commands', 'unrequest_pause'),
+    'clock.unpause': ('server_commands.clock_commands', 'unrequest_pause'),
+    'clock.toggle_pause_unpause': ('server_commands.clock_commands', 'toggle_pause_unpause'),
+    'clock.build_buy_pause_unpause': ('server_commands.clock_commands', 'build_buy_pause_unpause'),
 }
+MIRROR_PAUSE_ON = ('clock.request_pause', 'clock.pause')
+MIRROR_PAUSE_OFF = ('clock.unrequest_pause', 'clock.unpause')
+MIRROR_PAUSE_PREFIX = 'sims4mp_invite_'   # poignee de pause de l'invite chez l'hote (jamais celle de l'hote)
 MIRROR_MENU_COMMANDS = {'interactions.choices': 10, 'interactions.phone_choices': 3}   # place de reference_id
 MIRROR_COMMAND_ALIAS = 'sims4mp.'         # la commande d'origine reste enregistree sous ce prefixe
 MIRROR_TOKENS_MAX = 32                    # arguments par commande recue au plus
@@ -1667,6 +1683,7 @@ def _handle_host_event(session, kind, value):
         session.mirror_ready = False
         session.guest_sim_id = None
         mirror_guest_autonomy(session)               # le Sim de l'invite redevient autonome (0.21.1)
+        mirror_release_guest_pauses(session)         # ses pauses ne bloquent plus l'hote (0.21.9)
         _mirror_clear_out()
     elif kind == 'message':
         msg_type = value['type']
@@ -2872,6 +2889,11 @@ def _handle_travel(session, data):
                       key='travel-missing')
         return
     lot = '« {} »'.format(name or _clean_text(data.get('lot')) or 'un autre lot')
+    if session.role == 'client' and _mirror['active']:
+        # Simulation unique (0.21.9) : une seule partie, l'invite suit l'hote sans fenetre de choix.
+        bridge_notify('{} part sur {} : vous le suivez.'.format(who, lot), sim_id=sim_id, key='travel')
+        on_travel_choice(TRAVEL_FOLLOW, zone_id, sim_ids)
+        return
     try:
         bridge_show_dialog('Voyage à deux', '{} part sur {}. Le suivre pour continuer ensemble ?'.format(who, lot),
                            ((TRAVEL_FOLLOW, 'Suivre sur le même lot'), (TRAVEL_STAY, 'Rester ici')),
@@ -2889,6 +2911,9 @@ def on_travel_choice(choice, zone_id, sim_ids):
         return
     _travel['following'] = zone_id                   # pas d'invitation en retour, sauvegarde liberee
     _save_lock_tick(_session)                        # invite : le jeu doit pouvoir sauvegarder pour voyager
+    # Simulation unique (0.21.9) : le voyage du jeu a besoin de la ligne du temps pour partir ; elle
+    # tourne jusqu'au chargement du lot d'arrivee (_mirror['traveling'], remis a False a l'arrivee).
+    _mirror['traveling'] = _mirror['active']
     try:
         ok = bridge_follow_travel(zone_id, sim_ids)
     except Exception:
@@ -2899,6 +2924,7 @@ def on_travel_choice(choice, zone_id, sim_ids):
         log('voyage : ce PC suit l\'autre joueur vers le lot {}'.format(zone_id))
     else:
         _travel['following'] = None
+        _mirror['traveling'] = False
         bridge_notify('Voyage impossible pour suivre l\'autre joueur (voir le journal).', alert=True)
 
 
@@ -3528,6 +3554,8 @@ _mirror = {
     'commands_sent': 0,      # invite
     'commands_applied': 0,   # hote
     'commands_failed': 0,
+    'guest_pauses': set(),   # hote : pauses posees par l'interface de l'invite (0.21.9)
+    'traveling': False,      # invite : voyage en cours, la ligne du temps tourne pour partir (0.21.9)
     # Nouveaux Sims (0.21.3).
     'sims_asked': 0,         # invite : profils demandes
     'sims_loaded': 0,
@@ -3755,6 +3783,12 @@ def _handle_command(session, data):
     if name == 'interactions.select':
         _apply_guest_choice(tokens)
         return
+    if name in MIRROR_PAUSE_ON + MIRROR_PAUSE_OFF + ('clock.toggle_pause_unpause',) and tokens:
+        tokens = [MIRROR_PAUSE_PREFIX + tokens[0]] + list(tokens[1:])
+        if name in MIRROR_PAUSE_ON:
+            _mirror['guest_pauses'].add(tokens[0])
+        elif name in MIRROR_PAUSE_OFF:
+            _mirror['guest_pauses'].discard(tokens[0])
     if name in MIRROR_MENU_COMMANDS:
         position = MIRROR_MENU_COMMANDS[name]
         reference = _as_int(tokens[position]) if len(tokens) > position else None
@@ -3772,6 +3806,24 @@ def _handle_command(session, data):
         _sync['pushing'] = False
     _mirror['commands_applied' if done else 'commands_failed'] += 1
     log('[host] commande de l\'invite {} : {}'.format(name, 'jouee' if done else 'non jouee'))
+
+
+def mirror_release_guest_pauses(session):
+    """Hote : invite parti, ses pauses encore posees sont levees (clock.unrequest_pause)."""
+    pauses = sorted(_mirror['guest_pauses'])
+    _mirror['guest_pauses'].clear()
+    for handle in pauses:
+        _safe('fin d\'une pause de l\'invite', bridge_unpause_handle, handle)
+        log('[host] pause de l\'invite levee ({}) : il est parti'.format(handle))
+
+
+def bridge_unpause_handle(handle):
+    """Hote : leve la pause posee sous ce nom (commande d'origine clock.unrequest_pause)."""
+    import services
+    import sims4.commands
+    client = services.client_manager().get_first_client()
+    sims4.commands.execute('{}clock.unrequest_pause {}'.format(MIRROR_COMMAND_ALIAS, handle),
+                           client.id if client is not None else None)
 
 
 def _apply_guest_choice(tokens):
@@ -4382,7 +4434,7 @@ def _hook_timeline():
 
     def make(original):
         def simulate(self, *args, **kwargs):
-            if _mirror['active']:
+            if _mirror['active'] and not _mirror['traveling']:
                 try:
                     if mirror_frozen() and bridge_is_frozen_timeline(self):
                         _mirror['frozen'] += 1
@@ -5923,6 +5975,7 @@ def _safe_on_zone_loaded():
     if _travel['following'] is not None:
         log('voyage : arrive sur le lot de l\'autre joueur ({})'.format(_travel['following']))
     _travel['following'] = None                      # voyage termine (ou nouvelle partie)
+    _mirror['traveling'] = False                     # simulation unique : ligne du temps de nouveau gelee
     install_menu()                                   # protege lui-meme ses erreurs
     try:
         on_zone_loaded()
