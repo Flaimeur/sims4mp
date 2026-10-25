@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - affichage de l'invite filtre (0.21.7) : les messages d'affichage de son propre
+# Sims 4 Multiplayer - renvoi de la partie par le lanceur (0.21.8, partie mod) : le menu de l'hote
+# « Renvoyer ma partie a l'invite » enregistre la partie et ecrit sims4mp_resync.json pour le
+# lanceur ; le lanceur de l'invite ecrit sims4mp_resync_done.json une fois la partie installee, et
+# le mod de l'invite demande alors de la recharger. Voir la section « renvoi de la partie ».
+# Affichage de l'invite filtre (0.21.7) : les messages d'affichage de son propre
 # jeu fige (ViewUpdate) perdent leurs entrees sur l'etat des objets et des Sims (MGR_OBJECT,
 # MGR_SIM_INFO), et ses messages MSG_SIM_* (besoins, humeur, file d'actions...) ne partent plus :
 # cet etat vient de l'hote ; client et interface restent. Pas de filtre en mode construction, ni
@@ -258,7 +262,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.7'
+MOD_VERSION = '0.21.8'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -1730,6 +1734,8 @@ def _handle_host_event(session, kind, value):
                 _handle_command(session, data)
             elif data.get('kind') == 'sim_request':
                 _handle_sim_request(session, data)
+            elif data.get('kind') == 'resync_save':
+                _handle_resync_save(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -1804,6 +1810,8 @@ def _handle_client_event(session, kind, value):
                 _handle_objects(session, value['data'])
             elif value['data'].get('kind') == 'sim_profile':
                 _handle_sim_profile(session, value['data'])
+            elif value['data'].get('kind') == 'resync_save':
+                _handle_resync_save(session, value['data'])
             elif value['data'].get('kind') == 'mirror':
                 _handle_mirror(session, value['data'])
             else:
@@ -1952,6 +1960,7 @@ def pump_tick():
     _release_clock_if_unused(_session)    # vitesse de l'hote retiree hors session d'invite
     _traffic_tick(now)                    # P1 : resume du trafic dans le journal
     _save_lock_tick(_session)             # invite connecte : sauvegarde verrouillee
+    _resync_tick(now)                     # invite : partie de l'hote installee par le lanceur (0.21.8)
 
 
 def _connected_conn(session):
@@ -4689,6 +4698,7 @@ MENU_ICON_INSTANCE = 0x80EB131F7361E9AA   # image DDS de sims4mp_icons.package (
 MENU_CLOSE, MENU_BACK = 6, 9
 MENU_PARTY, MENU_NOTIFY, MENU_TOOLS = 10, 11, 12
 MENU_HOST, MENU_JOIN = 20, 21
+MENU_SEND_SAVE = 23                                    # hote : renvoyer sa partie par le lanceur (0.21.8)
 MENU_STATUS, MENU_RESYNC, MENU_REPORT, MENU_SOLO = 4, 7, 8, 5
 MENU_CHOICES = (                                       # ecran principal
     (MENU_PARTY, 'Partie à deux…'),
@@ -4774,6 +4784,8 @@ def menu_screen(screen):
                 lines.append('IP de ce PC : {} , port {}.'.format(', '.join(ips) or 'inconnue',
                                                                   _session.endpoint.port))
             choices = [(MENU_RESYNC, 'Resynchroniser maintenant'), (MENU_SOLO, 'Jouer seul (se déconnecter)')]
+            if _session.role == 'host':
+                choices.insert(1, (MENU_SEND_SAVE, 'Renvoyer ma partie à l\'invité (lanceur)'))
         if _session is None or _session.role == 'host':
             lines.append('Simulation unique : votre jeu calcule la partie, l\'invité voit votre jeu.')
         elif _mirror['active']:
@@ -4836,6 +4848,8 @@ def on_menu_choice(choice, screen='main'):
         menu_host()
     elif choice == MENU_JOIN:
         open_join_dialog(_menu_last_ip())
+    elif choice == MENU_SEND_SAVE:
+        bridge_notify(request_save_resync())
 
 
 # -- heberger / rejoindre depuis le jeu (0.17.0) --
@@ -5143,6 +5157,135 @@ def bridge_lock_save(holder):
 def bridge_unlock_save(holder):
     import services
     services.get_persistence_service().unlock_save(holder)
+
+
+# -- renvoi de la partie de l'hote en cours de partie, par le lanceur (0.21.8) --
+# Le mod ne transporte pas la sauvegarde : il parle au lanceur par deux fichiers JSON a cote de
+# sims4mp_settings.json (Documents\Electronic Arts\), ecrits en entier puis renommes (os.replace).
+#   Hote : le menu « Renvoyer ma partie a l'invite » enregistre la partie (commande du jeu
+#     persistence.save_game, verifiee dans persistence_commands.pyc), puis ecrit RESYNC_REQUEST_NAME :
+#     {"version": 1, "id": <texte>, "slot": "Slot_XXXXXXXX.save", "demande": <horodatage>}
+#     (slot : persistence_service.get_save_slot_proto_buff().slot_id). L'invite est prevenu
+#     (EVENT resync_save, etape saving).
+#   Lanceur de l'hote : copie de nouveau ce slot dans la room ; lanceur de l'invite : la telecharge,
+#     l'installe dans le slot reserve, puis ecrit RESYNC_DONE_NAME :
+#     {"version": 1, "id": <meme texte>, "etat": "installee" | "erreur", "detail": <texte>}.
+#   Invite : le mod lit ce fichier toutes les RESYNC_POLL s ; partie installee : il demande de
+#     recharger la partie Sims4MP et previent l'hote (etape installed).
+
+RESYNC_REQUEST_NAME = 'sims4mp_resync.json'
+RESYNC_DONE_NAME = 'sims4mp_resync_done.json'
+RESYNC_POLL = 2.0                          # secondes reelles entre deux lectures du fichier du lanceur
+RESYNC_ID_MAX = 40
+_resync = {'expected': None, 'checked_at': 0.0, 'sent': 0, 'installed': 0}
+
+
+def bridge_current_slot_name():
+    """Fichier de la partie en cours : Slot_XXXXXXXX.save (slot_id du SaveSlotData du jeu)."""
+    import services
+    return 'Slot_{:08x}.save'.format(services.get_persistence_service().get_save_slot_proto_buff().slot_id)
+
+
+def bridge_save_game():
+    """Hote : enregistre la partie dans son slot, comme la commande du jeu persistence.save_game."""
+    import services
+    import sims4.commands
+    client = services.client_manager().get_first_client()
+    sims4.commands.execute('persistence.save_game False False', client.id if client is not None else None)
+
+
+def _resync_folder():
+    path = settings_path()
+    return os.path.dirname(path) if path else None
+
+
+def _write_json_atomic(path, data):
+    temp = path + '.tmp'
+    with open(temp, 'w', encoding='utf-8') as fh:
+        json.dump(data, fh, ensure_ascii=False)
+    os.replace(temp, path)
+
+
+def request_save_resync():
+    """Hote (menu) : enregistre la partie et demande au lanceur de la renvoyer. Renvoie le texte a afficher."""
+    session = _session
+    folder = _resync_folder()
+    if session is None or session.role != 'host' or not _connected(session):
+        return 'Renvoi impossible : aucun invité connecté.'
+    if folder is None:
+        return 'Renvoi impossible : dossier du lanceur introuvable.'
+    request_id = '{:x}'.format(int(time.time() * 1000))
+    try:
+        bridge_save_game()
+        slot = bridge_current_slot_name()
+        _write_json_atomic(os.path.join(folder, RESYNC_REQUEST_NAME), {
+            'version': 1, 'id': request_id, 'slot': slot,
+            'demande': time.strftime('%Y-%m-%dT%H:%M:%S')})
+    except Exception:
+        log('ERREUR renvoi de la partie :\n' + traceback.format_exc())
+        return 'Renvoi impossible : la partie n\'a pas pu être enregistrée (voir le journal).'
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {
+        'kind': 'resync_save', 'step': 'saving', 'id': request_id}))
+    _flush_now(session)
+    _resync['sent'] += 1
+    log('[host] partie enregistree ({}), renvoi demande au lanceur ({})'.format(slot, request_id))
+    return ('Partie enregistrée ({}) : le lanceur va l\'envoyer à l\'invité. Gardez le lanceur ouvert, '
+            'room comprise.'.format(slot))
+
+
+def _handle_resync_save(session, data):
+    """Invite : l'hote renvoie sa partie (saving) ; hote : l'invite l'a installee (installed)."""
+    request_id = data.get('id')
+    if not isinstance(request_id, str) or not 0 < len(request_id) <= RESYNC_ID_MAX or not request_id.isalnum():
+        return
+    if session.role == 'client' and data.get('step') == 'saving':
+        _resync['expected'] = request_id
+        log('[client] l\'hote renvoie sa partie ({}) : attente du lanceur'.format(request_id))
+        bridge_notify('L\'hôte vous renvoie sa partie : gardez le lanceur ouvert, il va l\'installer.')
+    elif session.role == 'host' and data.get('step') == 'installed':
+        log('[host] l\'invite a recu la partie ({})'.format(request_id))
+        bridge_notify('L\'invité a reçu votre partie et va la recharger.')
+
+
+def read_resync_done(path):
+    """Fichier du lanceur de l'invite, valide, ou None."""
+    try:
+        if os.path.getsize(path) > SETTINGS_MAX_SIZE:
+            return None
+        with open(path, 'r', encoding='utf-8-sig') as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if (not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('id'), str)
+            or data.get('etat') not in ('installee', 'erreur')):
+        return None
+    return data
+
+
+def _resync_tick(now):
+    """Invite : la partie attendue est-elle installee par le lanceur ?"""
+    expected = _resync['expected']
+    if expected is None or now - _resync['checked_at'] < RESYNC_POLL:
+        return
+    _resync['checked_at'] = now
+    folder = _resync_folder()
+    done = read_resync_done(os.path.join(folder, RESYNC_DONE_NAME)) if folder else None
+    if done is None or done['id'] != expected:
+        return
+    _resync['expected'] = None
+    if done['etat'] == 'erreur':
+        log('[client] le lanceur n\'a pas pu installer la partie de l\'hote : {}'.format(done.get('detail')))
+        bridge_notify('Le lanceur n\'a pas pu installer la partie de l\'hôte ({}).'.format(
+            _clean_text(done.get('detail')) or 'voir le lanceur'), alert=True)
+        return
+    _resync['installed'] += 1
+    log('[client] partie de l\'hote installee par le lanceur ({})'.format(expected))
+    bridge_notify('Partie de l\'hôte installée. Retournez au menu principal et chargez la partie Sims4MP '
+                  '(slot réservé) pour repartir du même état.', alert=True)
+    session = _session
+    if _connected(session):
+        session.endpoint.send(protocol.make_message(protocol.EVENT, {
+            'kind': 'resync_save', 'step': 'installed', 'id': expected}))
 
 
 def _save_lock_tick(session):

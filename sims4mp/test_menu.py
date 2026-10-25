@@ -503,9 +503,10 @@ report('en-tete en partie : role, autre joueur connecte avec ping, heure de l\'h
        str(header))
 guest.role = 'host'
 mod.open_menu('party')
-report('« Partie à deux… » en partie (hote) : IP et port de ce PC, Resynchroniser, Jouer seul',
+report('« Partie à deux… » en partie (hote) : IP et port, Resynchroniser, Renvoyer sa partie, Jouer seul',
        'IP de ce PC : 192.168.1.50 , port 7777.' in DIALOGS[-1].text and screen_labels() == [
-           'Resynchroniser maintenant', 'Jouer seul (se déconnecter)', 'État de la partie', 'Retour'],
+           'Resynchroniser maintenant', 'Renvoyer ma partie à l\'invité (lanceur)', 'Jouer seul (se déconnecter)',
+           'État de la partie', 'Retour'],
        DIALOGS[-1].text)
 del notes[:]
 mod.menu_join('192.168.1.20')

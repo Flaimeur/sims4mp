@@ -1090,7 +1090,47 @@ mod._handle_sim_profile(guest, {'kind': 'sim_profile', 'id': 3002, 'sim': 'pas d
 report('profil invalide : ignore', mod._mirror['sims_failed'] == 0 and 3002 not in PERSISTENCE.sims)
 SIMS[:] = SIMS[:2]
 
-# --- 14. Etat, commande de secours, fin ------------------------------------------------------------
+# --- 14. Renvoi de la partie de l'hote par le lanceur (0.21.8) --------------------------------------
+import json  # noqa: E402
+
+RESYNC_DIR = tempfile.mkdtemp(prefix='sims4mp_resync_')
+mod.settings_path = lambda mods_dir=None: os.path.join(RESYNC_DIR, 'sims4mp_settings.json')
+saved = []
+mod.bridge_save_game = lambda: saved.append('enregistre')
+mod.bridge_current_slot_name = lambda: 'Slot_0000000a.save'
+mod._session = host
+mod._gate['waiting'] = False
+del notes[:]
+text = mod.request_save_resync()
+request = json.load(open(os.path.join(RESYNC_DIR, 'sims4mp_resync.json'), encoding='utf-8'))
+announce = events(host.endpoint, 'resync_save')[-1]
+report('hote : partie enregistree, demande ecrite pour le lanceur, invite prevenu',
+       saved == ['enregistre'] and request['version'] == 1 and request['slot'] == 'Slot_0000000a.save'
+       and announce == {'kind': 'resync_save', 'step': 'saving', 'id': request['id']}
+       and 'le lanceur va l\'envoyer' in text, str(request))
+mod._session = guest
+mod._mirror['active'] = True
+mod._handle_resync_save(guest, dict(announce))
+report('invite : attend la partie annoncee', mod._resync['expected'] == request['id'])
+done_path = os.path.join(RESYNC_DIR, 'sims4mp_resync_done.json')
+json.dump({'version': 1, 'id': 'autre', 'etat': 'installee'}, open(done_path, 'w', encoding='utf-8'))
+mod._resync_tick(10000.0)
+report('fichier du lanceur pour une autre demande : ignore', mod._resync['expected'] == request['id'])
+json.dump({'version': 1, 'id': request['id'], 'etat': 'installee', 'detail': ''}, open(done_path, 'w', encoding='utf-8'))
+del notes[:]
+mod._resync_tick(20000.0)
+report('invite : partie installee par le lanceur, rechargement demande, hote prevenu',
+       mod._resync['expected'] is None and any('chargez la partie Sims4MP' in n for n in notes)
+       and events(guest.endpoint, 'resync_save')[-1] == {'kind': 'resync_save', 'step': 'installed',
+                                                         'id': request['id']}, str(notes))
+mod._session = host
+del notes[:]
+mod._handle_resync_save(host, {'kind': 'resync_save', 'step': 'installed', 'id': request['id']})
+report('hote : previent que l\'invite a recu la partie', any('a reçu votre partie' in n for n in notes))
+mod._session = guest
+shutil.rmtree(RESYNC_DIR, ignore_errors=True)
+
+# --- 15. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',
