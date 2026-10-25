@@ -309,7 +309,8 @@ class RoomServer:
     """Sert une copie figee d'une sauvegarde. start() / stop() ; events pour l'interface."""
 
     def __init__(self, save_path, saves_folder, snapshot_dir, mod_version, bind_ip, port, code=None,
-                 mods_dir=None, mods_sha=False, mods_cache=None):
+                 mods_dir=None, mods_sha=False, mods_cache=None, packs=None):
+        self.packs = list(packs) if packs is not None else None    # packs de l'hote (/packs), None : inconnus
         self.mods_dir = Path(mods_dir) if mods_dir else None
         self.mods_sha = mods_sha
         self.mods_cache = mods_cache
@@ -549,7 +550,7 @@ class RoomServer:
                             room.locked = True
                     return self._deny(401, 'code de room faux')
                 modfile = MODFILE_RE.fullmatch(self.path)
-                if self.path in ('/info', '/save', '/mods') or modfile:
+                if self.path in ('/info', '/save', '/mods', '/packs') or modfile:
                     # Rien n'est lisible sans l'accord de l'hote pour cette session et cette IP.
                     status, reason = room.authorize(self.headers.get(SESSION_HEADER, ''), client, self.path)
                     if status is not None:
@@ -596,6 +597,13 @@ class RoomServer:
                     # Le signal de lancement n'est transmis qu'aux invites acceptes.
                     token = room.launch_token if agreement == 'accepte' else None
                     body = json.dumps({'lancer': token, 'accord': agreement}).encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'application/json; charset=utf-8')
+                    self.send_header('Content-Length', str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path == '/packs' and room.packs is not None:
+                    body = json.dumps({'packs': room.packs}).encode('utf-8')
                     self.send_response(200)
                     self.send_header('Content-Type', 'application/json; charset=utf-8')
                     self.send_header('Content-Length', str(len(body)))
@@ -800,6 +808,34 @@ def fetch_mods_list(ip, port, code, session, timeout=15):
         return mods_cmp.validate_mods_list(data)
     except (OSError, http.client.HTTPException) as exc:
         raise RoomError('Lecture de la liste des mods interrompue : {}'.format(exc)) from None
+    finally:
+        conn.close()
+
+
+def fetch_packs(ip, port, code, session, timeout=CONNECT_TIMEOUT):
+    """Packs installes chez l'hote (/packs) ; None si son lanceur ne les donne pas (trop ancien)."""
+    code = validate_room_code(code)
+    headers = _session_headers(session)
+    try:
+        conn, response = _request(ip, port, code, '/packs', timeout, headers)
+    except (OSError, http.client.HTTPException) as exc:
+        raise RoomError('Room injoignable ({}:{}) : {}.'.format(ip, port, exc)) from None
+    try:
+        if response.status == 404:
+            return None
+        _check_status(response)
+        body = response.read(MAX_INFO_SIZE + 1)
+        try:
+            data = json.loads(body.decode('utf-8')) if len(body) <= MAX_INFO_SIZE else None
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            data = None
+        packs = data.get('packs') if isinstance(data, dict) and set(data) == {'packs'} else None
+        if not isinstance(packs, list) or len(packs) > core.MAX_PACKS or \
+                any(not isinstance(p, str) or not core.PACK_RE.fullmatch(p) for p in packs):
+            raise RoomError('Liste des packs de l\'hôte invalide.')
+        return sorted(set(packs))
+    except (OSError, http.client.HTTPException) as exc:
+        raise RoomError('Lecture des packs de l\'hôte interrompue : {}'.format(exc)) from None
     finally:
         conn.close()
 

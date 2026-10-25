@@ -849,6 +849,90 @@ if IS_MAC:
     detect_game = detect_game_mac
 
 
+# --- Packs installes (DLC) : lecture seule du dossier du jeu --------------------
+# Chaque pack a son dossier a la racine du jeu : EPxx (extension), GPxx (jeu), SPxx (kit),
+# FPxx (gratuit). Il est installe si le dossier contient son contenu (SimulationFullBuild0).
+PACK_RE = re.compile(r'(EP|GP|SP|FP)\d{2}')
+PACK_CONTENT = ('SimulationFullBuild0.package', 'ClientFullBuild0.package')
+MAX_PACKS = 300
+# Noms officiels (anglais) des packs les plus courants ; les autres sont montres par leur code.
+PACK_NAMES = {
+    'EP01': 'Get to Work', 'EP02': 'Get Together', 'EP03': 'City Living', 'EP04': 'Cats & Dogs',
+    'EP05': 'Seasons', 'EP06': 'Get Famous', 'EP07': 'Island Living', 'EP08': 'Discover University',
+    'EP09': 'Eco Lifestyle', 'EP10': 'Snowy Escape', 'EP11': 'Cottage Living', 'EP12': 'High School Years',
+    'EP13': 'Growing Together', 'EP14': 'Horse Ranch', 'EP15': 'For Rent', 'EP16': 'Lovestruck',
+    'EP17': 'Life & Death', 'GP01': 'Outdoor Retreat', 'GP02': 'Spa Day', 'GP03': 'Dine Out',
+    'GP04': 'Vampires', 'GP05': 'Parenthood', 'GP06': 'Jungle Adventure', 'GP07': 'StrangerVille',
+    'GP08': 'Realm of Magic', 'GP09': 'Journey to Batuu', 'GP10': 'Dream Home Decorator',
+    'GP11': 'My Wedding Stories', 'GP12': 'Werewolves', 'FP01': 'Holiday Celebration',
+}
+
+
+def game_root(game):
+    """Dossiers ou chercher les packs : racine du jeu (Windows : ...\\Game\\Bin\\TS4_x64.exe -> racine),
+    ou sur Mac l'app et son dossier."""
+    if game is None or game.exe is None:
+        return []
+    exe = Path(game.exe)
+    if exe.suffix.lower() == '.app':
+        return [exe.parent, exe / 'Contents', exe / 'Contents' / 'Resources']
+    return [exe.parent.parent.parent]
+
+
+def installed_packs(game):
+    """Codes des packs installes (['EP01', 'GP04', ...], tries), ou None si le jeu est introuvable."""
+    roots = game_root(game)
+    if not roots:
+        return None
+    found = set()
+    for root in roots:
+        try:
+            entries = list(Path(root).iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if PACK_RE.fullmatch(entry.name) and entry.is_dir() and not entry.is_symlink() \
+                    and any((entry / name).is_file() for name in PACK_CONTENT):
+                found.add(entry.name)
+    return sorted(found)[:MAX_PACKS]
+
+
+def pack_label(code):
+    name = PACK_NAMES.get(code)
+    return '{} ({})'.format(code, name) if name else code
+
+
+def packs_summary(packs):
+    """« 21 packs d'extension, 12 packs de jeu, 81 kits, 1 pack gratuit »."""
+    counts = collections.Counter(code[:2] for code in packs)
+    forms = (('EP', 'pack d\'extension', 'packs d\'extension'), ('GP', 'pack de jeu', 'packs de jeu'),
+             ('SP', 'kit', 'kits'), ('FP', 'pack gratuit', 'packs gratuits'))
+    parts = ['{} {}'.format(counts[kind], one if counts[kind] == 1 else many)
+             for kind, one, many in forms if counts[kind]]
+    return ', '.join(parts) or 'aucun pack'
+
+
+def compare_packs(host, own):
+    """Lignes de comparaison des packs de l'hote et de l'invite."""
+    if host is None:
+        return ['Packs : liste de l\'hôte indisponible (lanceur de l\'hôte trop ancien).']
+    if own is None:
+        return ['Packs : jeu introuvable ici, comparaison impossible.']
+    missing = [code for code in host if code not in own]
+    extra = [code for code in own if code not in host]
+    if not missing and not extra:
+        return ['Packs : identiques à l\'hôte ({}).'.format(packs_summary(own))]
+    lines = []
+    if missing:
+        lines.append('ATTENTION : {} pack(s) de l\'hôte absent(s) chez vous : {}. La partie peut contenir des '
+                     'objets, des lieux ou des Sims de ces packs : installez-les pour jouer ensemble.'.format(
+                         len(missing), ', '.join(pack_label(c) for c in missing)))
+    if extra:
+        lines.append('ATTENTION : {} pack(s) que l\'hôte n\'a pas : {}. N\'utilisez pas leur contenu pendant la '
+                     'partie à deux.'.format(len(extra), ', '.join(pack_label(c) for c in extra)))
+    return lines
+
+
 def game_target(game):
     """Ce que launch_game ouvre pour l'installation detectee."""
     return str(game.exe) if game.kind == 'ea' else STEAM_GAME_URL
@@ -2080,12 +2164,17 @@ class LauncherApp:
         self._local_busy = True
         documents = self._documents()
         known = self.local['mods_dir'] if self.local else None
+        game = getattr(self, 'game', None)
 
         def work():
             try:
                 state = installed_state(documents, known)
             except Exception as exc:                     # jamais d'erreur visible pour une relecture
                 state = {'mods_dir': None, 'error': str(exc), 'version': None, 'icons': False}
+            try:
+                state['packs'] = installed_packs(game)
+            except Exception:
+                state['packs'] = None
             try:
                 running = bool(game_is_running())
             except Exception:
@@ -2250,7 +2339,8 @@ class LauncherApp:
         self.home_cards = {}
         specs = [('mod', 'Mod Sims4MP', 0, 0, [('Installé', 'installed'), ('Dernière publiée', 'latest'),
                                                ('Icône de la roue', 'icons')]),
-                 ('game', 'Les Sims 4', 0, 1, [('Jeu', 'kind'), ('État', 'running'), ('Dossier Mods', 'mods')]),
+                 ('game', 'Les Sims 4', 0, 1, [('Jeu', 'kind'), ('État', 'running'), ('Dossier Mods', 'mods'),
+                                               ('Packs', 'packs')]),
                  ('net', 'Réseau', 1, 0, [('IP de ce PC', 'ip'), ('Port du jeu / room', 'ports')]),
                  ('party', 'Partie à deux', 1, 1, [('Room', 'room'), ('Réglage du mod', 'settings')])]
         for key, title, row, column, rows in specs:
@@ -2323,6 +2413,13 @@ class LauncherApp:
         kind = getattr(self, 'game', None)
         self._home_value('game', 'kind', GAME_KIND_LABELS[kind.kind] if kind and kind.kind else 'introuvable',
                          'Value.TLabel' if kind and kind.kind else 'Error.TLabel')
+        packs = (local or {}).get('packs')
+        if local is None:
+            self._home_value('game', 'packs', '…')
+        elif packs is None:
+            self._home_value('game', 'packs', 'inconnus (jeu introuvable)', 'Muted.TLabel')
+        else:
+            self._home_value('game', 'packs', '{} installé(s)'.format(len(packs)))
         running = self.game_running
         self._home_value('game', 'running', '…' if running is None else ('ouvert' if running else 'fermé'),
                          'Value.TLabel' if running is None else ('Warn.TLabel' if running else 'Ok.TLabel'))
@@ -2904,6 +3001,7 @@ class LauncherApp:
             self.set_status(str(exc), 'error')
             return
         save, documents = self.saves[index], self._documents()
+        game = getattr(self, 'game', None)                 # ses packs sont donnes aux invites (/packs)
 
         def task():
             mod = find_mods_dir(documents) / MOD_FILE
@@ -2913,7 +3011,8 @@ class LauncherApp:
             # Liste des mods avec SHA-256 (cache a cote du lanceur) : l'invite peut comparer et copier.
             server = room.RoomServer(save, room.saves_dir(documents), base_dir() / 'sims4mp_room',
                                      version, bind_ip, port, mods_dir=find_mods_dir(documents), mods_sha=True,
-                                     mods_cache=base_dir() / 'sims4mp_mods_cache.json')
+                                     mods_cache=base_dir() / 'sims4mp_mods_cache.json',
+                                     packs=installed_packs(game))
             info = server.prepare()
             try:
                 server.start()
@@ -3245,6 +3344,15 @@ class LauncherApp:
             lambda: room.apply_mods_sync(ip, port, code, session, plan, base_dir() / BACKUP_DIR_NAME, base_dir(),
                                          progress=self._set_progress)))
 
+    def _pack_lines(self, p):
+        """Comparaison des packs (DLC) de l'hote et d'ici ; ne bloque jamais la suite."""
+        import sims4mp_room as room
+        try:
+            host = room.fetch_packs(p['ip'], p['port'], p['code'], p['session'])
+        except LauncherError as exc:
+            return ['Packs : comparaison impossible ({}).'.format(str(exc).splitlines()[0])]
+        return compare_packs(host, installed_packs(getattr(self, 'game', None)))
+
     def _run_check(self):
         import sims4mp_room as room
         p, documents = self.presence, self._documents()
@@ -3252,6 +3360,7 @@ class LauncherApp:
         def task():
             info = room.fetch_room_info(p['ip'], p['port'], p['code'], p['session'])
             lines, plan = room.plan_join(info, documents)
+            lines += self._pack_lines(p)
             return lines + ['Vérification seulement : rien n\'a été écrit.'], 'Vérification OK : rien n\'a été écrit'
         self._start_task('Vérification de la room...', lambda: self._run_worker(task))
 
@@ -3262,6 +3371,7 @@ class LauncherApp:
         def task():
             info = room.fetch_room_info(p['ip'], p['port'], p['code'], p['session'])
             lines, plan = room.plan_join(info, documents)
+            lines += self._pack_lines(p)
             self._join_info = (p['ip'], p['port'], p['code'], p['session'], info, lines)
             return lines, 'Room trouvée : confirmation demandée'
         self._join_info = None
