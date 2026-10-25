@@ -675,6 +675,12 @@ report('fenetre du Sim de l\'invite : envoyee a l\'invite, pas ouverte chez l\'h
        not SENT and mod._mirror['out'][-1] == (40, b'7:2') and 7 in mod._mirror['dialogs'])
 omega.send(0x1, 40, b'8:1')
 report('fenetre d\'un autre Sim : reste chez l\'hote', SENT == [(0x1, 40, b'8:1')] and 8 not in mod._mirror['dialogs'])
+del SENT[:]
+omega.send(0x1, 41, b'9:2')
+omega.send(0x1, 41, b'10:1')
+report('notification du Sim de l\'invite : chez lui seulement ; autre notification : chez l\'hote (0.21.4)',
+       SENT == [(0x1, 41, b'10:1')] and mod._mirror['out'][-1] == (41, b'9:2') and 9 in mod._mirror['dialogs']
+       and 10 not in mod._mirror['dialogs'] and mod._mirror['notifications_sent'] == 1, str(SENT))
 mod._handle_dialog(host, {'kind': 'dialog', 'how': 'respond', 'id': 7, 'values': [3]})
 mod._handle_dialog(host, {'kind': 'dialog', 'how': 'pick', 'id': 7, 'values': [[11, 12], True, False, None]})
 mod._handle_dialog(host, {'kind': 'dialog', 'how': 'text', 'id': 7, 'values': ['nom', 'Bob']})

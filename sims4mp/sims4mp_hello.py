@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - nouveaux Sims (0.21.3) : un Sim cree chez l'hote apres la sauvegarde (bebe,
+# Sims 4 Multiplayer - notifications du Sim de l'invite (0.21.4) : le jeu les envoie dans le meme
+# message que les fenetres (UiDialogMessage, MSG_UI_NOTIFICATION_SHOW) ; celles dont le Sim
+# (owner_id) est celui de l'invite s'affichent chez lui seulement, et leurs boutons repondent a
+# l'hote comme ceux des fenetres (0.20.1). Les notifications Sims4MP de l'hote restent chez lui.
+# Nouveaux Sims (0.21.3) : un Sim cree chez l'hote apres la sauvegarde (bebe,
 # PNJ genere) est inconnu chez l'invite ; sa presence declenche une demande de profil, l'hote envoie
 # le profil sauvegarde du Sim et de son foyer, l'invite le charge comme le jeu (persistence_service
 # puis Household.refresh_sim_data ou HouseholdManager.load_household) et le fait apparaitre sans
@@ -240,7 +244,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.3'
+MOD_VERSION = '0.21.4'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -3375,6 +3379,8 @@ _mirror = {
     'out': [],               # hote : (msg_id, octets) a envoyer au prochain passage de la pompe
     'host_only': None,       # ids MSG_* jamais recopies (lus dans Consts_pb2 a la demande)
     'dialog_show_id': None,  # MSG_UI_DIALOG_SHOW (lu en meme temps)
+    'notification_id': None, # MSG_UI_NOTIFICATION_SHOW (0.21.4)
+    'notifications_sent': 0, # hote : notifications du Sim de l'invite affichees chez lui
     'dialogs': [],           # hote : fenetres envoyees a l'invite (identifiants), 0.20.1
     'dialogs_sent': 0,
     'dialog_applied': 0,
@@ -3468,6 +3474,8 @@ def _mirror_host_only():
                                           if name == 'MSG_UI_DIALOG_SHOW'), None)
         _mirror['pie_ids'] = frozenset(msg_id for msg_id, name in _message_names().items()
                                        if name in ('MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE'))
+        _mirror['notification_id'] = next((msg_id for msg_id, name in _message_names().items()
+                                           if name == 'MSG_UI_NOTIFICATION_SHOW'), None)
         log('simulation unique : {} type(s) de message gardes sur l\'ecran de l\'hote'.format(len(ids)))
     return ids
 
@@ -3688,9 +3696,10 @@ def _handle_pie_select(session, data):
 
 # -- fenetres du jeu (0.20.1) : celles du Sim de l'invite s'ouvrent chez lui --
 
-def _mirror_dialog_for_guest(data):
-    """Hote : vrai si la fenetre (UiDialogMessage) concerne le Sim que controle l'invite (owner_id),
-    et pas aussi celui de l'hote. Son identifiant est garde pour accepter la reponse de l'invite."""
+def _mirror_dialog_for_guest(data, notification=False):
+    """Hote : vrai si la fenetre ou la notification (UiDialogMessage, MSG_UI_DIALOG_SHOW ou
+    MSG_UI_NOTIFICATION_SHOW, 0.21.4) concerne le Sim que controle l'invite (owner_id), et pas aussi
+    celui de l'hote. Son identifiant est garde pour accepter la reponse de l'invite (boutons)."""
     session = _session
     guest_sim = session.guest_sim_id if session is not None else None
     if guest_sim is None:
@@ -3701,8 +3710,11 @@ def _mirror_dialog_for_guest(data):
     routed = _mirror['dialogs']
     routed.append(dialog_id)
     del routed[:-MIRROR_DIALOGS_MAX]
-    _mirror['dialogs_sent'] += 1
-    log('[host] fenetre {} du Sim de l\'invite : ouverte chez lui'.format(dialog_id))
+    if notification:
+        _mirror['notifications_sent'] += 1           # frequentes : pas de ligne de journal
+    else:
+        _mirror['dialogs_sent'] += 1
+        log('[host] fenetre {} du Sim de l\'invite : ouverte chez lui'.format(dialog_id))
     return True
 
 
@@ -3774,7 +3786,8 @@ def mirror_capture(msg_id, data):
     if not isinstance(data, (bytes, bytearray)):
         return None
     host_only = _mirror_host_only()                  # lit aussi l'identifiant MSG_UI_DIALOG_SHOW
-    if msg_id == _mirror['dialog_show_id'] and _mirror_dialog_for_guest(data):
+    if msg_id in (_mirror['dialog_show_id'], _mirror['notification_id']) and _mirror_dialog_for_guest(
+            data, msg_id == _mirror['notification_id']):
         _mirror['out'].append((msg_id, bytes(data)))
         return 'guest'
     if msg_id in _mirror['pie_ids'] and _mirror['pie_pending'] and _mirror_pie_for_guest(data):
@@ -4074,8 +4087,8 @@ def mirror_lines():
             '  menus calculés pour l\'invité : {} envoyés , {} choix périmé(s)'.format(
                 _mirror['menus_sent'], _mirror['menus_stale']),
             '  profils de nouveaux Sims envoyés à l\'invité : {}'.format(_mirror['sims_sent']),
-            '  fenêtres ouvertes chez l\'invité : {} , réponses appliquées : {}'.format(
-                _mirror['dialogs_sent'], _mirror['dialog_applied']),
+            '  fenêtres ouvertes chez l\'invité : {} , notifications : {} , réponses appliquées : {}'.format(
+                _mirror['dialogs_sent'], _mirror['notifications_sent'], _mirror['dialog_applied']),
             '  annulations de l\'invité : {} , erreurs : {}'.format(_mirror['cancels_applied'], _mirror['errors'])]
 
 
