@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - notifications du Sim de l'invite (0.21.4) : le jeu les envoie dans le meme
+# Sims 4 Multiplayer - commandes de l'interface (0.21.5) : les boutons de l'interface envoient des
+# commandes au jeu ; celles de MIRROR_COMMANDS (menus, choix, croix d'un mixer, glisser-deposer,
+# carrieres, factures) sont reenregistrees : chez l'invite la ligne part a l'hote, qui l'execute
+# avec le Sim de l'invite comme Sim actif. Corrige aussi les menus de la 0.21.2 : remplacer la
+# fonction du module n'interceptait pas une commande (sims4.commands garde l'original).
+# Notifications du Sim de l'invite (0.21.4) : le jeu les envoie dans le meme
 # message que les fenetres (UiDialogMessage, MSG_UI_NOTIFICATION_SHOW) ; celles dont le Sim
 # (owner_id) est celui de l'invite s'affichent chez lui seulement, et leurs boutons repondent a
 # l'hote comme ceux des fenetres (0.20.1). Les notifications Sims4MP de l'hote restent chez lui.
@@ -244,7 +249,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.4'
+MOD_VERSION = '0.21.5'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -340,6 +345,32 @@ MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique
 MIRROR_OBJECTS_MAX = 200                  # objets crees / retires au plus par message « objects » (0.20.2)
 MIRROR_DIALOGS_MAX = 100                  # hote : fenetres envoyees a l'invite gardees (reponses acceptees)
 MIRROR_PROFILE_MAX = 512 * 1024           # profil de Sim ou de foyer recu au plus (octets, 0.21.3)
+# Commandes de l'interface jouees chez l'hote pour le Sim de l'invite (0.21.5) : nom -> (module, fonction).
+MIRROR_COMMANDS = {
+    'interactions.choices': ('server_commands.interaction_commands', 'generate_choices'),
+    'interactions.phone_choices': ('server_commands.interaction_commands', 'generate_phone_choices'),
+    'interactions.select': ('server_commands.interaction_commands', 'select_choice'),
+    'interactions.cancel': ('server_commands.interaction_commands', 'cancel_mixer_interaction'),
+    'live_drag.start': ('server_commands.live_drag_commands', 'live_drag_start'),
+    'live_drag.end': ('server_commands.live_drag_commands', 'live_drag_end'),
+    'live_drag.canceled': ('server_commands.live_drag_commands', 'live_drag_canceled'),
+    'live_drag.sell': ('server_commands.live_drag_commands', 'live_drag_sell'),
+    'careers.select': ('server_commands.career_commands', 'select_career'),
+    'careers.send_to_work': ('server_commands.career_commands', 'send_to_work'),
+    'careers.leave_work': ('server_commands.career_commands', 'leave_work'),
+    'careers.stay_late': ('server_commands.career_commands', 'stay_late'),
+    'careers.find_career': ('server_commands.career_commands', 'find_career'),
+    'careers.cancel_current_gig': ('server_commands.career_commands', 'cancel_current_gig'),
+    'careers.cancel_gig': ('server_commands.career_commands', 'cancel_gig'),
+    'careers.cancel_all_gigs': ('server_commands.career_commands', 'cancel_all_gigs'),
+    'bills.show_bills_dialog': ('sims.bills_commands', 'show_bills_dialog'),
+    'bills.sell_excess_utility': ('sims.bills_commands', 'sell_excess_utility'),
+    'bills.set_utility_end_bill_action': ('sims.bills_commands', 'set_utility_end_bill_action'),
+}
+MIRROR_MENU_COMMANDS = {'interactions.choices': 10, 'interactions.phone_choices': 3}   # place de reference_id
+MIRROR_COMMAND_ALIAS = 'sims4mp.'         # la commande d'origine reste enregistree sous ce prefixe
+MIRROR_TOKENS_MAX = 32                    # arguments par commande recue au plus
+MIRROR_TOKEN_LEN = 256
 MIRROR_BB_OPS = ('create', 'destroy', 'place', 'parent', 'unparent', 'design')   # gestes de l'invite (0.20.3)
 MIRROR_PICKS_MAX = 64                     # elements choisis au plus dans une reponse de liste
 
@@ -1220,32 +1251,31 @@ def bridge_pie_ids(data):
     return message.sim, message.client_reference_id
 
 
-def bridge_menu_for_guest(kind, args, sim_id):
-    """Hote : calcule le menu circulaire (ou du telephone) demande par l'invite pour son Sim, avec la
-    commande du jeu (interaction_commands.generate_choices / generate_phone_choices). Ces commandes
-    prennent le Sim acteur par interaction_commands._active_sim(client) : il pointe le temps de l'appel
-    sur le Sim de l'invite. Le menu range par le jeu (client.set_choices) est repris pour l'invite et
-    celui de l'hote remis en place. Renvoie le menu (ChoiceMenu) ou None."""
+def bridge_run_for_guest(name, tokens, sim_id, keep_menu=False):
+    """Hote : execute la commande du jeu de l'invite (ligne d'origine, sims4.commands.execute sur
+    l'alias sims4mp.<nom>) avec le Sim de l'invite comme Sim actif le temps de l'appel. Les commandes
+    du jeu prennent le Sim par client.active_sim / active_sim_info, lus dans Client._active_sim_info :
+    ce champ est change directement, sans les rappels de changement de Sim (autonomie, affichage).
+    keep_menu : un menu range par la commande (client.set_choices) est repris pour l'invite et celui
+    de l'hote remis en place ; renvoie alors ce menu. Sinon renvoie True. None : rien n'a ete fait."""
     import services
-    from objects import ALL_HIDDEN_REASONS
-    from server_commands import interaction_commands
+    import sims4.commands
     sim_info = services.sim_info_manager().get(sim_id)
-    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
     client = services.client_manager().get_first_client()
-    if sim is None or client is None:
+    if sim_info is None or client is None:
         return None
-    host_menu = client.choice_menu
-    active_sim = interaction_commands._active_sim
-    interaction_commands._active_sim = lambda _client: sim
+    host_info, host_menu = client._active_sim_info, client.choice_menu
+    client._active_sim_info = sim_info
     try:
-        command = (interaction_commands.generate_choices if kind == 'pie'
-                   else interaction_commands.generate_phone_choices)
-        command(_connection=client.id, **args)
+        sims4.commands.execute(' '.join([MIRROR_COMMAND_ALIAS + name] + list(tokens)), client.id)
         guest_menu = client.choice_menu
     finally:
-        interaction_commands._active_sim = active_sim
-        client.set_choices(host_menu)
-    return guest_menu if guest_menu is not host_menu else None
+        client._active_sim_info = host_info
+        if keep_menu:
+            client.set_choices(host_menu)
+    if keep_menu:
+        return guest_menu if guest_menu is not host_menu else None
+    return True
 
 
 def bridge_sim_profile(sim_id):
@@ -1616,10 +1646,8 @@ def _handle_host_event(session, kind, value):
                 _handle_dialog(session, data)
             elif data.get('kind') == 'bb':
                 _handle_build_buy(session, data)
-            elif data.get('kind') == 'pie':
-                _handle_pie(session, data)
-            elif data.get('kind') == 'pie_select':
-                _handle_pie_select(session, data)
+            elif data.get('kind') == 'cmd':
+                _handle_command(session, data)
             elif data.get('kind') == 'sim_request':
                 _handle_sim_request(session, data)
             else:
@@ -3394,6 +3422,11 @@ _mirror = {
     'menus_sent': 0,
     'menus_chosen': 0,
     'menus_stale': 0,
+    # Commandes de l'interface (0.21.5).
+    'commands': [],          # commandes reenregistrees sous l'alias sims4mp.<nom>
+    'commands_sent': 0,      # invite
+    'commands_applied': 0,   # hote
+    'commands_failed': 0,
     # Nouveaux Sims (0.21.3).
     'sims_asked': 0,         # invite : profils demandes
     'sims_loaded': 0,
@@ -3563,88 +3596,99 @@ def _handle_sim_profile(session, data):
         log('[client] profil du Sim {} refuse par le jeu'.format(sim_id))
 
 
-# -- menus circulaires (0.21.2) : calcules chez l'hote pour le Sim de l'invite --
-# Le clic de l'invite (commande interactions.choices / interactions.phone_choices) part a l'hote,
-# qui calcule le menu avec la vraie partie (bridge_menu_for_guest) ; le message du menu
-# (PieMenuCreate : Sim, reference du clic) est envoye a l'invite seulement. Son choix
-# (interactions.select : numero, revision du menu) revient a l'hote, qui l'applique comme
-# Client.select_interaction : meme revision, puis menu.select(numero).
+# -- commandes de l'interface (0.21.5) : jouees chez l'hote pour le Sim de l'invite --
+# Les boutons de l'interface envoient des commandes au jeu (sims4.commands) : menu circulaire,
+# menu du telephone, choix dans un menu, croix d'un mixer, glisser-deposer en mode vie, carrieres,
+# factures (MIRROR_COMMANDS). Verifie dans core.zip (sims4/commands.pyc) : Command enregistre une
+# fonction qui garde l'original (remplacer la fonction du module ne suffit pas) ;
+# sims4.commands.register(nom, restrictions, fonction, description, usage, type) recoit les arguments
+# bruts (texte) ; unregister(nom) ; execute(ligne, connexion). Chez les deux joueurs, la commande
+# d'origine est reenregistree sous sims4mp.<nom> et le vrai nom pointe sur une fonction du mod :
+# chez l'invite elle envoie la ligne a l'hote (EVENT cmd), sinon elle execute l'alias.
+# L'hote execute l'alias avec le Sim de l'invite comme Sim actif (bridge_run_for_guest). Menus :
+# le message du menu (PieMenuCreate : Sim, reference du clic) est envoye a l'invite seulement ;
+# son choix (interactions.select : numero, revision) est applique comme Client.select_interaction.
 
-PIE_ARGS = {                              # arguments des commandes du jeu : type attendu
-    'pie': (('target_id', int), ('pick_type', int), ('x', float), ('y', float), ('z', float),
-            ('lot_id', int), ('level', int), ('control', bool), ('alt', bool), ('shift', bool),
-            ('reference_id', int), ('referred_object_id', int), ('preferred_object_id', int),
-            ('is_routable', bool)),
-    'phone': (('control', bool), ('alt', bool), ('shift', bool), ('reference_id', int),
-              ('selected_affordance_id', int)),
-}
 PIE_PENDING_MAX = 20                      # menus attendus gardes au plus
 
 
-def _pie_values(kind, arguments):
-    """Invite : arguments de la commande du jeu en valeurs simples (None si absent)."""
-    values = {}
-    for name, kind_of in PIE_ARGS[kind]:
-        value = arguments.get(name)
-        if value is None:
-            values[name] = None
-        elif kind_of is bool:
-            values[name] = bool(value)
-        elif kind_of is float:
-            values[name] = float(value)
-        else:
-            values[name] = _as_int(value)
-    return values
-
-
-def _clean_pie_args(kind, values):
-    """Hote : arguments recus verifies, ou None."""
-    if kind not in PIE_ARGS or not isinstance(values, dict):
-        return None
-    clean = {}
-    for name, kind_of in PIE_ARGS[kind]:
-        value = values.get(name)
-        if value is None:
-            continue
-        if kind_of is bool:
-            if not isinstance(value, bool):
-                return None
-        elif kind_of is float:
-            value = _clean_float(value, POSITION_MAX_COORD)
-            if value is None:
-                return None
-        else:
-            value = _clean_int(value, -2 ** 63, 2 ** 64)
-            if value is None:
-                return None
-        clean[name] = value
-    return clean
-
-
-def mirror_forward_menu(kind, arguments):
-    """Invite : le clic qui ouvrirait un menu part a l'hote. Renvoie True si envoye."""
+def mirror_forward_command(name, tokens):
+    """Invite : envoie a l'hote la commande de l'interface (arguments bruts). True si envoyee."""
     session = _session
     if not mirror_frozen() or not _connected(session):
         return False
     session.endpoint.send(protocol.make_message(protocol.EVENT, {
-        'kind': 'pie', 'how': kind, 'args': _pie_values(kind, arguments)}))
+        'kind': 'cmd', 'name': name, 'args': [str(token) for token in tokens]}))
     _flush_now(session)
-    _mirror['menus_asked'] += 1
+    _mirror['commands_sent'] += 1
+    if name in MIRROR_MENU_COMMANDS:
+        _mirror['menus_asked'] += 1
+    elif name == 'interactions.select':
+        _mirror['menus_chosen'] += 1
+    else:
+        log('[client] commande envoyee a l\'hote : {} {}'.format(name, ' '.join(str(t) for t in tokens)))
     return True
 
 
-def mirror_forward_choice(choice_id, revision):
-    """Invite : choix dans un menu calcule par l'hote, envoye a l'hote. Renvoie True si envoye."""
-    session = _session
-    choice_id, revision = _as_int(choice_id), _as_int(revision)
-    if not mirror_frozen() or not _connected(session) or choice_id is None:
-        return False
-    session.endpoint.send(protocol.make_message(protocol.EVENT, {
-        'kind': 'pie_select', 'choice': choice_id, 'revision': revision}))
-    _flush_now(session)
-    _mirror['menus_chosen'] += 1
-    log('[client] choix {} envoye a l\'hote (menu {})'.format(choice_id, revision))
-    return True
+def _clean_tokens(tokens):
+    """Hote : arguments bruts recus, verifies (texte simple), ou None."""
+    if not isinstance(tokens, list) or len(tokens) > MIRROR_TOKENS_MAX:
+        return None
+    for token in tokens:
+        if (not isinstance(token, str) or not 0 < len(token) <= MIRROR_TOKEN_LEN or not token.isprintable()
+                or any(ch in token for ch in ' ;\t')):
+            return None
+    return tokens
+
+
+def _handle_command(session, data):
+    """Hote : joue la commande de l'interface de l'invite pour le Sim qu'il controle."""
+    name, tokens = data.get('name'), _clean_tokens(data.get('args'))
+    sim_id = session.guest_sim_id
+    if name not in MIRROR_COMMANDS or tokens is None or not mirror_on(session):
+        log('[host] commande de l\'invite invalide ignoree ({!r})'.format(name))
+        return
+    if sim_id is None:
+        log('[host] commande de l\'invite avant de connaitre son Sim : ignoree ({})'.format(name))
+        return
+    if name == 'interactions.select':
+        _apply_guest_choice(tokens)
+        return
+    if name in MIRROR_MENU_COMMANDS:
+        position = MIRROR_MENU_COMMANDS[name]
+        reference = _as_int(tokens[position]) if len(tokens) > position else None
+        pending = _mirror['pie_pending']
+        pending.append((sim_id, reference or 0))
+        del pending[:-PIE_PENDING_MAX]
+        menu = _safe('menu de l\'invite', bridge_run_for_guest, name, tokens, sim_id, True)
+        if menu is not None:
+            _mirror['guest_menu'] = menu
+        return
+    _sync['pushing'] = True
+    try:
+        done = _safe('commande de l\'invite ({})'.format(name), bridge_run_for_guest, name, tokens, sim_id)
+    finally:
+        _sync['pushing'] = False
+    _mirror['commands_applied' if done else 'commands_failed'] += 1
+    log('[host] commande de l\'invite {} : {}'.format(name, 'jouee' if done else 'non jouee'))
+
+
+def _apply_guest_choice(tokens):
+    """Hote : choix de l'invite dans le menu calcule pour lui, comme Client.select_interaction :
+    meme revision, puis menu.select(numero). Menu perime : ignore (sans reinitialiser le Sim)."""
+    choice_id = _as_int(tokens[0]) if tokens else None
+    revision = _as_int(tokens[1]) if len(tokens) > 1 else None
+    menu = _mirror['guest_menu']
+    if choice_id is None:
+        log('[host] choix de menu de l\'invite invalide ignore')
+        return
+    if menu is None or getattr(menu, 'revision', None) != revision:
+        _mirror['menus_stale'] += 1
+        log('[host] choix de l\'invite pour un menu perime (revision {}) : ignore'.format(revision))
+        return
+    _mirror['guest_menu'] = None
+    result = _safe('choix de l\'invite dans un menu', menu.select, choice_id)
+    log('[host] choix {} de l\'invite applique : {}'.format(choice_id, result))
 
 
 def _mirror_pie_for_guest(data):
@@ -3656,42 +3700,6 @@ def _mirror_pie_for_guest(data):
     pending.remove(key)
     _mirror['menus_sent'] += 1
     return True
-
-
-def _handle_pie(session, data):
-    """Hote : calcule le menu demande par l'invite pour le Sim qu'il controle."""
-    kind = data.get('how')
-    args = _clean_pie_args(kind, data.get('args'))
-    sim_id = session.guest_sim_id
-    if args is None or not mirror_on(session):
-        log('[host] demande de menu de l\'invite invalide ignoree')
-        return
-    if sim_id is None:
-        log('[host] menu demande par l\'invite avant de connaitre son Sim : ignore')
-        return
-    pending = _mirror['pie_pending']
-    pending.append((sim_id, args.get('reference_id') or 0))
-    del pending[:-PIE_PENDING_MAX]
-    menu = _safe('menu de l\'invite', bridge_menu_for_guest, kind, args, sim_id)
-    if menu is not None:
-        _mirror['guest_menu'] = menu
-
-
-def _handle_pie_select(session, data):
-    """Hote : applique le choix de l'invite dans le menu calcule pour lui (Client.select_interaction)."""
-    choice_id = _clean_int(data.get('choice'), 0, 2 ** 64)
-    revision = _clean_int(data.get('revision'), -2 ** 63, 2 ** 64)
-    menu = _mirror['guest_menu']
-    if choice_id is None or not mirror_on(session):
-        log('[host] choix de menu de l\'invite invalide ignore')
-        return
-    if menu is None or getattr(menu, 'revision', None) != revision:
-        _mirror['menus_stale'] += 1
-        log('[host] choix de l\'invite pour un menu perime (revision {}) : ignore'.format(revision))
-        return
-    _mirror['guest_menu'] = None
-    result = _safe('choix de l\'invite dans un menu', menu.select, choice_id)
-    log('[host] choix {} de l\'invite applique : {}'.format(choice_id, result))
 
 
 # -- fenetres du jeu (0.20.1) : celles du Sim de l'invite s'ouvrent chez lui --
@@ -4067,8 +4075,8 @@ def mirror_lines():
                 '  objets de l\'hôte copiés : {} (refusés : {}) , retirés : {}'.format(
                     _mirror['replicas_made'], _mirror['replicas_failed'], _mirror['replicas_removed']),
                 '  gestes de construction envoyés à l\'hôte : {}'.format(_mirror['bb_sent']),
-                '  menus demandés à l\'hôte : {} , choix envoyés : {}'.format(
-                    _mirror['menus_asked'], _mirror['menus_chosen']),
+                '  menus demandés à l\'hôte : {} , choix envoyés : {} , commandes envoyées : {}'.format(
+                    _mirror['menus_asked'], _mirror['menus_chosen'], _mirror['commands_sent']),
                 '  nouveaux Sims : {} profil(s) demandé(s), {} chargé(s), {} refusé(s)'.format(
                     _mirror['sims_asked'], _mirror['sims_loaded'], _mirror['sims_failed']),
                 '  réponses aux fenêtres de l\'hôte : {} , erreurs : {}'.format(
@@ -4086,6 +4094,8 @@ def mirror_lines():
                 _mirror['bb_applied'], _mirror['bb_failed']),
             '  menus calculés pour l\'invité : {} envoyés , {} choix périmé(s)'.format(
                 _mirror['menus_sent'], _mirror['menus_stale']),
+            '  commandes de l\'invité : {} jouée(s), {} non jouée(s)'.format(
+                _mirror['commands_applied'], _mirror['commands_failed']),
             '  profils de nouveaux Sims envoyés à l\'invité : {}'.format(_mirror['sims_sent']),
             '  fenêtres ouvertes chez l\'invité : {} , notifications : {} , réponses appliquées : {}'.format(
                 _mirror['dialogs_sent'], _mirror['notifications_sent'], _mirror['dialog_applied']),
@@ -4477,39 +4487,51 @@ def _hook_build_buy():
     _mirror_wrap(build_buy, 'c_api_buildbuy_session_end', make_session(False))
 
 
-def _hook_pie_menus():
-    """Invite : clic ouvrant un menu (interaction_commands.generate_choices / generate_phone_choices)
-    et choix dans ce menu (select_choice) partent a l'hote au lieu du jeu fige de l'invite (0.21.2)."""
-    from server_commands import interaction_commands
+def _command_router(name):
+    """Fonction enregistree sous le vrai nom d'une commande (arguments bruts, comme sims4.commands
+    les passe) : chez l'invite la ligne part a l'hote, sinon l'alias sims4mp.<nom> l'execute."""
+    import sims4.commands
 
-    def make_menu(kind):
-        def make_wrapper(original):
-            def command(*args, **kwargs):
-                if mirror_frozen():
-                    try:
-                        if mirror_forward_menu(kind, _call_args(original, args, kwargs)):
-                            return None
-                    except Exception:
-                        _mirror_error('demande de menu a l\'hote')
-                return original(*args, **kwargs)
-            return command
-        return make_wrapper
+    def route(*tokens, **kwargs):
+        if mirror_frozen():
+            try:
+                if mirror_forward_command(name, tokens):
+                    return True
+            except Exception:
+                _mirror_error('envoi de la commande {} a l\'hote'.format(name))
+        connection = kwargs.get('_session_id', kwargs.get('_connection'))
+        return sims4.commands.execute(' '.join([MIRROR_COMMAND_ALIAS + name] + [str(t) for t in tokens]),
+                                      connection)
+    route.__name__ = 'sims4mp_' + name.replace('.', '_')
+    return route
 
-    def make_select(original):
-        def select_choice(*args, **kwargs):
-            if mirror_frozen():
-                try:
-                    arguments = _call_args(original, args, kwargs)
-                    if mirror_forward_choice(arguments.get('choice_id'), arguments.get('reference_id')):
-                        return None
-                except Exception:
-                    _mirror_error('choix dans un menu de l\'hote')
-            return original(*args, **kwargs)
-        return select_choice
 
-    _mirror_wrap(interaction_commands, 'generate_choices', make_menu('pie'))
-    _mirror_wrap(interaction_commands, 'generate_phone_choices', make_menu('phone'))
-    _mirror_wrap(interaction_commands, 'select_choice', make_select)
+def _hook_commands():
+    """Reenregistre les commandes de MIRROR_COMMANDS : l'originale sous sims4mp.<nom> (avec sa lecture
+    des arguments), le vrai nom sur _command_router. Une commande dont le module manque est passee ;
+    si le vrai nom ne peut etre reenregistre, l'originale y est remise."""
+    import importlib
+    import sims4.commands
+    live = sims4.commands.CommandType.Live
+    for name, (module_name, function_name) in sorted(MIRROR_COMMANDS.items()):
+        try:
+            original = getattr(importlib.import_module(module_name), function_name)
+        except Exception:
+            log('simulation unique : commande {} absente de ce jeu ({}.{})'.format(name, module_name, function_name))
+            continue
+        try:
+            sims4.commands.Command(MIRROR_COMMAND_ALIAS + name, command_type=live)(original)
+            sims4.commands.unregister(name)
+            sims4.commands.register(name, sims4.commands.CommandRestrictionFlags.UNRESTRICTED,
+                                    _command_router(name), '', '', live)
+            _mirror['commands'].append(name)
+        except Exception:
+            log('ERREUR simulation unique : commande {} non reprise :\n{}'.format(name, traceback.format_exc()))
+            try:
+                sims4.commands.Command(name, command_type=live)(original)   # l'originale reste utilisable
+            except Exception:
+                log('ERREUR simulation unique : commande {} perdue'.format(name))
+    log('simulation unique : {} commande(s) de l\'interface reprises'.format(len(_mirror['commands'])))
 
 
 def _install_mirror_hooks():
@@ -4517,7 +4539,7 @@ def _install_mirror_hooks():
     for label, install in (('ligne du temps', _hook_timeline), ('horloge', _hook_clock_broadcast),
                            ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command),
                            ('fenetres', _hook_dialog_answers), ('objets', _hook_objects),
-                           ('construction', _hook_build_buy), ('menus', _hook_pie_menus)):
+                           ('construction', _hook_build_buy), ('commandes', _hook_commands)):
         try:
             install()
             _mirror['hooks'].append(label)

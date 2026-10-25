@@ -30,8 +30,41 @@ class _CheatOutput(object):
         _CheatOutput.lines.append(text)
 
 
-commands = module('sims4.commands', Command=lambda *a, **k: (lambda f: f),
-                  CommandType=types.SimpleNamespace(Live='Live'), CheatOutput=_CheatOutput)
+REGISTRY = {}                                        # faux registre des commandes du jeu
+
+
+def _token_value(token):
+    if token in ('True', 'False'):
+        return token == 'True'
+    try:
+        return int(token)
+    except ValueError:
+        try:
+            return float(token)
+        except ValueError:
+            return token
+
+
+def _Command(name, *aliases, command_type=None, **kwargs):
+    """Comme sims4.commands.Command : enregistre une fonction qui lit les arguments texte et garde l'originale."""
+    def named_command(func):
+        def invoke_command(*tokens, _session_id=None):
+            return func(*[_token_value(t) for t in tokens], _connection=_session_id)
+        REGISTRY[name] = invoke_command
+        return func
+    return named_command
+
+
+def _execute(line, connection):
+    tokens = line.split()
+    return REGISTRY[tokens[0]](*tokens[1:], _session_id=connection)
+
+
+commands = module('sims4.commands', Command=_Command, CommandType=types.SimpleNamespace(Live='Live'),
+                  CheatOutput=_CheatOutput, register=lambda name, restrictions, handler, *a: REGISTRY.__setitem__(
+                      name, handler),
+                  unregister=lambda name: REGISTRY.pop(name, None), execute=_execute,
+                  CommandRestrictionFlags=types.SimpleNamespace(UNRESTRICTED=0))
 module('sims4', commands=commands)
 
 
@@ -142,7 +175,16 @@ def select_choice(choice_id, reference_id=None, _connection=None):
 
 module('server_commands.interaction_commands', cancel_common=cancel_common, generate_choices=generate_choices,
        generate_phone_choices=generate_phone_choices, select_choice=select_choice,
-       _active_sim=lambda client: 'Sim actif de l\'hote')
+       _active_sim=lambda client: client._active_sim_info.get_sim_instance())   # comme le jeu : client.active_sim
+CAREER_CALLS = []
+
+
+def send_to_work(sim_id, career_uid, _connection=None):
+    client = sys.modules['services'].client_manager().get_first_client()
+    CAREER_CALLS.append((sim_id, career_uid, client._active_sim_info, _connection))
+
+
+module('server_commands.career_commands', send_to_work=send_to_work)
 
 
 class TestResult(object):
@@ -427,7 +469,8 @@ class Sim(object):
 
 SLEEP = Interaction(555)
 SIMS = [Sim(1), Sim(2, [SLEEP])]
-CLIENT = types.SimpleNamespace(id=0xABC, choice_menu='menu de l\'hote')
+HOST_INFO = types.SimpleNamespace(sim_id=1, get_sim_instance=lambda **kwargs: 'Sim actif de l\'hote')
+CLIENT = types.SimpleNamespace(id=0xABC, choice_menu='menu de l\'hote', _active_sim_info=HOST_INFO)
 CLIENT.set_choices = lambda menu: setattr(CLIENT, 'choice_menu', menu)
 module('services',
        client_manager=lambda: types.SimpleNamespace(get_first_client=lambda: CLIENT),
@@ -483,9 +526,9 @@ def events(endpoint, kind):
     return [m['data'] for m in endpoint.sent if m['type'] == protocol.EVENT and m['data'].get('kind') == kind]
 
 
-report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets, construction, menus',
+report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets, construction, commandes',
        mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets', 'construction',
-                                'menus'], str(mod._mirror['hooks']))
+                                'commandes'], str(mod._mirror['hooks']))
 
 # --- 1. Hote : choix, annonce, confirmation ---------------------------------------------------
 host = mod.NetSession('host', Endpoint())
@@ -820,35 +863,51 @@ report('geste invalide : ignore', not BB_CALLS)
 mod._mirror['wanted'] = False
 mod._session = guest
 
-# --- 12. Menus circulaires calcules chez l'hote (0.21.2) -------------------------------------------
+# --- 12. Commandes de l'interface : menus, choix, carrieres (0.21.2, 0.21.5) -----------------------
 commands_module = sys.modules['server_commands.interaction_commands']
+report('commandes reprises : l\'originale sous sims4mp.<nom>, le vrai nom sur le mod',
+       'interactions.choices' in mod._mirror['commands'] and 'careers.send_to_work' in mod._mirror['commands']
+       and 'sims4mp.interactions.choices' in REGISTRY and REGISTRY['interactions.choices'].__name__.startswith(
+           'sims4mp_'), str(mod._mirror['commands']))
 del GENERATED[:]
-start = len(events(guest.endpoint, 'pie'))
-commands_module.generate_choices(1001, 2, 1.5, 0.0, 2.5, 5, 0, False, False, True, 77, 0, 0, True, CLIENT.id)
-commands_module.generate_phone_choices(False, False, False, 78, None, CLIENT.id)
-asked = events(guest.endpoint, 'pie')[start:]
-report('invite : le clic qui ouvre un menu part a l\'hote, rien n\'est calcule chez lui',
-       not GENERATED and [a['how'] for a in asked] == ['pie', 'phone']
-       and asked[0]['args']['target_id'] == 1001 and asked[0]['args']['x'] == 1.5
-       and asked[0]['args']['shift'] is True and asked[0]['args']['reference_id'] == 77, str(asked))
+start = len(events(guest.endpoint, 'cmd'))
+_execute('interactions.choices 1001 2 1.5 0.0 2.5 5 0 False False True 77 0 0 True', CLIENT.id)
+_execute('interactions.phone_choices False False False 78', CLIENT.id)
+asked = events(guest.endpoint, 'cmd')[start:]
+report('invite : le clic qui ouvre un menu part a l\'hote (ligne d\'origine), rien n\'est calcule chez lui',
+       not GENERATED and [a['name'] for a in asked] == ['interactions.choices', 'interactions.phone_choices']
+       and asked[0]['args'][0] == '1001' and asked[0]['args'][10] == '77', str(asked))
 del LOCAL_SELECTS[:]
-commands_module.select_choice(3, 41, CLIENT.id)
-chosen = events(guest.endpoint, 'pie_select')
+_execute('interactions.select 3 41', CLIENT.id)
+chosen = events(guest.endpoint, 'cmd')[-1]
 report('invite : son choix dans le menu part a l\'hote',
-       not LOCAL_SELECTS and chosen[-1] == {'kind': 'pie_select', 'choice': 3, 'revision': 41}, str(chosen))
+       not LOCAL_SELECTS and chosen == {'kind': 'cmd', 'name': 'interactions.select', 'args': ['3', '41']}, str(chosen))
+_execute('careers.send_to_work 2 555', CLIENT.id)
+report('invite : bouton de carriere envoye a l\'hote, pas joue dans son jeu fige',
+       not CAREER_CALLS and events(guest.endpoint, 'cmd')[-1]['args'] == ['2', '555'])
 
 mod._session = host
 mod._mirror['wanted'] = True
 host.guest_sim_id = 2
 CLIENT.choice_menu = 'menu de l\'hote'
-mod._handle_pie(host, asked[0])
+mod._handle_command(host, asked[0])
 guest_menu = mod._mirror['guest_menu']
-report('hote : menu calcule pour le Sim de l\'invite avec la commande du jeu, menu de l\'hote remis',
+report('hote : menu calcule pour le Sim de l\'invite avec la commande du jeu, menu et Sim de l\'hote remis',
        GENERATED == [('pie', SIMS[1], 1001, 77, 1.5, True, CLIENT.id)] and guest_menu is not None
        and guest_menu.sim is SIMS[1] and CLIENT.choice_menu == 'menu de l\'hote'
-       and commands_module._active_sim(CLIENT) == 'Sim actif de l\'hote', str(GENERATED))
-mod._handle_pie(host, asked[1])
+       and CLIENT._active_sim_info is HOST_INFO, str(GENERATED))
+mod._handle_command(host, asked[1])
 report('menu du telephone calcule de la meme facon', GENERATED[-1][:3] == ('phone', SIMS[1], 78))
+mod._handle_command(host, {'kind': 'cmd', 'name': 'careers.send_to_work', 'args': ['2', '555']})
+report('hote : commande de carriere jouee avec le Sim de l\'invite comme Sim actif, puis le sien remis',
+       CAREER_CALLS == [(2, 555, SIMS[1].sim_info, CLIENT.id)] and CLIENT._active_sim_info is HOST_INFO
+       and mod._mirror['commands_applied'] == 1, str(CAREER_CALLS))
+_execute('careers.send_to_work 1 7', CLIENT.id)
+report('hote : ses propres boutons jouent la commande d\'origine', CAREER_CALLS[-1] == (1, 7, HOST_INFO, CLIENT.id))
+for bad in ({'name': 'cheats.motherlode', 'args': []}, {'name': 'careers.send_to_work', 'args': ['2 ; x']},
+            {'name': 'careers.send_to_work', 'args': [3]}):
+    mod._handle_command(host, dict(bad, kind='cmd'))
+report('commande hors liste ou arguments douteux : ignoree', len(CAREER_CALLS) == 2)
 mod._mirror['capturing'] = True
 del SENT[:]
 omega.send(0x1, 6, b'2:77')
@@ -858,10 +917,10 @@ report('message du menu de l\'invite : chez l\'invite seulement ; menu de l\'hot
        SENT == [(0x1, 6, b'1:5')] and mod._mirror['out'][-2:] == [(6, b'2:77'), (171, b'2:78')]
        and not mod._mirror['pie_pending'] and mod._mirror['menus_sent'] == 2, str(SENT))
 phone_menu = mod._mirror['guest_menu']
-mod._handle_pie_select(host, {'kind': 'pie_select', 'choice': 3, 'revision': 1})
+mod._handle_command(host, {'kind': 'cmd', 'name': 'interactions.select', 'args': ['3', '1']})
 report('choix pour un menu perime : ignore, sans toucher au Sim', phone_menu.selected is None
        and mod._mirror['menus_stale'] == 1)
-mod._handle_pie_select(host, {'kind': 'pie_select', 'choice': 3, 'revision': phone_menu.revision})
+mod._handle_command(host, {'kind': 'cmd', 'name': 'interactions.select', 'args': ['3', str(phone_menu.revision)]})
 report('choix de l\'invite applique dans son menu (meme revision)', phone_menu.selected == 3
        and mod._mirror['guest_menu'] is None)
 mod._mirror['capturing'] = False
