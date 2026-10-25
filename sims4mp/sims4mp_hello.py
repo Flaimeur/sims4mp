@@ -5177,7 +5177,8 @@ RESYNC_REQUEST_NAME = 'sims4mp_resync.json'
 RESYNC_DONE_NAME = 'sims4mp_resync_done.json'
 RESYNC_POLL = 2.0                          # secondes reelles entre deux lectures du fichier du lanceur
 RESYNC_ID_MAX = 40
-_resync = {'expected': None, 'checked_at': 0.0, 'sent': 0, 'installed': 0}
+RESYNC_TIMEOUT = 300.0                     # invite : sans reponse du lanceur apres 5 min, il est prevenu
+_resync = {'expected': None, 'expected_at': 0.0, 'checked_at': 0.0, 'sent': 0, 'installed': 0}
 
 
 def bridge_current_slot_name():
@@ -5215,12 +5216,13 @@ def request_save_resync():
     if folder is None:
         return 'Renvoi impossible : dossier du lanceur introuvable.'
     request_id = '{:x}'.format(int(time.time() * 1000))
+    # Heure notee avant l'enregistrement : le lanceur n'accepte qu'un slot ecrit apres la demande.
+    asked = time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(time.time() - 1))
     try:
         bridge_save_game()
         slot = bridge_current_slot_name()
         _write_json_atomic(os.path.join(folder, RESYNC_REQUEST_NAME), {
-            'version': 1, 'id': request_id, 'slot': slot,
-            'demande': time.strftime('%Y-%m-%dT%H:%M:%S')})
+            'version': 1, 'id': request_id, 'slot': slot, 'demande': asked})
     except Exception:
         log('ERREUR renvoi de la partie :\n' + traceback.format_exc())
         return 'Renvoi impossible : la partie n\'a pas pu être enregistrée (voir le journal).'
@@ -5240,6 +5242,7 @@ def _handle_resync_save(session, data):
         return
     if session.role == 'client' and data.get('step') == 'saving':
         _resync['expected'] = request_id
+        _resync['expected_at'] = time.monotonic()
         log('[client] l\'hote renvoie sa partie ({}) : attente du lanceur'.format(request_id))
         bridge_notify('L\'hôte vous renvoie sa partie : gardez le lanceur ouvert, il va l\'installer.')
     elif session.role == 'host' and data.get('step') == 'installed':
@@ -5271,6 +5274,12 @@ def _resync_tick(now):
     folder = _resync_folder()
     done = read_resync_done(os.path.join(folder, RESYNC_DONE_NAME)) if folder else None
     if done is None or done['id'] != expected:
+        if now - _resync['expected_at'] >= RESYNC_TIMEOUT:
+            # Une copie ratee chez l'hote n'est dite que dans le journal de son lanceur.
+            _resync['expected'] = None
+            log('[client] aucune reponse du lanceur pour le renvoi {} apres {:.0f} s'.format(expected, RESYNC_TIMEOUT))
+            bridge_notify('La partie de l\'hôte n\'est pas arrivée. Vérifiez que les deux lanceurs sont ouverts '
+                          '(room comprise) ; l\'hôte peut la renvoyer.', alert=True)
         return
     _resync['expected'] = None
     if done['etat'] == 'erreur':

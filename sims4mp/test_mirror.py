@@ -1112,12 +1112,16 @@ mod._session = guest
 mod._mirror['active'] = True
 mod._handle_resync_save(guest, dict(announce))
 report('invite : attend la partie annoncee', mod._resync['expected'] == request['id'])
+report('demande : heure notee avant l\'enregistrement (le lanceur exige un slot ecrit apres)',
+       len(request['demande']) == 19 and request['demande'][10] == 'T')
+mod._resync['expected_at'] = 9900.0
 done_path = os.path.join(RESYNC_DIR, 'sims4mp_resync_done.json')
 json.dump({'version': 1, 'id': 'autre', 'etat': 'installee'}, open(done_path, 'w', encoding='utf-8'))
 mod._resync_tick(10000.0)
 report('fichier du lanceur pour une autre demande : ignore', mod._resync['expected'] == request['id'])
 json.dump({'version': 1, 'id': request['id'], 'etat': 'installee', 'detail': ''}, open(done_path, 'w', encoding='utf-8'))
 del notes[:]
+mod._resync['expected_at'] = 19900.0
 mod._resync_tick(20000.0)
 report('invite : partie installee par le lanceur, rechargement demande, hote prevenu',
        mod._resync['expected'] is None and any('chargez la partie Sims4MP' in n for n in notes)
@@ -1127,6 +1131,13 @@ mod._session = host
 del notes[:]
 mod._handle_resync_save(host, {'kind': 'resync_save', 'step': 'installed', 'id': request['id']})
 report('hote : previent que l\'invite a recu la partie', any('a reçu votre partie' in n for n in notes))
+mod._session = guest
+mod._handle_resync_save(guest, {'kind': 'resync_save', 'step': 'saving', 'id': 'abc123'})
+mod._resync['expected_at'] = 30000.0
+del notes[:]
+mod._resync_tick(30000.0 + mod.RESYNC_TIMEOUT + 1)
+report('invite : sans reponse du lanceur apres 5 min, il est prevenu et n\'attend plus',
+       mod._resync['expected'] is None and any('pas arrivée' in n for n in notes), str(notes))
 mod._session = guest
 shutil.rmtree(RESYNC_DIR, ignore_errors=True)
 
