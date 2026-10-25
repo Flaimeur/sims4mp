@@ -862,7 +862,100 @@ mod._mirror['capturing'] = False
 mod._mirror['wanted'] = False
 mod._session = guest
 
-# --- 13. Etat, commande de secours, fin ------------------------------------------------------------
+# --- 13. Nouveaux Sims (0.21.3) ---------------------------------------------------------------------
+
+
+class Proto(object):
+    def __init__(self, data=b''):
+        self.data = data
+
+    def ParseFromString(self, data):
+        self.data = bytes(data)
+
+    def SerializeToString(self):
+        return self.data
+
+
+class Persistence(object):
+    def __init__(self):
+        self.sims, self.households = {}, {}
+
+    def get_sim_proto_buff(self, sim_id):
+        return self.sims.get(sim_id)
+
+    def add_sim_proto_buff(self, sim_id):
+        self.sims[sim_id] = Proto()
+        return self.sims[sim_id]
+
+    def get_household_proto_buff(self, household_id):
+        return self.households.get(household_id)
+
+    def add_household_proto_buff(self, household_id):
+        self.households[household_id] = Proto()
+        return self.households[household_id]
+
+
+PERSISTENCE = Persistence()
+HOUSEHOLDS = {}
+LOADED_HOUSEHOLDS = []
+
+
+def _load_household(household_id):
+    LOADED_HOUSEHOLDS.append((household_id, PERSISTENCE.households[household_id].data))
+    SIMS.append(Sim(3000))                            # le jeu cree les Sims du foyer charge
+
+
+services_module = sys.modules['services']
+services_module.get_persistence_service = lambda: PERSISTENCE
+services_module.household_manager = lambda: types.SimpleNamespace(get=HOUSEHOLDS.get, load_household=_load_household)
+
+# Hote : profil d'un Sim cree apres la sauvegarde.
+mod._session = host
+mod._mirror['wanted'] = True
+baby = Sim(3000)
+baby.sim_info.save_sim = lambda: Proto(b'profil-bebe')
+baby.sim_info.household = types.SimpleNamespace(id=70, save_data=lambda: PERSISTENCE.households.__setitem__(
+    70, Proto(b'foyer-70')))
+SIMS.append(baby)
+mod._handle_sim_request(host, {'kind': 'sim_request', 'id': 3000})
+profiles = events(host.endpoint, 'sim_profile')
+report('hote : profil sauvegarde du Sim et de son foyer envoye a l\'invite',
+       len(profiles) == 1 and base64.b64decode(profiles[0]['sim']) == b'profil-bebe'
+       and base64.b64decode(profiles[0]['household']) == b'foyer-70' and profiles[0]['household_id'] == 70,
+       str(profiles))
+mod._handle_sim_request(host, {'kind': 'sim_request', 'id': 9999})
+report('Sim inconnu chez l\'hote : rien n\'est envoye', len(events(host.endpoint, 'sim_profile')) == 1)
+SIMS.remove(baby)
+mod._mirror['wanted'] = False
+
+# Invite : la presence trouve ce Sim inconnu, demande son profil, le charge, le fait apparaitre.
+mod._session = guest
+spawned = []
+mod.bridge_spawn_sim = lambda sim_id, x, y, z: (
+    'inconnu' if all(s.sim_info.sim_id != sim_id for s in SIMS) else spawned.append(sim_id) or 'ok')
+mod.bridge_instanced_sim_ids = lambda: [1, 2]
+roster = {'kind': 'roster', 'zone_id': 99, 'list': [{'sim_id': 3000, 'name': 'Bebe', 'x': 1.0, 'y': 0.0, 'z': 1.0}]}
+mod._handle_roster(guest, roster)
+report('invite : Sim de l\'hote inconnu ici, son profil est demande a l\'hote',
+       events(guest.endpoint, 'sim_request')[-1] == {'kind': 'sim_request', 'id': 3000}
+       and 3000 not in guest.roster_unknown and 3000 not in mod._mirror['replicas'])
+mod._handle_sim_profile(guest, dict(profiles[0]))
+report('invite : profil range dans sa sauvegarde, foyer charge par le jeu',
+       PERSISTENCE.sims[3000].data == b'profil-bebe' and LOADED_HOUSEHOLDS == [(70, b'foyer-70')]
+       and mod._mirror['sims_loaded'] == 1 and 3000 not in guest.roster_retry)
+mod._handle_roster(guest, roster)
+report('invite : la presence le fait ensuite apparaitre, sans affichage propre (copie)',
+       spawned == [3000] and 3000 in mod._mirror['replicas'])
+known = []
+HOUSEHOLDS[71] = types.SimpleNamespace(refresh_sim_data=lambda sim_id: known.append(sim_id) or SIMS.append(Sim(sim_id)))
+mod._handle_sim_profile(guest, {'kind': 'sim_profile', 'id': 3001, 'household_id': 71,
+                                'sim': base64.b64encode(b'p').decode('ascii'), 'household': None})
+report('foyer deja connu ici : Sim rattache par le jeu (Household.refresh_sim_data)', known == [3001])
+mod._handle_sim_profile(guest, {'kind': 'sim_profile', 'id': 3002, 'sim': 'pas du base64 !'})
+report('profil invalide : ignore', mod._mirror['sims_failed'] == 0 and 3002 not in PERSISTENCE.sims)
+SIMS[:] = SIMS[:2]
+
+# --- 14. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',

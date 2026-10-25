@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - menus circulaires calcules chez l'hote (0.21.2) : le clic de l'invite qui
+# Sims 4 Multiplayer - nouveaux Sims (0.21.3) : un Sim cree chez l'hote apres la sauvegarde (bebe,
+# PNJ genere) est inconnu chez l'invite ; sa presence declenche une demande de profil, l'hote envoie
+# le profil sauvegarde du Sim et de son foyer, l'invite le charge comme le jeu (persistence_service
+# puis Household.refresh_sim_data ou HouseholdManager.load_household) et le fait apparaitre sans
+# affichage propre (comme les objets, 0.20.2) ; tout Sim apparu chez l'invite l'est ainsi.
+# Menus circulaires calcules chez l'hote (0.21.2) : le clic de l'invite qui
 # ouvre un menu (interactions.choices, interactions.phone_choices) part a l'hote, qui calcule le
 # menu pour le Sim de l'invite avec la vraie partie ; le menu s'affiche chez l'invite seulement et
 # son choix (interactions.select) est applique chez l'hote (meme revision, menu.select).
@@ -235,7 +240,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.2'
+MOD_VERSION = '0.21.3'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -330,6 +335,7 @@ MIRROR_HOST_ONLY_PREFIXES = ('MSG_CONNECTION_STATUS_', 'MSG_DEBUGVISUALIZATION_'
 MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique).'
 MIRROR_OBJECTS_MAX = 200                  # objets crees / retires au plus par message « objects » (0.20.2)
 MIRROR_DIALOGS_MAX = 100                  # hote : fenetres envoyees a l'invite gardees (reponses acceptees)
+MIRROR_PROFILE_MAX = 512 * 1024           # profil de Sim ou de foyer recu au plus (octets, 0.21.3)
 MIRROR_BB_OPS = ('create', 'destroy', 'place', 'parent', 'unparent', 'design')   # gestes de l'invite (0.20.3)
 MIRROR_PICKS_MAX = 64                     # elements choisis au plus dans une reponse de liste
 
@@ -1238,6 +1244,54 @@ def bridge_menu_for_guest(kind, args, sim_id):
     return guest_menu if guest_menu is not host_menu else None
 
 
+def bridge_sim_profile(sim_id):
+    """Hote : profil sauvegarde d'un Sim et de son foyer (octets protobuf), pour l'invite qui ne le
+    connait pas. SimInfo.save_sim met a jour le profil ; persistence_service.get_sim_proto_buff /
+    get_household_proto_buff le lisent (comme Household.refresh_sim_data). None si absent."""
+    import services
+    sim_info = services.sim_info_manager().get(sim_id)
+    if sim_info is None:
+        return None
+    persistence = services.get_persistence_service()
+    saved = sim_info.save_sim()
+    sim_proto = saved if hasattr(saved, 'SerializeToString') else persistence.get_sim_proto_buff(sim_id)
+    if sim_proto is None:
+        return None
+    household = sim_info.household
+    household_proto = None
+    if household is not None:
+        if hasattr(household, 'save_data'):
+            household.save_data()
+        household_proto = persistence.get_household_proto_buff(household.id)
+    return {'household_id': household.id if household is not None else None,
+            'sim': sim_proto.SerializeToString(),
+            'household': household_proto.SerializeToString() if household_proto is not None else None}
+
+
+def bridge_add_sim_profile(sim_id, household_id, sim_bytes, household_bytes):
+    """Invite : range le profil recu dans sa sauvegarde en memoire (persistence_service
+    .add_sim_proto_buff / add_household_proto_buff) puis laisse le jeu le charger : rattachement a un
+    foyer connu (Household.refresh_sim_data), sinon chargement du foyer (HouseholdManager
+    .load_household). Renvoie 'ok', 'deja' ou 'refus'."""
+    import services
+    if services.sim_info_manager().get(sim_id) is not None:
+        return 'deja'
+    persistence = services.get_persistence_service()
+    sim_proto = persistence.get_sim_proto_buff(sim_id) or persistence.add_sim_proto_buff(sim_id)
+    sim_proto.ParseFromString(sim_bytes)
+    household = services.household_manager().get(household_id) if household_id else None
+    if household is not None:
+        household.refresh_sim_data(sim_id)
+    elif household_bytes is not None:
+        household_proto = (persistence.get_household_proto_buff(household_id)
+                           or persistence.add_household_proto_buff(household_id))
+        household_proto.ParseFromString(household_bytes)
+        services.household_manager().load_household(household_id)
+    else:
+        return 'refus'
+    return 'ok' if services.sim_info_manager().get(sim_id) is not None else 'refus'
+
+
 def bridge_cancel_by_id(interaction_id):
     """Hote : annule comme la croix du joueur l'action interaction_id de l'un des Sims presents
     (Sim.find_interaction_by_id puis find_continuation_by_id, comme
@@ -1562,6 +1616,8 @@ def _handle_host_event(session, kind, value):
                 _handle_pie(session, data)
             elif data.get('kind') == 'pie_select':
                 _handle_pie_select(session, data)
+            elif data.get('kind') == 'sim_request':
+                _handle_sim_request(session, data)
             else:
                 # Le host est la seule source d'etat : rien d'autre n'est accepte du client.
                 log('[host] EVENT du client ignore (kind {!r})'.format(data.get('kind')))
@@ -1634,6 +1690,8 @@ def _handle_client_event(session, kind, value):
                 _handle_view(session, value['data'])
             elif value['data'].get('kind') == 'objects':
                 _handle_objects(session, value['data'])
+            elif value['data'].get('kind') == 'sim_profile':
+                _handle_sim_profile(session, value['data'])
             elif value['data'].get('kind') == 'mirror':
                 _handle_mirror(session, value['data'])
             else:
@@ -2865,12 +2923,19 @@ def _handle_roster(session, data):
                 continue
             session.roster_retry[sim_id] = now + ROSTER_RETRY
             actions += 1
+            if _mirror['active']:
+                _mirror['replicas'].add(sim_id)      # simulation unique : son affichage vient de l'hote
             result = _safe('apparition d\'un Sim', bridge_spawn_sim, sim_id, position['x'], position['y'],
                            position['z'])
+            if result != 'ok':
+                _mirror['replicas'].discard(sim_id)
             label = position['name'] or 'Sim {}'.format(sim_id)
             if result == 'ok':
                 session.roster_spawned += 1
                 log('[{}] presence : {} apparait (present chez l\'hote)'.format(session.role, label))
+            elif result == 'inconnu' and _mirror['active']:
+                mirror_request_sim(session, sim_id)  # Sim cree chez l'hote apres la sauvegarde (0.21.3)
+                log('[{}] presence : {} inconnu ici, profil demande a l\'hote'.format(session.role, label))
             elif result == 'inconnu':
                 session.roster_unknown.add(sim_id)
                 log('[{}] presence : {} n\'existe pas dans cette partie (sauvegarde differente ?)'.format(
@@ -3323,6 +3388,11 @@ _mirror = {
     'menus_sent': 0,
     'menus_chosen': 0,
     'menus_stale': 0,
+    # Nouveaux Sims (0.21.3).
+    'sims_asked': 0,         # invite : profils demandes
+    'sims_loaded': 0,
+    'sims_failed': 0,
+    'sims_sent': 0,          # hote : profils envoyes
     # Objets crees apres le chargement (0.20.2).
     'objs_new': [],          # hote : objets ajoutes depuis le dernier passage (refs faibles)
     'objs_del': [],          # hote : identifiants retires depuis le dernier passage
@@ -3425,6 +3495,64 @@ def mirror_guest_autonomy(session):
         if _safe('autonomie du Sim de l\'invite', bridge_set_limited_autonomy, target, True):
             limited.add(target)
             log('[host] Sim {} controle par l\'invite : autonomie limitee, comme un Sim selectionne'.format(target))
+
+
+# -- nouveaux Sims (0.21.3) : Sims crees chez l'hote apres la sauvegarde (bebes, PNJ generes) --
+# La presence (0.18.0) trouve chez l'invite un Sim de l'hote absent de sa partie : l'invite demande
+# son profil (EVENT sim_request), l'hote l'envoie avec celui de son foyer (EVENT sim_profile,
+# protobuf en base64), l'invite le charge comme le jeu (bridge_add_sim_profile) ; la presence le
+# fait ensuite apparaitre, sans affichage propre.
+
+def mirror_request_sim(session, sim_id):
+    """Invite : demande a l'hote le profil d'un Sim inconnu ici."""
+    if session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'sim_request', 'id': sim_id})):
+        _mirror['sims_asked'] += 1
+
+
+def _handle_sim_request(session, data):
+    """Hote : envoie a l'invite le profil d'un Sim de sa partie."""
+    sim_id = _clean_int(data.get('id'), 1, 2 ** 64)
+    if sim_id is None or not mirror_on(session):
+        return
+    profile = _safe('profil d\'un Sim pour l\'invite', bridge_sim_profile, sim_id)
+    if profile is None or len(profile['sim']) > MIRROR_PROFILE_MAX or len(profile['household'] or b'') > MIRROR_PROFILE_MAX:
+        log('[host] profil du Sim {} indisponible pour l\'invite'.format(sim_id))
+        return
+    encode = lambda raw: base64.b64encode(raw).decode('ascii') if raw is not None else None
+    session.endpoint.send(protocol.make_message(protocol.EVENT, {
+        'kind': 'sim_profile', 'id': sim_id, 'household_id': profile['household_id'],
+        'sim': encode(profile['sim']), 'household': encode(profile['household'])}))
+    _mirror['sims_sent'] += 1
+    log('[host] profil du Sim {} envoye a l\'invite'.format(sim_id))
+
+
+def _handle_sim_profile(session, data):
+    """Invite : charge le profil d'un Sim de l'hote, que la presence fera apparaitre ensuite."""
+    sim_id = _clean_int(data.get('id'), 1, 2 ** 64)
+    household_id = _clean_int(data.get('household_id'), 1, 2 ** 64) if data.get('household_id') is not None else None
+    try:
+        sim_bytes = base64.b64decode(data.get('sim', '').encode('ascii'), validate=True)
+        household_bytes = (base64.b64decode(data['household'].encode('ascii'), validate=True)
+                           if isinstance(data.get('household'), str) else None)
+    except (binascii.Error, ValueError, UnicodeEncodeError, AttributeError):
+        sim_bytes = None
+    if sim_id is None or not sim_bytes or len(sim_bytes) > MIRROR_PROFILE_MAX or not _mirror['active']:
+        log('[client] profil de Sim de l\'hote invalide ignore')
+        return
+    try:
+        result = bridge_add_sim_profile(sim_id, household_id, sim_bytes, household_bytes)
+    except Exception:
+        result = 'refus'
+        _mirror_error('chargement du profil du Sim {}'.format(sim_id))
+    if result in ('ok', 'deja'):
+        _mirror['sims_loaded'] += result == 'ok'
+        session.roster_retry.pop(sim_id, None)       # la presence le fait apparaitre au prochain passage
+        session.roster_unknown.discard(sim_id)
+        log('[client] profil du Sim {} charge ({})'.format(sim_id, result))
+    else:
+        _mirror['sims_failed'] += 1
+        session.roster_unknown.add(sim_id)           # plus redemande pendant cette partie
+        log('[client] profil du Sim {} refuse par le jeu'.format(sim_id))
 
 
 # -- menus circulaires (0.21.2) : calcules chez l'hote pour le Sim de l'invite --
@@ -3928,6 +4056,8 @@ def mirror_lines():
                 '  gestes de construction envoyés à l\'hôte : {}'.format(_mirror['bb_sent']),
                 '  menus demandés à l\'hôte : {} , choix envoyés : {}'.format(
                     _mirror['menus_asked'], _mirror['menus_chosen']),
+                '  nouveaux Sims : {} profil(s) demandé(s), {} chargé(s), {} refusé(s)'.format(
+                    _mirror['sims_asked'], _mirror['sims_loaded'], _mirror['sims_failed']),
                 '  réponses aux fenêtres de l\'hôte : {} , erreurs : {}'.format(
                     _mirror['dialog_answers'], _mirror['errors'])]
     session = _session
@@ -3943,6 +4073,7 @@ def mirror_lines():
                 _mirror['bb_applied'], _mirror['bb_failed']),
             '  menus calculés pour l\'invité : {} envoyés , {} choix périmé(s)'.format(
                 _mirror['menus_sent'], _mirror['menus_stale']),
+            '  profils de nouveaux Sims envoyés à l\'invité : {}'.format(_mirror['sims_sent']),
             '  fenêtres ouvertes chez l\'invité : {} , réponses appliquées : {}'.format(
                 _mirror['dialogs_sent'], _mirror['dialog_applied']),
             '  annulations de l\'invité : {} , erreurs : {}'.format(_mirror['cancels_applied'], _mirror['errors'])]
