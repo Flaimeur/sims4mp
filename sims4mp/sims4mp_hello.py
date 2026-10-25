@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - autres interfaces (0.21.6) : inventaire (achat, vente, favoris), triches
+# Sims 4 Multiplayer - affichage de l'invite filtre (0.21.7) : les messages d'affichage de son propre
+# jeu fige (ViewUpdate) perdent leurs entrees sur l'etat des objets et des Sims (MGR_OBJECT,
+# MGR_SIM_INFO), et ses messages MSG_SIM_* (besoins, humeur, file d'actions...) ne partent plus :
+# cet etat vient de l'hote ; client et interface restent. Pas de filtre en mode construction, ni
+# sur les messages recus de l'hote.
+# Autres interfaces (0.21.6) : inventaire (achat, vente, favoris), triches
 # (motherlode, rosebud/kaching, money, factures auto, aspirations), aspirations, clubs, calendrier,
 # universite, carnet et prenom/nom du Sim jouent chez l'hote ; ce qui ouvre seulement un affichage
 # reste chez l'invite. Les triches gardent leur type de commande du jeu (Cheat).
@@ -253,7 +258,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.6'
+MOD_VERSION = '0.21.7'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -1140,6 +1145,27 @@ def bridge_deliver_view(msg_id, data):
         return False
     omega.send(client.id, msg_id, data)
     return True
+
+
+def bridge_filter_own_view(data):
+    """Invite : retire d'un message d'affichage de son propre jeu (protocolbuffers.Distributor_pb2
+    .ViewUpdate) les entrees sur l'etat des objets et des Sims (primary_channel.id.manager_id
+    MGR_OBJECT / MGR_SIM_INFO, Consts_pb2) : cet etat vient de l'hote. Garde le reste (client,
+    interface). Renvoie (octets ou None si plus rien, nombre d'entrees retirees)."""
+    from protocolbuffers import Consts_pb2, Distributor_pb2
+    message = Distributor_pb2.ViewUpdate()
+    message.ParseFromString(bytes(data))
+    dropped = (Consts_pb2.MGR_OBJECT, Consts_pb2.MGR_SIM_INFO)
+    kept = [entry for entry in message.entries if entry.primary_channel.id.manager_id not in dropped]
+    removed = len(message.entries) - len(kept)
+    if not removed:
+        return data, 0
+    if not kept:
+        return None, removed
+    filtered = Distributor_pb2.ViewUpdate()
+    for entry in kept:
+        filtered.entries.add().CopyFrom(entry)
+    return filtered.SerializeToString(), removed
 
 
 def bridge_is_frozen_timeline(timeline):
@@ -3423,6 +3449,13 @@ def _install_traffic_hook():
                     return None                      # fenetre du Sim de l'invite : chez lui seulement
             except Exception:
                 _mirror_error('recopie d\'un message')
+        if _mirror['active'] and not _mirror['delivering']:
+            try:
+                data = mirror_filter_own(msg_id, data)
+                if data is None:
+                    return None                      # rien d'utile : l'etat vient de l'hote
+            except Exception:
+                _mirror_error('filtre de l\'affichage de l\'invite')
         return original(session_id, msg_id, data, *args, **kwargs)
 
     send._sims4mp_hook = True
@@ -3458,6 +3491,11 @@ _mirror = {
     'wanted': True,          # hote : simulation unique (seul mode depuis 0.21.0 ; mp.mirror off : diagnostic)
     'active': False,         # invite : simulation locale gelee, affichage recu de l'hote
     'capturing': False,      # hote : recopie en cours (invite connecte et pret)
+    'delivering': False,     # invite : message de l'hote en cours de remise (jamais filtre, 0.21.7)
+    'view_update_id': None,  # MSG_OBJECTS_VIEW_UPDATE (lu a la demande)
+    'own_entries_dropped': 0,  # invite : entrees de son propre affichage retirees (etat des objets/Sims)
+    'own_sim_ids': frozenset(),  # MSG_SIM_* : etat des Sims, jamais envoye par le jeu fige de l'invite
+    'own_messages_dropped': 0,
     'out': [],               # hote : (msg_id, octets) a envoyer au prochain passage de la pompe
     'host_only': None,       # ids MSG_* jamais recopies (lus dans Consts_pb2 a la demande)
     'dialog_show_id': None,  # MSG_UI_DIALOG_SHOW (lu en meme temps)
@@ -3842,6 +3880,27 @@ def _handle_dialog(session, data):
         log('[host] fenetre {} : reponse de l\'invite appliquee ({})'.format(dialog_id, how))
 
 
+def mirror_filter_own(msg_id, data):
+    """Invite (0.21.7) : un message d'affichage de son propre jeu fige ne garde que ce qui ne parle ni
+    des objets ni des Sims (bridge_filter_own_view) ; rien n'est filtre en mode construction, ou il
+    pose lui-meme ses objets. Renvoie les octets a afficher ou None."""
+    if not mirror_frozen() or _mirror['bb_session'] or not isinstance(data, (bytes, bytearray)):
+        return data
+    if _mirror['view_update_id'] is None:
+        names = _message_names()
+        _mirror['view_update_id'] = next((m for m, name in names.items() if name == 'MSG_OBJECTS_VIEW_UPDATE'), -1)
+        _mirror['own_sim_ids'] = frozenset(m for m, name in names.items() if name.startswith('MSG_SIM_'))
+    if msg_id in _mirror['own_sim_ids']:
+        _mirror['own_messages_dropped'] += 1         # besoins, humeur, file d'actions... : ceux de l'hote
+        return None
+    if msg_id != _mirror['view_update_id']:
+        return data
+    filtered, removed = bridge_filter_own_view(data)
+    if removed:
+        _mirror['own_entries_dropped'] += removed
+    return filtered
+
+
 def mirror_capture(msg_id, data):
     """Hote : garde un message envoye a son affichage pour le recopier a l'invite. Renvoie 'guest'
     pour une fenetre du Sim de l'invite, qui ne doit pas s'ouvrir chez l'hote (0.20.1)."""
@@ -4124,6 +4183,8 @@ def mirror_lines():
                     _mirror['ignored']),
                 '  gel : {} pas de simulation, {} heure(s), {} venue(s) de PNJ évités'.format(
                     _mirror['frozen'], _mirror['clock_skipped'], _mirror['spawns_skipped']),
+                '  affichage de son propre jeu : {} entrée(s) objets/Sims et {} message(s) de Sims retirés'.format(
+                    _mirror['own_entries_dropped'], _mirror['own_messages_dropped']),
                 '  clics envoyés à l\'hôte : {} (non transmissibles : {}) , annulations : {}'.format(
                     _mirror['refused'], _mirror['unsent'], _mirror['cancels_sent']),
                 '  objets de l\'hôte copiés : {} (refusés : {}) , retirés : {}'.format(
@@ -4238,11 +4299,14 @@ def _handle_view(session, data):
             continue
         _mirror['received'][0] += 1
         _mirror['received'][1] += len(raw)
+        _mirror['delivering'] = True                 # message de l'hote : jamais filtre
         try:
             if bridge_deliver_view(entry[0], raw):
                 _mirror['delivered'] += 1
         except Exception:
             _mirror_error('affichage du message {}'.format(entry[0]))
+        finally:
+            _mirror['delivering'] = False
 
 
 def mirror_takes_order(queue, interaction):

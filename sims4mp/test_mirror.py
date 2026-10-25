@@ -236,6 +236,41 @@ class _PieMessage(object):
 
 
 module('protocolbuffers.InteractionOps_pb2', PieMenuCreate=_PieMessage)
+sys.modules['protocolbuffers.Consts_pb2'].MGR_OBJECT = 1
+sys.modules['protocolbuffers.Consts_pb2'].MGR_SIM_INFO = 3
+
+
+class _Entries(list):
+    def add(self):
+        entry = _ViewEntry(0)
+        self.append(entry)
+        return entry
+
+
+class _ViewEntry(object):
+    """Entree d'affichage : seul primary_channel.id.manager_id compte ici."""
+
+    def __init__(self, manager_id):
+        self.primary_channel = types.SimpleNamespace(id=types.SimpleNamespace(manager_id=manager_id))
+
+    def CopyFrom(self, other):
+        self.primary_channel.id.manager_id = other.primary_channel.id.manager_id
+
+
+class _ViewUpdate(object):
+    """Faux ViewUpdate : octets « 1,4,3 » = gestionnaires des entrees."""
+
+    def __init__(self):
+        self.entries = _Entries()
+
+    def ParseFromString(self, data):
+        self.entries = _Entries(_ViewEntry(int(v)) for v in data.decode('ascii').split(',') if v)
+
+    def SerializeToString(self):
+        return ','.join(str(e.primary_channel.id.manager_id) for e in self.entries).encode('ascii')
+
+
+module('protocolbuffers.Distributor_pb2', ViewUpdate=_ViewUpdate)
 
 
 class _DialogMessage(object):
@@ -644,6 +679,22 @@ del SENT[:]
 mod._handle_view(guest, {'kind': 'view', 'm': [[11, 'pas du base64 !'], ['11', 'AA=='], [-1, 'AA=='], 'x']})
 mod._handle_view(guest, {'kind': 'view', 'm': 'pas une liste'})
 report('entrees invalides ignorees', not SENT and mod._mirror['ignored'] == 4)
+omega.send(0xABC, 11, b'1,4,3')
+omega.send(0xABC, 11, b'1,3')
+omega.send(0xABC, 159, b'humeur locale')
+omega.send(0xABC, 40, b'5:2')
+report('affichage du jeu fige de l\'invite : etat des objets et Sims retire, client et fenetres gardes (0.21.7)',
+       SENT == [(0xABC, 11, b'4'), (0xABC, 40, b'5:2')] and mod._mirror['own_entries_dropped'] == 4
+       and mod._mirror['own_messages_dropped'] == 1, str(SENT))
+del SENT[:]
+mod._handle_view(guest, {'kind': 'view', 'm': [[11, base64.b64encode(b'1,3').decode('ascii')]]})
+report('message de l\'hote : jamais filtre', SENT == [(0xABC, 11, b'1,3')])
+del SENT[:]
+mod._mirror['bb_session'] = True
+omega.send(0xABC, 11, b'1,4')
+mod._mirror['bb_session'] = False
+report('mode construction : son propre affichage n\'est pas filtre', SENT == [(0xABC, 11, b'1,4')])
+del SENT[:]
 
 # --- 7. Invite : clics et croix partent a l'hote --------------------------------------------------
 mod.bridge_order_from_interaction = lambda q, i, kind='pie', mixers=False: {
