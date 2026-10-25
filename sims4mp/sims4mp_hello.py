@@ -1,4 +1,8 @@
-# Sims 4 Multiplayer - commandes de l'interface (0.21.5) : les boutons de l'interface envoient des
+# Sims 4 Multiplayer - autres interfaces (0.21.6) : inventaire (achat, vente, favoris), triches
+# (motherlode, rosebud/kaching, money, factures auto, aspirations), aspirations, clubs, calendrier,
+# universite, carnet et prenom/nom du Sim jouent chez l'hote ; ce qui ouvre seulement un affichage
+# reste chez l'invite. Les triches gardent leur type de commande du jeu (Cheat).
+# Commandes de l'interface (0.21.5) : les boutons de l'interface envoient des
 # commandes au jeu ; celles de MIRROR_COMMANDS (menus, choix, croix d'un mixer, glisser-deposer,
 # carrieres, factures) sont reenregistrees : chez l'invite la ligne part a l'hote, qui l'execute
 # avec le Sim de l'invite comme Sim actif. Corrige aussi les menus de la 0.21.2 : remplacer la
@@ -249,7 +253,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.5'
+MOD_VERSION = '0.21.6'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -345,7 +349,8 @@ MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique
 MIRROR_OBJECTS_MAX = 200                  # objets crees / retires au plus par message « objects » (0.20.2)
 MIRROR_DIALOGS_MAX = 100                  # hote : fenetres envoyees a l'invite gardees (reponses acceptees)
 MIRROR_PROFILE_MAX = 512 * 1024           # profil de Sim ou de foyer recu au plus (octets, 0.21.3)
-# Commandes de l'interface jouees chez l'hote pour le Sim de l'invite (0.21.5) : nom -> (module, fonction).
+# Commandes de l'interface jouees chez l'hote pour le Sim de l'invite (0.21.5) :
+# nom -> (module, fonction[, type de commande du jeu : 'Live' par defaut, 'Cheat' pour les triches]).
 MIRROR_COMMANDS = {
     'interactions.choices': ('server_commands.interaction_commands', 'generate_choices'),
     'interactions.phone_choices': ('server_commands.interaction_commands', 'generate_phone_choices'),
@@ -366,6 +371,55 @@ MIRROR_COMMANDS = {
     'bills.show_bills_dialog': ('sims.bills_commands', 'show_bills_dialog'),
     'bills.sell_excess_utility': ('sims.bills_commands', 'sell_excess_utility'),
     'bills.set_utility_end_bill_action': ('sims.bills_commands', 'set_utility_end_bill_action'),
+    # 0.21.6 : seules les commandes qui changent la partie ; celles qui ouvrent seulement un affichage
+    # (inventory.open_ui, notebook.generate_notebook, family_tree.show_family_tree...) restent chez
+    # l'invite, sinon la fenetre s'ouvrirait sur l'ecran de l'hote.
+    'inventory.purchase_picker_response': ('server_commands.inventory_commands', 'purchase_picker_response'),
+    'inventory.purchase_picker_response_by_ids': ('server_commands.inventory_commands',
+                                                  'purchase_picker_response_by_ids'),
+    'inventory.sell_picker_response_by_ids': ('server_commands.inventory_commands', 'sell_picker_response_by_ids'),
+    'inventory.sim_inventory_sell_multiple': ('server_commands.inventory_commands', 'sim_inventory_sell_multiple'),
+    'inventory.sim_inventory_favorite_multiple': ('server_commands.inventory_commands',
+                                                  'sim_inventory_favorite_multiple'),
+    'motherlode': ('server_commands.sim_commands', 'motherlode', 'Cheat'),
+    'rosebud': ('server_commands.sim_commands', 'rosebud', 'Cheat'),
+    'kaching': ('server_commands.sim_commands', 'rosebud', 'Cheat'),
+    'money': ('server_commands.sim_commands', 'set_money', 'Cheat'),
+    'households.autopay_bills': ('server_commands.bill_commands', 'autopay_bills', 'Cheat'),
+    'aspirations.complete_aspiration': ('server_commands.aspiration_commands', 'complete_aspiration', 'Cheat'),
+    'aspirations.complete_current_milestone': ('server_commands.aspiration_commands', 'complete_current_milestone',
+                                               'Cheat'),
+    'aspirations.complete_objective': ('server_commands.aspiration_commands', 'complete_objective', 'Cheat'),
+    'aspirations.add_aspiration_to_suggested_aspirations': ('server_commands.aspiration_commands',
+                                                            'add_aspiration_to_suggested_aspirations'),
+    'aspirations.remove_aspiration_from_suggested_aspirations': ('server_commands.aspiration_commands',
+                                                                 'remove_aspiration_from_suggested_aspirations'),
+    'aspirations.activate_timed_aspiration_from_suggested_aspiration': (
+        'server_commands.aspiration_commands', 'activate_timed_aspiration_from_suggested_aspiration'),
+    'aspirations.activate_timed_aspiration': ('server_commands.aspiration_commands', 'activate_timed_aspiration'),
+    'aspirations.deactivate_timed_aspiration': ('server_commands.aspiration_commands', 'deactivate_timed_aspiration'),
+    'clubs.add_sim_to_club_by_id': ('clubs.club_commands', 'add_sim_to_club_by_id'),
+    'clubs.set_leader_by_id': ('clubs.club_commands', 'set_leader_by_id'),
+    'clubs.remove_sim_from_club_by_id': ('clubs.club_commands', 'remove_sim_from_club_by_id'),
+    'clubs.start_gathering_by_club_id': ('clubs.club_commands', 'start_gathering_by_club_id'),
+    'clubs.join_gathering_by_club_id': ('clubs.club_commands', 'join_gathering_by_club_id'),
+    'clubs.end_gathering_by_club_id': ('clubs.club_commands', 'end_gathering_by_club_id'),
+    'clubs.request_invite': ('clubs.club_commands', 'request_club_invite'),
+    'clubs.create_club': ('clubs.club_commands', 'create_club'),
+    'clubs.update_club': ('clubs.club_commands', 'update_club'),
+    'clubs.remove_club_by_id': ('clubs.club_commands', 'remove_club_by_id'),
+    'clubs.set_club_outfit_style': ('clubs.club_commands', 'set_club_outfit_style'),
+    'clubs.set_club_outfit_color': ('clubs.club_commands', 'set_club_outfit_color'),
+    'clubs.set_outfit_setting': ('clubs.club_commands', 'set_outfit_setting'),
+    'calendar.set_favorite_calendar_entry': ('server_commands.calendar_commands', 'set_favorite_calendar_entry'),
+    'university.enroll': ('sims.university.university_commands', 'enroll'),
+    'university.dropout': ('sims.university.university_commands', 'dropout'),
+    'university.withdraw': ('sims.university.university_commands', 'withdraw'),
+    'notebook.mark_entry_as_seen': ('notebook.notebook_commands', 'mark_entry_as_seen'),
+    'notebook.save_notes': ('notebook.notebook_commands', 'save_notes'),
+    'notebook.hide_category': ('notebook.notebook_commands', 'hide_category'),
+    'sims.set_first_name': ('server_commands.sim_commands', 'set_first_name'),
+    'sims.set_last_name': ('server_commands.sim_commands', 'set_last_name'),
 }
 MIRROR_MENU_COMMANDS = {'interactions.choices': 10, 'interactions.phone_choices': 3}   # place de reference_id
 MIRROR_COMMAND_ALIAS = 'sims4mp.'         # la commande d'origine reste enregistree sous ce prefixe
@@ -4512,23 +4566,24 @@ def _hook_commands():
     si le vrai nom ne peut etre reenregistre, l'originale y est remise."""
     import importlib
     import sims4.commands
-    live = sims4.commands.CommandType.Live
-    for name, (module_name, function_name) in sorted(MIRROR_COMMANDS.items()):
+    for name, entry in sorted(MIRROR_COMMANDS.items()):
+        module_name, function_name = entry[0], entry[1]
+        kind = getattr(sims4.commands.CommandType, entry[2] if len(entry) > 2 else 'Live')
         try:
             original = getattr(importlib.import_module(module_name), function_name)
         except Exception:
             log('simulation unique : commande {} absente de ce jeu ({}.{})'.format(name, module_name, function_name))
             continue
         try:
-            sims4.commands.Command(MIRROR_COMMAND_ALIAS + name, command_type=live)(original)
+            sims4.commands.Command(MIRROR_COMMAND_ALIAS + name, command_type=kind)(original)
             sims4.commands.unregister(name)
             sims4.commands.register(name, sims4.commands.CommandRestrictionFlags.UNRESTRICTED,
-                                    _command_router(name), '', '', live)
+                                    _command_router(name), '', '', kind)
             _mirror['commands'].append(name)
         except Exception:
             log('ERREUR simulation unique : commande {} non reprise :\n{}'.format(name, traceback.format_exc()))
             try:
-                sims4.commands.Command(name, command_type=live)(original)   # l'originale reste utilisable
+                sims4.commands.Command(name, command_type=kind)(original)   # l'originale reste utilisable
             except Exception:
                 log('ERREUR simulation unique : commande {} perdue'.format(name))
     log('simulation unique : {} commande(s) de l\'interface reprises'.format(len(_mirror['commands'])))

@@ -60,9 +60,16 @@ def _execute(line, connection):
     return REGISTRY[tokens[0]](*tokens[1:], _session_id=connection)
 
 
-commands = module('sims4.commands', Command=_Command, CommandType=types.SimpleNamespace(Live='Live'),
-                  CheatOutput=_CheatOutput, register=lambda name, restrictions, handler, *a: REGISTRY.__setitem__(
-                      name, handler),
+TYPES = {}                                           # type de commande enregistre pour chaque nom
+
+
+def _register(name, restrictions, handler, description, usage, command_type):
+    REGISTRY[name] = handler
+    TYPES[name] = command_type
+
+
+commands = module('sims4.commands', Command=_Command, CommandType=types.SimpleNamespace(Live='Live', Cheat='Cheat'),
+                  CheatOutput=_CheatOutput, register=_register,
                   unregister=lambda name: REGISTRY.pop(name, None), execute=_execute,
                   CommandRestrictionFlags=types.SimpleNamespace(UNRESTRICTED=0))
 module('sims4', commands=commands)
@@ -185,6 +192,8 @@ def send_to_work(sim_id, career_uid, _connection=None):
 
 
 module('server_commands.career_commands', send_to_work=send_to_work)
+CHEATS = []
+module('server_commands.sim_commands', motherlode=lambda _connection=None: CHEATS.append(('motherlode', _connection)))
 
 
 class TestResult(object):
@@ -908,6 +917,16 @@ for bad in ({'name': 'cheats.motherlode', 'args': []}, {'name': 'careers.send_to
             {'name': 'careers.send_to_work', 'args': [3]}):
     mod._handle_command(host, dict(bad, kind='cmd'))
 report('commande hors liste ou arguments douteux : ignoree', len(CAREER_CALLS) == 2)
+report('triche motherlode reprise en gardant son type de commande du jeu (0.21.6)',
+       TYPES.get('motherlode') == 'Cheat' and TYPES.get('careers.send_to_work') == 'Live')
+mod._session = guest
+_execute('motherlode', CLIENT.id)
+report('invite : motherlode envoye a l\'hote, pas joue chez lui',
+       not CHEATS and events(guest.endpoint, 'cmd')[-1] == {'kind': 'cmd', 'name': 'motherlode', 'args': []})
+mod._session = host
+mod._handle_command(host, {'kind': 'cmd', 'name': 'motherlode', 'args': []})
+report('hote : motherlode joue chez lui (l\'argent revient a l\'invite par la synchro d\'argent)',
+       CHEATS == [('motherlode', CLIENT.id)])
 mod._mirror['capturing'] = True
 del SENT[:]
 omega.send(0x1, 6, b'2:77')
