@@ -1,4 +1,12 @@
-# Sims 4 Multiplayer - premiers retours en jeu (0.21.9) : en simulation unique, l'invite suit le
+# Sims 4 Multiplayer - deuxieme essai en jeu (0.21.10) : plus de gestes de construction ni d'objets
+# envoyes pendant un chargement de lot (1263 envoyes a tort au voyage) ; gestes de construction
+# seulement en mode construction ; le Sim de l'invite part avec le voyage de l'hote ; Sims de
+# l'invite absents chez l'hote retires de son ecran (la ligne du temps gelee empechait leur depart),
+# Sims de l'hote affiches par l'invite si leur affichage n'est pas deja venu de l'hote ; poignee de
+# pause en un mot ; entree « Sims4MP… » de l'invite ouverte chez lui ; fenetres ouvertes pour une
+# action de l'invite (pendant son choix, ou acteur = son Sim) envoyees chez lui ; commandes
+# d'universite laissees telles quelles.
+# Premiers retours en jeu (0.21.9) : en simulation unique, l'invite suit le
 # voyage de l'hote sans fenetre de choix, et sa ligne du temps tourne jusqu'a l'arrivee (le voyage du
 # jeu en a besoin pour partir) ; les pauses demandees par son interface (fenetre ouverte : clock
 # .request_pause / unrequest_pause ; mode construction : clock.build_buy_pause_unpause) mettent
@@ -267,7 +275,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.21.9'
+MOD_VERSION = '0.21.10'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -943,6 +951,25 @@ def bridge_despawn_sim(sim_id):
     return True
 
 
+def bridge_show_sim(sim_id, visible):
+    """Invite en simulation unique : affiche ou retire de son ecran un Sim de sa partie, sans le detruire
+    (Distributor.add_object / remove_object, comme quand un objet entre ou sort de la vue du client).
+    Renvoie True si le Sim existe ici."""
+    import services
+    from distributor.system import Distributor
+    from objects import ALL_HIDDEN_REASONS
+    sim_info = services.sim_info_manager().get(sim_id)
+    sim = sim_info.get_sim_instance(allow_hidden_flags=ALL_HIDDEN_REASONS) if sim_info is not None else None
+    if sim is None:
+        return False
+    _mirror['replicas'].discard(sim_id)              # sinon add_object / remove_object seraient sautes
+    if visible:
+        Distributor.instance().add_object(sim)
+    else:
+        Distributor.instance().remove_object(sim)
+    return True
+
+
 def bridge_sim_snapshot(sim_id):
     """Position et action en cours d'un Sim present, comme bridge_read_position, ou None."""
     import services
@@ -1186,6 +1213,13 @@ def bridge_filter_own_view(data):
     for entry in kept:
         filtered.entries.add().CopyFrom(entry)
     return filtered.SerializeToString(), removed
+
+
+def bridge_zone_running():
+    """Vrai si la zone tourne (Zone.is_zone_running) : faux pendant un chargement ou un voyage."""
+    import services
+    zone = services.current_zone()
+    return zone is not None and bool(zone.is_zone_running)
 
 
 def bridge_is_frozen_timeline(timeline):
@@ -1829,6 +1863,8 @@ def _handle_client_event(session, kind, value):
                 _handle_sim_profile(session, value['data'])
             elif value['data'].get('kind') == 'resync_save':
                 _handle_resync_save(session, value['data'])
+            elif value['data'].get('kind') == 'open_menu':
+                _safe('fenetre Sims4MP de l\'invite', open_menu)   # 0.21.10
             elif value['data'].get('kind') == 'mirror':
                 _handle_mirror(session, value['data'])
             else:
@@ -2928,6 +2964,20 @@ def on_travel_choice(choice, zone_id, sim_ids):
         bridge_notify('Voyage impossible pour suivre l\'autre joueur (voir le journal).', alert=True)
 
 
+def mirror_travel_with_guest(msg):
+    """Hote en simulation unique (0.21.10) : le Sim que controle l'invite part avec le voyage de l'hote
+    (ajoute aux sim_ids du message TravelSimsToZone) ; sinon il restait sur l'ancien lot chez l'hote."""
+    session = _session
+    if session is None or session.role != 'host' or not mirror_on(session):
+        return
+    guest_sim = session.guest_sim_id
+    if guest_sim is None or guest_sim in msg.sim_ids or not _read('guest_sim_here',
+                                                                  lambda: bridge_sim_snapshot(guest_sim)):
+        return
+    msg.sim_ids.append(guest_sim)
+    log('[host] voyage : le Sim de l\'invite ({}) part avec vous'.format(guest_sim))
+
+
 def _install_travel_hook():
     """Depart reel d'un voyage : Distributor.add_event avec MSG_TRAVEL_SIMS_TO_ZONE
     (distributor/system.pyc : add_event(self, msg_id, msg, immediate=False))."""
@@ -2942,6 +2992,7 @@ def _install_travel_hook():
     def add_event(self, msg_id, msg, *args, **kwargs):
         if msg_id == travel_msg:
             try:
+                mirror_travel_with_guest(msg)
                 on_travel_message(msg.zone_id, list(msg.sim_ids))
             except Exception:
                 _sync_error('suivi des voyages')
@@ -3037,6 +3088,8 @@ def _roster_tick(session, now):
     for sim_id in (_safe('liste des Sims', bridge_instanced_sim_ids) or [])[:ROSTER_MAX]:
         snapshot = _safe('position d\'un Sim', bridge_sim_snapshot, sim_id)
         if snapshot is not None:
+            if mirror_on(session):
+                snapshot['vu'] = sim_id in _mirror['sims_live']   # son affichage est deja parti (0.21.10)
             entries.append(snapshot)
     session.endpoint.send(protocol.make_message(protocol.EVENT, {
         'kind': 'roster', 'zone_id': bridge_current_zone_id(), 'list': entries}))
@@ -3052,17 +3105,24 @@ def _handle_roster(session, data):
         return
     if _gate['waiting'] or zone_id is None or zone_id != bridge_current_zone_id():
         return                                       # autre lot : rien a recopier ici
-    host = {}
+    host, shown = {}, set()
     for entry in entries:
         position = validate_position(entry)
         if position is not None:
             host[position['sim_id']] = position
+            if entry.get('vu') is True:
+                shown.add(position['sim_id'])        # son affichage est deja arrive de l'hote (0.21.10)
     local = set(_safe('liste des Sims', bridge_instanced_sim_ids) or [])
     mine = _my_active_id()
     now = time.monotonic()
     actions = 0
     _sync['pushing'] = True                          # pas des actions du joueur
     try:
+        for sim_id in sorted(_mirror['hidden'] & set(host)):
+            # Revenu chez l'hote : de nouveau affiche ici (par l'hote s'il l'a fait apparaitre depuis).
+            _mirror['hidden'].discard(sim_id)
+            if sim_id not in shown:
+                _safe('retour d\'un Sim a l\'ecran', bridge_show_sim, sim_id, True)
         for sim_id, position in host.items():
             if sim_id in local or sim_id in session.roster_unknown or actions >= ROSTER_ACTIONS:
                 continue
@@ -3070,8 +3130,10 @@ def _handle_roster(session, data):
                 continue
             session.roster_retry[sim_id] = now + ROSTER_RETRY
             actions += 1
-            if _mirror['active']:
-                _mirror['replicas'].add(sim_id)      # simulation unique : son affichage vient de l'hote
+            if _mirror['active'] and sim_id in shown:
+                # Simulation unique : affichage deja envoye par l'hote ; sinon le jeu de l'invite
+                # l'affiche lui-meme (Sim present chez l'hote avant la recopie : sinon invisible).
+                _mirror['replicas'].add(sim_id)
             result = _safe('apparition d\'un Sim', bridge_spawn_sim, sim_id, position['x'], position['y'],
                            position['z'])
             if result != 'ok':
@@ -3089,11 +3151,19 @@ def _handle_roster(session, data):
                     session.role, label))
             elif result != 'deja':
                 log('[{}] presence : {} impossible a faire apparaitre ({})'.format(session.role, label, result))
-        for sim_id in sorted(local - set(host)):
+        for sim_id in sorted(local - set(host) - _mirror['hidden']):
             if sim_id == mine or actions >= ROSTER_ACTIONS or now < session.roster_retry.get(sim_id, 0.0):
                 continue
             session.roster_retry[sim_id] = now + ROSTER_RETRY
             actions += 1
+            if _mirror['active']:
+                # Simulation unique (0.21.10) : schedule_destroy_asap attend la ligne du temps, gelee ici
+                # (le meme Sim etait « retire » toutes les 30 s) ; il est seulement retire de l'ecran.
+                if _safe('Sim retire de l\'ecran', bridge_show_sim, sim_id, False):
+                    _mirror['hidden'].add(sim_id)
+                    session.roster_despawned += 1
+                    log('[{}] presence : Sim {} retire de l\'ecran (absent chez l\'hote)'.format(session.role, sim_id))
+                continue
             if _safe('depart d\'un Sim', bridge_despawn_sim, sim_id):
                 session.roster_despawned += 1
                 session.sims_remote.pop(sim_id, None)
@@ -3555,6 +3625,10 @@ _mirror = {
     'commands_applied': 0,   # hote
     'commands_failed': 0,
     'guest_pauses': set(),   # hote : pauses posees par l'interface de l'invite (0.21.9)
+    'sims_live': set(),      # hote : Sims apparus pendant la recopie (affichage envoye a l'invite, 0.21.10)
+    'for_guest': 0,          # hote : > 0 pendant un choix ou une commande de l'invite (0.21.10)
+    'guest_dialog_ids': set(),  # hote : fenetres ouvertes pour une action de l'invite (a lui envoyer)
+    'hidden': set(),         # invite : Sims de sa partie absents chez l'hote, retires de son ecran (0.21.10)
     'traveling': False,      # invite : voyage en cours, la ligne du temps tourne pour partir (0.21.9)
     # Nouveaux Sims (0.21.3).
     'sims_asked': 0,         # invite : profils demandes
@@ -3784,7 +3858,8 @@ def _handle_command(session, data):
         _apply_guest_choice(tokens)
         return
     if name in MIRROR_PAUSE_ON + MIRROR_PAUSE_OFF + ('clock.toggle_pause_unpause',) and tokens:
-        tokens = [MIRROR_PAUSE_PREFIX + tokens[0]] + list(tokens[1:])
+        # Poignee en un seul mot (0.21.10) : l'interface envoie « Layout Manager Set Modal Visible ».
+        tokens = [MIRROR_PAUSE_PREFIX + '_'.join(tokens)]
         if name in MIRROR_PAUSE_ON:
             _mirror['guest_pauses'].add(tokens[0])
         elif name in MIRROR_PAUSE_OFF:
@@ -3800,10 +3875,12 @@ def _handle_command(session, data):
             _mirror['guest_menu'] = menu
         return
     _sync['pushing'] = True
+    _mirror['for_guest'] += 1                        # fenetres ouvertes pendant la commande : a l'invite
     try:
         done = _safe('commande de l\'invite ({})'.format(name), bridge_run_for_guest, name, tokens, sim_id)
     finally:
         _sync['pushing'] = False
+        _mirror['for_guest'] -= 1
     _mirror['commands_applied' if done else 'commands_failed'] += 1
     log('[host] commande de l\'invite {} : {}'.format(name, 'jouee' if done else 'non jouee'))
 
@@ -3840,8 +3917,27 @@ def _apply_guest_choice(tokens):
         log('[host] choix de l\'invite pour un menu perime (revision {}) : ignore'.format(revision))
         return
     _mirror['guest_menu'] = None
-    result = _safe('choix de l\'invite dans un menu', menu.select, choice_id)
+    if _safe('entree choisie par l\'invite', bridge_choice_is_sims4mp_menu, menu, choice_id):
+        # Entree « Sims4MP… » (0.21.10) : la fenetre de l'invite s'ouvre chez lui, pas chez l'hote.
+        session = _session
+        if session is not None:
+            session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'open_menu'}))
+            _flush_now(session)
+        log('[host] l\'invite ouvre sa fenetre Sims4MP')
+        return
+    _mirror['for_guest'] += 1                        # fenetres ouvertes pendant ce choix : a l'invite
+    try:
+        result = _safe('choix de l\'invite dans un menu', menu.select, choice_id)
+    finally:
+        _mirror['for_guest'] -= 1
     log('[host] choix {} de l\'invite applique : {}'.format(choice_id, result))
+
+
+def bridge_choice_is_sims4mp_menu(menu, choice_id):
+    """Vrai si le choix designe l'entree « Sims4MP… » du mod (ChoiceMenu.menu_items[numero].aop.affordance)."""
+    item = menu.menu_items.get(choice_id)
+    affordance = getattr(getattr(item, 'aop', None), 'affordance', None)
+    return affordance is not None and affordance is _menu['affordance']
 
 
 def _mirror_pie_for_guest(data):
@@ -3866,8 +3962,10 @@ def _mirror_dialog_for_guest(data, notification=False):
     if guest_sim is None:
         return False
     dialog_id, owner_id = bridge_dialog_ids(data)
-    if owner_id != guest_sim or owner_id == _my_active_id():
+    forced = dialog_id in _mirror['guest_dialog_ids']    # ouverte pour une action de l'invite (0.21.10)
+    if not forced and (owner_id != guest_sim or owner_id == _my_active_id()):
         return False
+    _mirror['guest_dialog_ids'].discard(dialog_id)
     routed = _mirror['dialogs']
     routed.append(dialog_id)
     del routed[:-MIRROR_DIALOGS_MAX]
@@ -4006,8 +4104,13 @@ def _mirror_clear_out():
 # copie de meme identifiant sans affichage propre (Distributor.add_object / remove_object sautes).
 
 def mirror_object_added(obj):
-    """Hote (ObjectManager.add) : objet a envoyer a l'invite au prochain passage."""
+    """Hote (ObjectManager.add) : objet a envoyer a l'invite au prochain passage. Pendant un chargement
+    de lot, rien (0.21.10) : les deux jeux chargent les memes objets de leur sauvegarde. Un Sim apparu
+    pendant la recopie est note : l'invite sait que son affichage lui est arrive (presence)."""
+    if not bridge_zone_running():
+        return
     if getattr(obj, 'is_sim', False):
+        _mirror['sims_live'].add(getattr(obj, 'id', None))
         return
     try:
         ref = weakref.ref(obj)
@@ -4017,8 +4120,8 @@ def mirror_object_added(obj):
 
 
 def mirror_object_removed(obj):
-    """Hote (ObjectManager.remove) : objet retire, a retirer chez l'invite."""
-    if getattr(obj, 'is_sim', False):
+    """Hote (ObjectManager.remove) : objet retire, a retirer chez l'invite (pas pendant un chargement)."""
+    if getattr(obj, 'is_sim', False) or not bridge_zone_running():
         return
     obj_id = getattr(obj, 'id', None)
     pending = [ref for ref in _mirror['objs_new'] if ref() is not obj]
@@ -4488,6 +4591,45 @@ def _hook_cancel_command():
     _mirror_wrap(interaction_commands, 'cancel_common', make)
 
 
+def bridge_dialog_actor_id(dialog):
+    """Sim acteur d'une fenetre (dialog._resolver.get_participant(ParticipantType.Actor)), ou None."""
+    from interactions import ParticipantType
+    resolver = getattr(dialog, '_resolver', None)
+    actor = resolver.get_participant(ParticipantType.Actor) if resolver is not None else None
+    return getattr(actor, 'sim_id', None) or getattr(getattr(actor, 'sim_info', None), 'sim_id', None)
+
+
+def mirror_note_dialog(dialog):
+    """Hote (UiDialogService.dialog_show, 0.21.10) : une fenetre ouverte pendant un choix ou une commande
+    de l'invite, ou dont l'acteur est le Sim de l'invite, lui sera envoyee meme si son proprietaire est
+    le Sim de l'hote (fenetres de mods comme les menus de WickedWhims)."""
+    session = _session
+    if session is None or session.role != 'host' or not mirror_on(session) or session.guest_sim_id is None:
+        return
+    dialog_id = getattr(dialog, 'dialog_id', None)
+    if dialog_id is None:
+        return
+    actor = _read('dialog_actor', lambda: bridge_dialog_actor_id(dialog))
+    if _mirror['for_guest'] > 0 or (actor == session.guest_sim_id and actor != _my_active_id()):
+        _mirror['guest_dialog_ids'].add(dialog_id)
+        while len(_mirror['guest_dialog_ids']) > MIRROR_DIALOGS_MAX:
+            _mirror['guest_dialog_ids'].pop()
+
+
+def _hook_dialog_show():
+    from ui.ui_dialog_service import UiDialogService
+
+    def make(original):
+        def dialog_show(self, dialog, *args, **kwargs):
+            try:
+                mirror_note_dialog(dialog)
+            except Exception:
+                _mirror_error('fenetre pour l\'invite')
+            return original(self, dialog, *args, **kwargs)
+        return dialog_show
+    _mirror_wrap(UiDialogService, 'dialog_show', make)
+
+
 def _hook_dialog_answers():
     """Invite : une reponse a une fenetre que son jeu ne connait pas (UiDialogService.get_dialog
     renvoie None) vient d'une fenetre de l'hote ; elle part a l'hote (0.20.1)."""
@@ -4610,7 +4752,9 @@ def _hook_build_buy():
     def make(op, describe, before=None):
         def make_wrapper(original):
             def wrapper(*args, **kwargs):
-                active = mirror_frozen() and not _sync['pushing']
+                # Seulement en mode construction ouvert (0.21.10) : ces fonctions sont aussi appelees par
+                # le jeu en chargeant un lot (1263 gestes envoyes a tort pendant un voyage).
+                active = mirror_frozen() and not _sync['pushing'] and _mirror['bb_session']
                 values = None
                 if active:
                     try:
@@ -4690,6 +4834,7 @@ def _hook_commands():
     des arguments), le vrai nom sur _command_router. Une commande dont le module manque est passee ;
     si le vrai nom ne peut etre reenregistre, l'originale y est remise."""
     import importlib
+    import inspect
     import sims4.commands
     for name, entry in sorted(MIRROR_COMMANDS.items()):
         module_name, function_name = entry[0], entry[1]
@@ -4698,6 +4843,11 @@ def _hook_commands():
             original = getattr(importlib.import_module(module_name), function_name)
         except Exception:
             log('simulation unique : commande {} absente de ce jeu ({}.{})'.format(name, module_name, function_name))
+            continue
+        try:
+            inspect.getfullargspec(original)       # lu par Command : sinon la commande reste telle quelle
+        except TypeError:
+            log('simulation unique : commande {} laissee telle quelle (arguments illisibles)'.format(name))
             continue
         try:
             sims4.commands.Command(MIRROR_COMMAND_ALIAS + name, command_type=kind)(original)
@@ -4719,7 +4869,8 @@ def _install_mirror_hooks():
     for label, install in (('ligne du temps', _hook_timeline), ('horloge', _hook_clock_broadcast),
                            ('PNJ', _hook_npc_spawner), ('croix', _hook_cancel_command),
                            ('fenetres', _hook_dialog_answers), ('objets', _hook_objects),
-                           ('construction', _hook_build_buy), ('commandes', _hook_commands)):
+                           ('construction', _hook_build_buy), ('commandes', _hook_commands),
+                           ('fenetres de l\'invite', _hook_dialog_show)):
         try:
             install()
             _mirror['hooks'].append(label)
@@ -5976,6 +6127,10 @@ def _safe_on_zone_loaded():
         log('voyage : arrive sur le lot de l\'autre joueur ({})'.format(_travel['following']))
     _travel['following'] = None                      # voyage termine (ou nouvelle partie)
     _mirror['traveling'] = False                     # simulation unique : ligne du temps de nouveau gelee
+    # Nouveau lot (0.21.10) : les objets et Sims notes concernaient l'ancien.
+    _mirror_clear_out()
+    for key in ('sims_live', 'hidden', 'replicas'):
+        _mirror[key].clear()
     install_menu()                                   # protege lui-meme ses erreurs
     try:
         on_zone_loaded()

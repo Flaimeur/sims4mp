@@ -309,6 +309,9 @@ class UiDialogService(object):
     def dialog_text_input(self, dialog_id, text_input_name, text_input_value):
         self.calls.append(('text', dialog_id, text_input_name, text_input_value))
 
+    def dialog_show(self, dialog, phone_ring_type=None, auto_response=None, caller_id=None, immediate=False):
+        self.calls.append(('show', dialog.dialog_id))
+
 
 DIALOGS = UiDialogService()
 module('ui')
@@ -498,6 +501,7 @@ class Sim(object):
     is_sim = True
 
     def __init__(self, sim_id, interactions=()):
+        self.id = sim_id                             # comme le jeu : l'objet Sim a l'identifiant de son Sim
         self.sim_info = types.SimpleNamespace(sim_id=sim_id, get_sim_instance=lambda **kwargs: self)
         self._interactions = {i.id: i for i in interactions}
         self.si_state = []
@@ -576,7 +580,7 @@ def events(endpoint, kind):
 
 report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets, construction, commandes',
        mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets', 'construction',
-                                'commandes'], str(mod._mirror['hooks']))
+                                'commandes', 'fenetres de l\'invite'], str(mod._mirror['hooks']))
 
 # --- 1. Hote : choix, annonce, confirmation ---------------------------------------------------
 host = mod.NetSession('host', Endpoint())
@@ -880,20 +884,25 @@ TRANSFORM = types.SimpleNamespace(translation=vec, orientation=rot)
 SURFACE = types.SimpleNamespace(secondary_id=1, type=1)
 del BB_CALLS[:]
 start = len(events(guest.endpoint, 'bb'))
+obj_system.c_api_create_object(99, 59, 2999, None, 1, 0)   # hors mode construction (chargement d'un lot)
+build_buy.c_api_set_object_location(99, 2999, SURFACE, TRANSFORM)
+report('hors mode construction (chargement d\'un lot, 0.21.10) : rien n\'est envoye a l\'hote',
+       len(BB_CALLS) == 2 and len(events(guest.endpoint, 'bb')) == start and 2999 not in mod._mirror['replicas'])
+del BB_CALLS[:]
+recolored = ClientObjectMixin()
+recolored.id = 3001
+recolored.set_definition(61)                         # hors mode construction : non transmis
+build_buy.c_api_buildbuy_session_begin(99, 1)
 obj_system.c_api_create_object(99, 60, 3001, None, 1, 0)
 build_buy.c_api_set_object_location_ex(99, 3001, SURFACE, TRANSFORM, 0, None, 0)
 build_buy.c_api_set_object_location(99, 3001, SURFACE, TRANSFORM)
 obj_system.c_api_set_parent_object(3002, 3001, TRANSFORM, None, 7, 99)
 obj_system.c_api_clear_parent_object(3002, TRANSFORM, 99, SURFACE)
-recolored = ClientObjectMixin()
-recolored.id = 3001
-recolored.set_definition(61)                         # hors mode construction : non transmis
-build_buy.c_api_buildbuy_session_begin(99, 1)
 recolored.set_definition(61)
-build_buy.c_api_buildbuy_session_end(99, 1)
 obj_system.c_api_destroy_object(99, 3002)
+build_buy.c_api_buildbuy_session_end(99, 1)
 gestures = events(guest.endpoint, 'bb')[start:]
-report('invite : chaque geste est fait ici puis envoye a l\'hote',
+report('invite en mode construction : chaque geste est fait ici puis envoye a l\'hote',
        len(BB_CALLS) == 8 and [g['op'] for g in gestures] == ['create', 'place', 'place', 'parent', 'unparent',
                                                              'design', 'destroy'], str([g['op'] for g in gestures]))
 report('creation : definition, etat, emplacement ; copie sans affichage propre chez l\'invite',
@@ -1073,7 +1082,8 @@ spawned = []
 mod.bridge_spawn_sim = lambda sim_id, x, y, z: (
     'inconnu' if all(s.sim_info.sim_id != sim_id for s in SIMS) else spawned.append(sim_id) or 'ok')
 mod.bridge_instanced_sim_ids = lambda: [1, 2]
-roster = {'kind': 'roster', 'zone_id': 99, 'list': [{'sim_id': 3000, 'name': 'Bebe', 'x': 1.0, 'y': 0.0, 'z': 1.0}]}
+roster = {'kind': 'roster', 'zone_id': 99, 'list': [{'sim_id': 3000, 'name': 'Bebe', 'x': 1.0, 'y': 0.0, 'z': 1.0,
+                                                    'vu': True}]}
 mod._handle_roster(guest, roster)
 report('invite : Sim de l\'hote inconnu ici, son profil est demande a l\'hote',
        events(guest.endpoint, 'sim_request')[-1] == {'kind': 'sim_request', 'id': 3000}
@@ -1083,8 +1093,14 @@ report('invite : profil range dans sa sauvegarde, foyer charge par le jeu',
        PERSISTENCE.sims[3000].data == b'profil-bebe' and LOADED_HOUSEHOLDS == [(70, b'foyer-70')]
        and mod._mirror['sims_loaded'] == 1 and 3000 not in guest.roster_retry)
 mod._handle_roster(guest, roster)
-report('invite : la presence le fait ensuite apparaitre, sans affichage propre (copie)',
+report('invite : la presence le fait ensuite apparaitre, sans affichage propre (affichage deja venu de l\'hote)',
        spawned == [3000] and 3000 in mod._mirror['replicas'])
+guest.roster_retry.clear()
+mod._handle_roster(guest, {'kind': 'roster', 'zone_id': 99,
+                           'list': [{'sim_id': 2, 'name': 'Avant', 'x': 0.0, 'y': 0.0, 'z': 0.0, 'vu': False},
+                                    {'sim_id': 4001, 'name': 'Ancien', 'x': 0.0, 'y': 0.0, 'z': 0.0, 'vu': False}]})
+report('Sim de l\'hote present avant la recopie : affiche par le jeu de l\'invite (sinon invisible, 0.21.10)',
+       4001 not in mod._mirror['replicas'])
 known = []
 HOUSEHOLDS[71] = types.SimpleNamespace(refresh_sim_data=lambda sim_id: known.append(sim_id) or SIMS.append(Sim(sim_id)))
 mod._handle_sim_profile(guest, {'kind': 'sim_profile', 'id': 3001, 'household_id': 71,
@@ -1187,7 +1203,83 @@ mod._safe_on_zone_loaded()
 SIM_TIMELINE.simulate(6)
 report('arrive sur le lot : ligne du temps de nouveau gelee', SIM_TIMELINE.runs == 1 and not mod._mirror['traveling'])
 
-# --- 16. Etat, commande de secours, fin ------------------------------------------------------------
+# --- 16. Deuxieme essai en jeu (0.21.10) ------------------------------------------------------------
+# Poignee de pause avec des espaces : un seul mot chez l'hote.
+mod._session = host
+mod._mirror['wanted'] = True
+host.guest_sim_id = 2
+del PAUSES[:]
+mod._handle_command(host, {'kind': 'cmd', 'name': 'clock.request_pause',
+                           'args': ['Layout', 'Manager', 'Set', 'Modal', 'Visible']})
+mod._handle_command(host, {'kind': 'cmd', 'name': 'clock.unrequest_pause',
+                           'args': ['Layout', 'Manager', 'Set', 'Modal', 'Visible']})
+report('poignee « Layout Manager Set Modal Visible » : une seule poignee, posee puis levee',
+       PAUSES == [('pause', 'sims4mp_invite_Layout_Manager_Set_Modal_Visible'),
+                  ('reprise', 'sims4mp_invite_Layout_Manager_Set_Modal_Visible')], str(PAUSES))
+
+# Voyage de l'hote : le Sim de l'invite part avec lui.
+travel = types.SimpleNamespace(zone_id=120, sim_ids=[1, 3000])
+real_read = mod._read
+mod._read = lambda field, func: True if field == 'guest_sim_here' else real_read(field, func)
+mod.mirror_travel_with_guest(travel)
+report('voyage de l\'hote : le Sim de l\'invite est ajoute aux Sims du voyage', travel.sim_ids == [1, 3000, 2])
+mod.mirror_travel_with_guest(travel)
+report('deja dans le voyage : pas ajoute deux fois', travel.sim_ids == [1, 3000, 2])
+mod._read = real_read
+
+# Entree « Sims4MP… » choisie par l'invite : sa propre fenetre, pas celle de l'hote.
+menu_affordance = object()
+mod._menu['affordance'] = menu_affordance
+own_menu = ChoiceMenu(SIMS[1], 90)
+own_menu.menu_items = {4: types.SimpleNamespace(aop=types.SimpleNamespace(affordance=menu_affordance))}
+mod._mirror['guest_menu'] = own_menu
+mod._handle_command(host, {'kind': 'cmd', 'name': 'interactions.select', 'args': ['4', str(own_menu.revision)]})
+report('entree « Sims4MP… » de l\'invite : ouverte chez lui, rien n\'est lance chez l\'hote',
+       own_menu.selected is None and events(host.endpoint, 'open_menu')[-1] == {'kind': 'open_menu'})
+
+# Fenetre ouverte pendant un choix de l'invite (menu d'un mod) : envoyee a l'invite.
+popup = types.SimpleNamespace(dialog_id=77, _resolver=None)
+
+
+class ModMenu(ChoiceMenu):
+    def select(self, choice_id):
+        DIALOGS.dialog_show(popup)                   # comme un mod qui ouvre son menu tout de suite
+        return 'menu du mod'
+
+
+mod_menu = ModMenu(SIMS[1], 91)
+mod_menu.menu_items = {}
+mod._mirror['guest_menu'] = mod_menu
+mod._handle_command(host, {'kind': 'cmd', 'name': 'interactions.select', 'args': ['1', str(mod_menu.revision)]})
+mod._mirror['capturing'] = True
+del SENT[:]
+omega.send(0x1, 40, b'77:1')
+report('fenetre ouverte pendant le choix de l\'invite (proprietaire : Sim de l\'hote) : chez l\'invite',
+       not SENT and mod._mirror['out'][-1] == (40, b'77:1'), str(SENT))
+omega.send(0x1, 40, b'78:1')
+report('fenetre de l\'hote ouverte en dehors : reste chez l\'hote', SENT == [(0x1, 40, b'78:1')])
+mod._mirror['capturing'] = False
+mod._mirror['wanted'] = False
+
+# Invite : Sim de sa partie absent chez l'hote, retire de son ecran (sans attendre sa ligne du temps).
+mod._session = guest
+del Distributor.shown[:]
+guest.roster_retry.clear()
+mod.bridge_instanced_sim_ids = lambda: [1, 2, 5005]
+SIMS.append(Sim(5005))
+Distributor.instance = classmethod(lambda cls: cls())
+mod._handle_roster(guest, {'kind': 'roster', 'zone_id': 99, 'list': [
+    {'sim_id': 1, 'name': 'A', 'x': 0.0, 'y': 0.0, 'z': 0.0}, {'sim_id': 2, 'name': 'B', 'x': 0.0, 'y': 0.0, 'z': 0.0}]})
+report('Sim de l\'invite absent chez l\'hote : retire de son ecran, une seule fois',
+       Distributor.shown == [('retrait', 5005)] and 5005 in mod._mirror['hidden'])
+guest.roster_retry.clear()
+mod._handle_roster(guest, {'kind': 'roster', 'zone_id': 99, 'list': [
+    {'sim_id': 1, 'name': 'A', 'x': 0.0, 'y': 0.0, 'z': 0.0}, {'sim_id': 5005, 'name': 'C', 'x': 0.0, 'y': 0.0, 'z': 0.0}]})
+report('revenu chez l\'hote : de nouveau affiche chez l\'invite',
+       ('ajout', 5005) in Distributor.shown and 5005 not in mod._mirror['hidden'], str(Distributor.shown))
+SIMS.pop()
+
+# --- 17. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
 mod.mp_mirror('on')
 report('mp.mirror on chez l\'invite : refuse (seul l\'hote choisit)',
