@@ -1,4 +1,9 @@
-# Sims 4 Multiplayer - correctif 0.23.1 : SimSpawner.spawn_sim reste une methode de classe une fois
+# Sims 4 Multiplayer - essai de la 0.23.1 (0.23.2) : en simulation unique l'argent n'est plus synchronise
+# a part (le gain du jeu de l'invite pendant un voyage etait ajoute deux fois chez l'hote) ; poignee de
+# pause recue en un seul argument avec espaces acceptee ; gros affichage (806 Ko a l'arrivee d'un voyage)
+# decoupe au lieu d'etre perdu ; rappels murs/sols a l'ouverture (invite) et la sortie (hote) du mode
+# construction.
+# Correctif 0.23.1 : SimSpawner.spawn_sim reste une methode de classe une fois
 # accrochee (avec WickedWhims, le chargement d'un lot plantait : erreur 110).
 # Comme S4MP, apres une relecture complete de son mod (0.23.0) : l'invite ne garde
 # de son propre affichage qu'une liste blanche (menus, fenetres, survol, glisser : MIRROR_LOCAL_OPS et
@@ -285,7 +290,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.23.1'
+MOD_VERSION = '0.23.2'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -1277,6 +1282,33 @@ def bridge_filter_own_view(data, keep_ops, keep_objects):
     if not filtered.entries:
         return None, removed
     return filtered.SerializeToString(), removed
+
+
+def bridge_split_view(data, limit):
+    """Hote : decoupe un gros ViewUpdate (protocolbuffers.Distributor_pb2) en plusieurs, entrees dans
+    l'ordre, chacun de limit octets au plus ; une entree seule plus grosse part seule si elle tient
+    dans MIRROR_MAX_RAW, sinon elle est perdue. Renvoie la liste des octets (vide si rien)."""
+    from protocolbuffers import Distributor_pb2
+    message = Distributor_pb2.ViewUpdate()
+    message.ParseFromString(bytes(data))
+    parts, current, size = [], None, 0
+    for entry in message.entries:
+        single = Distributor_pb2.ViewUpdate()
+        single.entries.add().CopyFrom(entry)
+        entry_size = len(single.SerializeToString())
+        if entry_size > MIRROR_MAX_RAW:
+            _mirror['too_big'] += 1
+            continue
+        if current is not None and size + entry_size > limit:
+            parts.append(current.SerializeToString())
+            current, size = None, 0
+        if current is None:
+            current = Distributor_pb2.ViewUpdate()
+        current.entries.add().CopyFrom(entry)
+        size += entry_size
+    if current is not None:
+        parts.append(current.SerializeToString())
+    return parts
 
 
 def bridge_local_op_types(names):
@@ -2396,6 +2428,8 @@ def _money_flush(session):
 def _money_tick(session, now):
     if not (session.endpoint.is_connected and session.handshake_done):
         return
+    if mirror_on(session):
+        return                                       # simulation unique : seul l'argent de l'hote compte (0.23.2)
     if now - session.money_checked_at < MONEY_INTERVAL:
         return
     session.money_checked_at = now
@@ -2421,6 +2455,11 @@ def _apply_money(session, delta, reason):
 
 
 def _handle_money(session, data):
+    if mirror_on(session):
+        # Simulation unique (0.23.2) : le solde vient de l'hote ; un changement du jeu de l'invite (pendant
+        # un voyage, ou il tourne) etait ajoute une seconde fois chez l'hote.
+        log('[{}] argent de l\'autre joueur ignore (simulation unique)'.format(session.role))
+        return
     household_id = _clean_int(data.get('household_id'), 0, 2 ** 64)
     local = _safe('lecture argent', bridge_funds)
     if household_id is None or local is None or local[0] != household_id:
@@ -3816,6 +3855,7 @@ _mirror = {
     'batches': 0,
     'skipped': 0,            # hote : messages propres a son ecran
     'too_big': 0,
+    'split': 0,              # hote : gros affichages decoupes (0.23.2)
     'dropped': 0,
     'received': [0, 0],      # invite : messages, octets recus
     'delivered': 0,
@@ -3874,6 +3914,8 @@ def _mirror_host_only():
                                        if name in ('MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE'))
         _mirror['notification_id'] = next((msg_id for msg_id, name in _message_names().items()
                                            if name == 'MSG_UI_NOTIFICATION_SHOW'), None)
+        _mirror['view_update_id'] = next((msg_id for msg_id, name in _message_names().items()
+                                          if name == 'MSG_OBJECTS_VIEW_UPDATE'), -1)
         log('simulation unique : {} type(s) de message gardes sur l\'ecran de l\'hote'.format(len(ids)))
     return ids
 
@@ -4008,7 +4050,11 @@ def _clean_tokens(tokens):
 
 def _handle_command(session, data):
     """Hote : joue la commande de l'interface de l'invite pour le Sim qu'il controle."""
-    name, tokens = data.get('name'), _clean_tokens(data.get('args'))
+    name, args = data.get('name'), data.get('args')
+    if name in MIRROR_PAUSE_ON + MIRROR_PAUSE_OFF + ('clock.toggle_pause_unpause',) and isinstance(args, list):
+        # L'interface envoie la poignee en un seul argument avec des espaces (0.23.2, vu en jeu).
+        args = [part for arg in args if isinstance(arg, str) for part in arg.split()]
+    tokens = _clean_tokens(args)
     sim_id = session.guest_sim_id
     if name not in MIRROR_COMMANDS or tokens is None or not mirror_on(session):
         log('[host] commande de l\'invite invalide ignoree ({!r})'.format(name))
@@ -4247,13 +4293,22 @@ def mirror_capture(msg_id, data):
     if msg_id in host_only:
         _mirror['skipped'] += 1
         return None
-    if len(data) > MIRROR_MAX_RAW:
-        _mirror['too_big'] += 1
-        if _mirror['too_big'] <= 5:
-            log('simulation unique : message {} trop gros ({} octets), non recopie'.format(msg_id, len(data)))
-        return
     out = _mirror['out']
-    out.append((msg_id, bytes(data)))
+    if len(data) > MIRROR_MAX_RAW:
+        parts = None
+        if msg_id == _mirror['view_update_id']:
+            # Affichage d'arrivee sur un lot (806 Ko vu en jeu) : decoupe par entrees (0.23.2).
+            parts = _safe('decoupage d\'un gros affichage', bridge_split_view, data, MIRROR_BATCH_BYTES)
+        if not parts:
+            _mirror['too_big'] += 1
+            if _mirror['too_big'] <= 5:
+                log('simulation unique : message {} trop gros ({} octets), non recopie'.format(msg_id, len(data)))
+            return
+        _mirror['split'] += 1
+        log('simulation unique : gros affichage ({} octets) decoupe en {} parties'.format(len(data), len(parts)))
+        out.extend((msg_id, part) for part in parts)
+    else:
+        out.append((msg_id, bytes(data)))
     if len(out) > MIRROR_QUEUE_MAX:
         _mirror['dropped'] += len(out)
         log('simulation unique : file pleine, {} messages abandonnes (resynchro conseillee)'.format(len(out)))
@@ -4352,6 +4407,20 @@ def _clean_object_entry(entry):
 # Chez l'invite, chaque appel part a l'hote, qui le rejoue avec la meme fonction ; l'objet cree
 # chez l'invite n'a pas d'affichage propre (copie, comme en 0.20.2) : il apparait par l'hote.
 # Murs, sols et terrain sont geres par le moteur C++ du jeu : pas par ce chemin.
+
+def mirror_build_buy_reminder(opened):
+    """Rappel (0.23.2) : murs, sols, toits et terrain ne passent pas en direct (S4MP non plus). L'invite
+    l'apprend en ouvrant le mode construction, l'hote en le quittant (renvoi de sa partie)."""
+    session = _session
+    if not _connected(session) or not mirror_on(session):
+        return
+    if session.role == 'client' and opened:
+        bridge_notify('Mode construction : vos objets sont posés chez l\'hôte. Murs, sols, toits et terrain : '
+                      'seul l\'hôte peut les faire, puis il vous renvoie sa partie.', key='bb_invite')
+    elif session.role == 'host' and not opened:
+        bridge_notify('Murs, sols ou terrain modifiés ? Pour que l\'invité les voie : Maj + clic sur le sol → '
+                      'Sims4MP… → Partie à deux… → Renvoyer ma partie à l\'invité.', key='bb_hote')
+
 
 def mirror_forward_build_buy(op, values):
     """Invite : envoie un geste de construction/achat a l'hote. Renvoie True si envoye."""
@@ -4540,8 +4609,8 @@ def mirror_lines():
     return ['Simulation unique : {}.'.format(state),
             '  affichage recopié : {} message(s) en {} lot(s), {:.0f} Ko'.format(
                 _mirror['sent'][0], _mirror['batches'], _mirror['sent'][1] / 1024.0),
-            '  gardés sur votre écran : {} , trop gros : {} , abandonnés : {}'.format(
-                _mirror['skipped'], _mirror['too_big'], _mirror['dropped']),
+            '  gardés sur votre écran : {} , découpés : {} , trop gros : {} , abandonnés : {}'.format(
+                _mirror['skipped'], _mirror['split'], _mirror['too_big'], _mirror['dropped']),
             '  objets envoyés à l\'invité : {} créés , {} retirés , Sims apparus : {}'.format(
                 _mirror['objs_sent'], _mirror['objs_removed_sent'], _mirror['spawns_sent']),
             '  construction de l\'invité : {} geste(s) rejoué(s), {} refusé(s)'.format(
@@ -5029,6 +5098,10 @@ def _hook_build_buy():
         def make_wrapper(original):
             def session(*args, **kwargs):
                 _mirror['bb_session'] = opened
+                try:
+                    mirror_build_buy_reminder(opened)
+                except Exception:
+                    _mirror_error('rappel du mode construction')
                 return original(*args, **kwargs)
             return session
         return make_wrapper

@@ -1411,6 +1411,24 @@ mod._mirror['local_send'] = False
 report('notification Sims4MP de ce PC : affichee ici, jamais recopiee',
        SENT == [(0x1, 41, b'85:2')] and len(mod._mirror['out']) == queued)
 mod._mirror['capturing'] = False
+
+# Essai de la 0.23.1 (0.23.2) : poignee en un seul argument avec espaces, gros affichage, argent.
+del PAUSES[:]
+mod._handle_command(host, {'kind': 'cmd', 'name': 'clock.request_pause', 'args': ['Layout Manager Set Modal Visible']})
+report('poignee de pause recue en un seul argument avec espaces : acceptee, en un mot (vu en jeu)',
+       PAUSES == [('pause', 'sims4mp_invite_Layout_Manager_Set_Modal_Visible')], str(PAUSES))
+real_max, real_batch = mod.MIRROR_MAX_RAW, mod.MIRROR_BATCH_BYTES
+mod.MIRROR_MAX_RAW, mod.MIRROR_BATCH_BYTES = 10, 8
+mod._mirror['view_update_id'] = 11
+del mod._mirror['out'][:]
+mod.mirror_capture(11, b'7:3,8:3,9:3')
+mod.MIRROR_MAX_RAW, mod.MIRROR_BATCH_BYTES = real_max, real_batch
+report('gros affichage (arrivee sur un lot) : decoupe par entrees, rien de perdu',
+       mod._mirror['out'] == [(11, b'7:3,8:3'), (11, b'9:3')] and mod._mirror['split'] == 1, str(mod._mirror['out']))
+del mod._mirror['out'][:]
+applied = host.money_applied
+mod._handle_money(host, {'kind': 'money', 'delta': 655, 'household_id': 1})
+report('simulation unique : argent envoye par l\'invite ignore (il etait ajoute deux fois)', host.money_applied == applied)
 mod._mirror['wanted'] = False
 mod._session = guest
 
