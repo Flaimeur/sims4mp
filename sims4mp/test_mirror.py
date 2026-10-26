@@ -131,6 +131,18 @@ class SimSpawnerService(object):
 
 module('sims')
 module('sims.sim_spawner_service', SimSpawnerService=SimSpawnerService)
+
+
+class SimSpawner(object):
+    spawned = []
+
+    @classmethod
+    def spawn_sim(cls, sim_info, sim_position=None, **kwargs):
+        cls.spawned.append(sim_info)
+        return True
+
+
+module('sims.sim_spawner', SimSpawner=SimSpawner)
 LOCAL_CANCELS = []
 
 
@@ -245,36 +257,60 @@ sys.modules['protocolbuffers.Consts_pb2'].MGR_SIM_INFO = 3
 
 
 class _Entries(list):
+    def __init__(self, items=(), make=None):
+        list.__init__(self, items)
+        self.make = make or (lambda: _ViewEntry(0, []))
+
     def add(self):
-        entry = _ViewEntry(0)
+        entry = self.make()
         self.append(entry)
         return entry
 
 
-class _ViewEntry(object):
-    """Entree d'affichage : seul primary_channel.id.manager_id compte ici."""
-
-    def __init__(self, manager_id):
-        self.primary_channel = types.SimpleNamespace(id=types.SimpleNamespace(manager_id=manager_id))
+class _Op(object):
+    def __init__(self, op_type=0):
+        self.type = op_type
 
     def CopyFrom(self, other):
-        self.primary_channel.id.manager_id = other.primary_channel.id.manager_id
+        self.type = other.type
+
+
+class _ViewEntry(object):
+    """Entree d'affichage : objet (primary_channel.id.object_id) et types de ses operations."""
+
+    def __init__(self, object_id, op_types):
+        self.primary_channel = types.SimpleNamespace(id=types.SimpleNamespace(manager_id=1, object_id=object_id))
+        self.operation_list = types.SimpleNamespace(operations=_Entries((_Op(t) for t in op_types), _Op))
+
+    def CopyFrom(self, other):
+        self.primary_channel.id.object_id = other.primary_channel.id.object_id
+        self.operation_list.operations = _Entries((_Op(op.type) for op in other.operation_list.operations), _Op)
 
 
 class _ViewUpdate(object):
-    """Faux ViewUpdate : octets « 1,4,3 » = gestionnaires des entrees."""
+    """Faux ViewUpdate : octets « 7:3.10,8:16 » = objet:types d'operation de chaque entree."""
 
     def __init__(self):
         self.entries = _Entries()
 
     def ParseFromString(self, data):
-        self.entries = _Entries(_ViewEntry(int(v)) for v in data.decode('ascii').split(',') if v)
+        self.entries = _Entries()
+        for part in data.decode('ascii').split(','):
+            if part:
+                obj, ops = part.split(':')
+                self.entries.append(_ViewEntry(int(obj), [int(t) for t in ops.split('.') if t]))
 
     def SerializeToString(self):
-        return ','.join(str(e.primary_channel.id.manager_id) for e in self.entries).encode('ascii')
+        return ','.join('{}:{}'.format(e.primary_channel.id.object_id,
+                                       '.'.join(str(op.type) for op in e.operation_list.operations))
+                        for e in self.entries).encode('ascii')
 
 
 module('protocolbuffers.Distributor_pb2', ViewUpdate=_ViewUpdate)
+# Operations du jeu : FOCUS 10 et HOVERTIP_CREATED 277 sont propres a l'ecran, SET_LOCATION 3 et
+# UI_NOTIFICATION_SHOW 166 non (vraies valeurs de DistributorOps_pb2.Operation).
+module('protocolbuffers.DistributorOps_pb2', Operation=types.SimpleNamespace(
+    FOCUS=10, HOVERTIP_CREATED=277, SET_LOCATION=3, UI_NOTIFICATION_SHOW=166))
 
 
 class _DialogMessage(object):
@@ -578,9 +614,10 @@ def events(endpoint, kind):
     return [m['data'] for m in endpoint.sent if m['type'] == protocol.EVENT and m['data'].get('kind') == kind]
 
 
-report('accroches installees : ligne du temps, horloge, PNJ, croix, fenetres, objets, construction, commandes',
-       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'croix', 'fenetres', 'objets', 'construction',
-                                'commandes', 'fenetres de l\'invite'], str(mod._mirror['hooks']))
+report('accroches installees : ligne du temps, horloge, PNJ, apparitions, croix, fenetres, objets, construction, '
+       'commandes',
+       mod._mirror['hooks'] == ['ligne du temps', 'horloge', 'PNJ', 'apparitions', 'croix', 'fenetres', 'objets',
+                                'construction', 'commandes', 'fenetres de l\'invite'], str(mod._mirror['hooks']))
 
 # --- 1. Hote : choix, annonce, confirmation ---------------------------------------------------
 host = mod.NetSession('host', Endpoint())
@@ -687,21 +724,33 @@ del SENT[:]
 mod._handle_view(guest, {'kind': 'view', 'm': [[11, 'pas du base64 !'], ['11', 'AA=='], [-1, 'AA=='], 'x']})
 mod._handle_view(guest, {'kind': 'view', 'm': 'pas une liste'})
 report('entrees invalides ignorees', not SENT and mod._mirror['ignored'] == 4)
-omega.send(0xABC, 11, b'1,4,3')
-omega.send(0xABC, 11, b'1,3')
+omega.send(0xABC, 11, b'7:3.10,8:3,9:277')
+omega.send(0xABC, 11, b'7:3.166')
 omega.send(0xABC, 159, b'humeur locale')
 omega.send(0xABC, 40, b'5:2')
-report('affichage du jeu fige de l\'invite : etat des objets et Sims retire, client et fenetres gardes (0.21.7)',
-       SENT == [(0xABC, 11, b'4'), (0xABC, 40, b'5:2')] and mod._mirror['own_entries_dropped'] == 4
-       and mod._mirror['own_messages_dropped'] == 1, str(SENT))
+omega.send(0xABC, 210, b'etat de connexion')
+report('affichage du jeu fige de l\'invite : liste blanche de S4MP (survol, menus, fenetres), le reste vient '
+       'de l\'hote (0.23.0)',
+       SENT == [(0xABC, 11, b'7:10,9:277'), (0xABC, 40, b'5:2'), (0xABC, 210, b'etat de connexion')]
+       and mod._mirror['own_entries_dropped'] == 4 and mod._mirror['own_messages_dropped'] == 1, str(SENT))
 del SENT[:]
-mod._handle_view(guest, {'kind': 'view', 'm': [[11, base64.b64encode(b'1,3').decode('ascii')]]})
-report('message de l\'hote : jamais filtre', SENT == [(0xABC, 11, b'1,3')])
+mod._mirror['own_shown'].add(8)
+omega.send(0xABC, 11, b'7:3,8:3.1')
+mod._mirror['own_shown'].clear()
+report('Sim affiche par l\'invite lui-meme (present chez l\'hote avant la recopie) : son entree passe',
+       SENT == [(0xABC, 11, b'8:3.1')], str(SENT))
+del SENT[:]
+ZONE.is_zone_running = False
+omega.send(0xABC, 159, b'chargement')
+ZONE.is_zone_running = True
+mod._handle_view(guest, {'kind': 'view', 'm': [[11, base64.b64encode(b'7:3').decode('ascii')]]})
+report('chargement (zone arretee) et messages de l\'hote : jamais filtres',
+       SENT == [(0xABC, 159, b'chargement'), (0xABC, 11, b'7:3')], str(SENT))
 del SENT[:]
 mod._mirror['bb_session'] = True
-omega.send(0xABC, 11, b'1,4')
+omega.send(0xABC, 11, b'7:3')
 mod._mirror['bb_session'] = False
-report('mode construction : son propre affichage n\'est pas filtre', SENT == [(0xABC, 11, b'1,4')])
+report('mode construction : son propre affichage n\'est pas filtre', SENT == [(0xABC, 11, b'7:3')])
 del SENT[:]
 
 # --- 7. Invite : clics et croix partent a l'hote --------------------------------------------------
@@ -1278,6 +1327,72 @@ mod._handle_roster(guest, {'kind': 'roster', 'zone_id': 99, 'list': [
 report('revenu chez l\'hote : de nouveau affiche chez l\'invite',
        ('ajout', 5005) in Distributor.shown and 5005 not in mod._mirror['hidden'], str(Distributor.shown))
 SIMS.pop()
+
+# --- 16b. Comme S4MP (0.23.0) : apparitions venues de l'hote, fenetres en chaine ---------------------
+# Invite : son jeu ne fait plus apparaitre de Sims de lui-meme pendant que la zone tourne.
+mod._session = guest
+mod._mirror['active'] = True
+SimSpawner.spawned = []
+blocked = SimSpawner.spawn_sim('passant de sa rue')
+mod._mirror['spawning'] = True
+allowed = SimSpawner.spawn_sim('demande par l\'hote')
+mod._mirror['spawning'] = False
+ZONE.is_zone_running = False
+loading = SimSpawner.spawn_sim('chargement du lot')
+ZONE.is_zone_running = True
+report('invite : apparitions de son propre jeu refusees zone en marche (permises pour l\'hote et au chargement)',
+       blocked is False and allowed is True and loading is True and mod._mirror['spawns_blocked'] == 1
+       and SimSpawner.spawned == ['demande par l\'hote', 'chargement du lot'], str(SimSpawner.spawned))
+
+# Hote : chaque Sim apparu est annonce aussitot.
+mod._session = host
+mod._mirror['wanted'] = True
+real_snapshot = mod.bridge_sim_snapshot
+mod.bridge_sim_snapshot = lambda sim_id: {'sim_id': sim_id, 'name': 'Passant', 'x': 2.0, 'y': 0.0, 'z': 3.0}
+mod.mirror_object_added(types.SimpleNamespace(is_sim=True, id=6006))
+mod._mirror_flush_spawns(host)
+mod.bridge_sim_snapshot = real_snapshot
+announced = events(host.endpoint, 'spawned')
+report('hote : Sim apparu annonce a l\'invite au passage suivant, sans attendre la presence (30 s)',
+       announced and announced[-1]['list'][0]['sim_id'] == 6006 and announced[-1]['list'][0]['vu'] is True
+       and not mod._mirror['spawns_out'] and mod._mirror['spawns_sent'] == 1, str(announced))
+
+# Invite : l'annonce est rejouee tout de suite.
+mod._session = guest
+del spawned[:]
+SIMS.append(Sim(6006))
+mod._handle_spawned(guest, announced[-1])
+report('invite : Sim annonce par l\'hote rejoue aussitot, sans affichage propre',
+       spawned == [6006] and 6006 in mod._mirror['replicas'], str(spawned))
+SIMS.pop()
+
+# Hote : une fenetre ouverte par la reponse de l'invite (menus en chaine d'un mod) va chez lui.
+mod._session = host
+mod._mirror['capturing'] = True
+del SENT[:]
+omega.send(0x1, 40, b'81:2')                         # fenetre du Sim de l'invite : chez lui
+DIALOGS.dialog_show(types.SimpleNamespace(dialog_id=82, _resolver=None, owner=None))
+report('fenetre suivante sans autre proprietaire, avant sa reponse : chez l\'invite aussi (comme S4MP)',
+       81 in mod._mirror['dialogs'] and 82 in mod._mirror['guest_dialog_ids'])
+real_answer = mod.bridge_answer_dialog
+mod.bridge_answer_dialog = lambda how, dialog_id, values: DIALOGS.dialog_show(
+    types.SimpleNamespace(dialog_id=83, _resolver=None, owner=None)) or True
+mod._handle_dialog(host, {'kind': 'dialog', 'how': 'respond', 'id': 81, 'values': [1]})
+mod.bridge_answer_dialog = real_answer
+DIALOGS.dialog_show(types.SimpleNamespace(dialog_id=84, _resolver=None, owner=None))
+report('fenetre ouverte par sa reponse : chez l\'invite ; apres sa reponse, les autres restent chez l\'hote',
+       83 in mod._mirror['guest_dialog_ids'] and 84 not in mod._mirror['guest_dialog_ids']
+       and mod._mirror['sticky_until'] == 0.0)
+del SENT[:]
+queued = len(mod._mirror['out'])
+mod._mirror['local_send'] = True
+omega.send(0x1, 41, b'85:2')
+mod._mirror['local_send'] = False
+report('notification Sims4MP de ce PC : affichee ici, jamais recopiee',
+       SENT == [(0x1, 41, b'85:2')] and len(mod._mirror['out']) == queued)
+mod._mirror['capturing'] = False
+mod._mirror['wanted'] = False
+mod._session = guest
 
 # --- 17. Etat, commande de secours, fin ------------------------------------------------------------
 del _CheatOutput.lines[:]
