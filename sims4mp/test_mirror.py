@@ -310,7 +310,8 @@ module('protocolbuffers.Distributor_pb2', ViewUpdate=_ViewUpdate)
 # Operations du jeu : FOCUS 10 et HOVERTIP_CREATED 277 sont propres a l'ecran, SET_LOCATION 3 et
 # UI_NOTIFICATION_SHOW 166 non (vraies valeurs de DistributorOps_pb2.Operation).
 module('protocolbuffers.DistributorOps_pb2', Operation=types.SimpleNamespace(
-    FOCUS=10, HOVERTIP_CREATED=277, SET_LOCATION=3, UI_NOTIFICATION_SHOW=166))
+    FOCUS=10, HOVERTIP_CREATED=277, SET_LOCATION=3, UI_NOTIFICATION_SHOW=166, OBJECT_DELETE=1, OBJECT_CREATE=41,
+    UI_UPDATE=16, SET_GAME_TIME=150, NOTEBOOK_VIEW=1100))
 
 
 class _DialogMessage(object):
@@ -736,8 +737,9 @@ report('affichage du jeu fige de l\'invite : liste blanche de S4MP (survol, menu
 del SENT[:]
 mod._mirror['own_shown'].add(8)
 omega.send(0xABC, 11, b'7:3,8:3.1')
+omega.send(0xABC, 11, b'8:3')
 mod._mirror['own_shown'].clear()
-report('Sim affiche par l\'invite lui-meme (present chez l\'hote avant la recopie) : son entree passe',
+report('Sim affiche par l\'invite lui-meme : son apparition/retrait passe, pas ses autres operations (0.23.3)',
        SENT == [(0xABC, 11, b'8:3.1')], str(SENT))
 del SENT[:]
 ZONE.is_zone_running = False
@@ -1429,7 +1431,57 @@ del mod._mirror['out'][:]
 applied = host.money_applied
 mod._handle_money(host, {'kind': 'money', 'delta': 655, 'household_id': 1})
 report('simulation unique : argent envoye par l\'invite ignore (il etait ajoute deux fois)', host.money_applied == applied)
+
+# Journaux des deux PC (0.23.3) : fenetres d'interface, heure, liste de presence.
+mod._mirror['capturing'] = True
+mod._mirror['guest_ui_until'] = 0.0
+del SENT[:]
+omega.send(0x1, 11, b'7:3.1100,8:10.150')
+report('hote : son carnet et sa camera restent chez lui, son heure n\'est plus envoyee ; le reste part a l\'invite',
+       SENT == [(0x1, 11, b'7:3.1100,8:10.150')] and mod._mirror['out'][-1] == (11, b'7:3'), str(mod._mirror['out']))
+del SENT[:]
+mod.mirror_guest_ui_window()
+omega.send(0x1, 11, b'7:3.1100')
+report('hote : fenetre demandee par l\'invite (carnet, evenement) : chez lui seulement',
+       SENT == [(0x1, 11, b'7:3')] and mod._mirror['out'][-1] == (11, b'7:3.1100'), str(SENT))
+mod._mirror['guest_ui_until'] = 0.0
+mod._mirror['capturing'] = False
+del mod._mirror['out'][:]
+real_values = mod.bridge_clock_values
+mod.bridge_clock_values = lambda game_clock: {'game_time': 5000, 'game_speed': 1.0, 'clock_speed': 1,
+                                              'initial_ticks': 7, 'super_speed': False}
+mod.mirror_send_clock(object())
+mod.bridge_clock_values = real_values
+clock_ops = events(host.endpoint, 'clock_op')
+report('hote : heure de jeu envoyee a l\'invite, sans les horloges de son PC',
+       clock_ops and clock_ops[-1]['game_time'] == 5000 and 'monotonic_time' not in clock_ops[-1], str(clock_ops))
+host.roster_sent_at = 999.0
+mod._handle_host_event(host, 'message', {'type': protocol.EVENT, 'v': 1, 'data': {'kind': 'roster_request'}})
+report('hote : liste de presence renvoyee des que l\'invite arrive sur le lot', host.roster_sent_at == 0.0)
 mod._mirror['wanted'] = False
+
+mod._session = guest
+applied_clock = []
+real_apply = mod.bridge_apply_host_clock
+mod.bridge_apply_host_clock = lambda values: applied_clock.append(values) or True
+mod._handle_clock_op(guest, dict(clock_ops[-1]))
+mod._handle_clock_op(guest, {'kind': 'clock_op', 'game_time': 'x', 'game_speed': 1.0, 'clock_speed': 1,
+                             'initial_ticks': 7, 'super_speed': False})
+mod.bridge_apply_host_clock = real_apply
+report('invite : heure de l\'hote refaite avec ses horloges ; heure invalide ignoree',
+       len(applied_clock) == 1 and applied_clock[0]['game_time'] == 5000 and mod._mirror['clock_applied'] == 1)
+advanced = []
+real_advance = mod.bridge_advance_clock
+mod.bridge_advance_clock = lambda seconds: advanced.append(seconds)
+mod._handle_clock(guest, {'kind': 'clock', 'seconds': 10.0 ** 6, 'speed': 1})
+mod._handle_clock(guest, {'kind': 'clock', 'seconds': 10.0 ** 6, 'speed': 1})
+mod.bridge_advance_clock = real_advance
+report('invite en simulation unique : plus de recalage ni de pause de son horloge (pauses de l\'hote en boucle)',
+       not advanced)
+mod._mirror['zone_seen'] = False
+mod._mirror_tick(guest, 5000.0)
+report('invite : arrivee sur un lot, liste de presence demandee a l\'hote',
+       events(guest.endpoint, 'roster_request') and mod._mirror['zone_seen'] is True)
 mod._session = guest
 
 # --- 17. Etat, commande de secours, fin ------------------------------------------------------------

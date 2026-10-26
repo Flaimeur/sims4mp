@@ -1,4 +1,12 @@
-# Sims 4 Multiplayer - essai de la 0.23.1 (0.23.2) : en simulation unique l'argent n'est plus synchronise
+# Sims 4 Multiplayer - journaux des deux PC (0.23.3), comme S4MP : l'invite refait l'heure de l'hote avec
+# ses propres horloges (EVENT clock_op ; l'operation SetGameTime de l'hote portait l'heure de son PC :
+# heure decalee de 2 min, trajets et animations deja finis a l'arrivee) ; plus de recalage ni de pause de
+# l'horloge de l'invite en simulation unique (ses changements de vitesse mettaient l'hote en pause en
+# boucle) ; les fenetres d'interface de l'hote (carnet, preparation d'evenement...) restent chez lui, et
+# celles demandees par l'invite vont chez lui seulement ; carnet, planificateur d'evenements et voyage de
+# l'invite joues chez l'hote ; Sims affiches par l'invite lui-meme : seulement leur apparition ; liste de
+# presence demandee des l'arrivee sur un lot.
+# Essai de la 0.23.1 (0.23.2) : en simulation unique l'argent n'est plus synchronise
 # a part (le gain du jeu de l'invite pendant un voyage etait ajoute deux fois chez l'hote) ; poignee de
 # pause recue en un seul argument avec espaces acceptee ; gros affichage (806 Ko a l'arrivee d'un voyage)
 # decoupe au lieu d'etre perdu ; rappels murs/sols a l'ouverture (invite) et la sortie (hote) du mode
@@ -290,7 +298,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.23.2'
+MOD_VERSION = '0.23.3'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -402,6 +410,18 @@ MIRROR_LOCAL_OPS = (
 MIRROR_LOCAL_MESSAGES = ('MSG_OBJECT_IS_INTERACTABLE', 'MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE',
                          'MSG_UI_DIALOG_SHOW', 'MSG_GAME_SAVE_LOCK_UNLOCK', 'MSG_SHOW_SIM_PROFILE')
 MIRROR_STICKY_SECONDS = 60.0              # hote : fenetres suivant une fenetre de l'invite, a lui aussi
+# Hote (0.23.3, comme S4MP) : operations de son propre ecran, jamais envoyees a l'invite (camera, survol,
+# Sim actif, client, heure : l'invite refait l'heure avec ses propres horloges).
+MIRROR_HOST_SCREEN_OPS = ('FOCUS', 'HOVERTIP_CREATED', 'SET_SIM_ACTIVE', 'SET_VFX_MASK', 'CLIENT_CREATE',
+                          'CLIENT_DELETE', 'SET_GAME_TIME')
+# Fenetres d'interface en UI_UPDATE (shared_messages.MessageOp : data_context = type de message) : comme les
+# autres operations d'interface de MIRROR_LOCAL_OPS, elles vont a celui qui les a demandees.
+MIRROR_UI_CONTEXTS = ('MSG_SITUATION_PREPARE', 'MSG_UI_SCREEN_SLAM', 'MSG_MANAGE_EMPLOYEES_DIALOG',
+                      'MSG_SHOW_SMALL_BUSINESS_CONFIGURATOR', 'MSG_MANAGE_SMALL_BUSINESS_EMPLOYEES_DIALOG',
+                      'MSG_MANAGE_SMALL_BUSINESS_EMPLOYEE_TASKS_DIALOG', 'MSG_EXTEND_VACATION',
+                      'MSG_SHOW_DYNASTY_CONFIGURATOR')
+MIRROR_GUEST_UI_SECONDS = 2.0             # hote : apres une commande de l'invite, ses fenetres vont chez lui
+MIRROR_CLOCK_INTERVAL = 10.0              # hote : heure renvoyee a l'invite au moins toutes les 10 s
 MIRROR_REFUSE_REASON = 'Sims4MP : action envoyée à l\'hôte (simulation unique).'
 MIRROR_OBJECTS_MAX = 200                  # objets crees / retires au plus par message « objects » (0.20.2)
 MIRROR_DIALOGS_MAX = 100                  # hote : fenetres envoyees a l'invite gardees (reponses acceptees)
@@ -472,6 +492,22 @@ MIRROR_COMMANDS = {
     'university.enroll': ('sims.university.university_commands', 'enroll'),
     'university.dropout': ('sims.university.university_commands', 'dropout'),
     'university.withdraw': ('sims.university.university_commands', 'withdraw'),
+    # Carnet, planificateur d'evenements (calendrier) et voyage de l'invite (0.23.3, comme S4MP pour les
+    # deux premiers) : calcules chez l'hote, la fenetre revient a l'invite ; le voyage part de l'hote,
+    # que l'invite suit tout seul.
+    'notebook.generate_notebook': ('notebook.notebook_commands', 'generate_notebook'),
+    'situations.get_situation_ids': ('server_commands.situation_commands', 'get_situation_ids'),
+    'situations.get_situation_data': ('server_commands.situation_commands', 'get_situation_data'),
+    'situations.get_prepopulated_job_for_sims': ('server_commands.situation_commands', 'get_prepopulated_job_for_sims'),
+    'situations.get_sims_for_job': ('server_commands.situation_commands', 'get_sims_for_job'),
+    'situations.get_valid_situation_locations': ('server_commands.situation_commands', 'get_valid_situation_locations'),
+    'situations.start_situation_creation': ('server_commands.situation_commands', 'start_situation_creation'),
+    'situations.start_situation_creation_for_edit': ('server_commands.situation_commands',
+                                                     'start_situation_creation_for_edit'),
+    'situations.create_gl': ('server_commands.situation_commands', 'create_situation_with_guest_list'),
+    'situations.destroy_user_facing_situation': ('server_commands.situation_commands', 'destroy_user_facing_situation'),
+    'situations.ui_element_interacted': ('server_commands.situation_commands', 'ui_element_interacted'),
+    'travel.travel_sims_to_zone': ('world.travel_commands', 'travel_sims_to_zone'),
     'notebook.mark_entry_as_seen': ('notebook.notebook_commands', 'mark_entry_as_seen'),
     'notebook.save_notes': ('notebook.notebook_commands', 'save_notes'),
     'notebook.hide_category': ('notebook.notebook_commands', 'hide_category'),
@@ -1251,7 +1287,7 @@ def bridge_deliver_view(msg_id, data):
     return True
 
 
-def bridge_filter_own_view(data, keep_ops, keep_objects):
+def bridge_filter_own_view(data, keep_ops, keep_objects, whole_ops=frozenset()):
     """Invite (0.23.0, comme S4MP) : d'un message d'affichage de son propre jeu (protocolbuffers
     .Distributor_pb2.ViewUpdate), ne garde que les operations propres a son ecran (entries[]
     .operation_list.operations[].type dans keep_ops) ; l'etat du monde vient de l'hote. Les entrees
@@ -1263,10 +1299,13 @@ def bridge_filter_own_view(data, keep_ops, keep_objects):
     filtered = Distributor_pb2.ViewUpdate()
     removed = 0
     for entry in message.entries:
-        if entry.primary_channel.id.object_id in keep_objects:
+        operations = entry.operation_list.operations
+        if entry.primary_channel.id.object_id in keep_objects and (
+                not whole_ops or any(op.type in whole_ops for op in operations)):
+            # Sim qu'il affiche lui-meme : seulement son apparition / son retrait (0.23.3) ; ses autres
+            # operations (jeu fige) se battaient avec celles de l'hote (Sim teleporte, animation coupee).
             filtered.entries.add().CopyFrom(entry)
             continue
-        operations = entry.operation_list.operations
         kept = [op for op in operations if op.type in keep_ops]
         removed += len(operations) - len(kept)
         if not kept:
@@ -1309,6 +1348,94 @@ def bridge_split_view(data, limit):
     if current is not None:
         parts.append(current.SerializeToString())
     return parts
+
+
+def bridge_route_host_view(data, host_ops, ui_ops, ui_update, ui_contexts, ui_to_guest):
+    """Hote (0.23.3, comme S4MP) : partage un ViewUpdate de son jeu entre son ecran et l'invite. Les
+    operations de son ecran (host_ops) restent chez lui ; les fenetres d'interface (ui_ops, ou UI_UPDATE
+    dont data_context est dans ui_contexts) vont a l'invite si ui_to_guest, sinon restent chez lui ;
+    le reste va aux deux. Renvoie (octets pour l'hote, octets pour l'invite, fenetres envoyees a
+    l'invite), None quand une part est vide ; data tel quel si rien n'est retire."""
+    from protocolbuffers import Distributor_pb2
+    message = Distributor_pb2.ViewUpdate()
+    message.ParseFromString(bytes(data))
+    parts = {'host': Distributor_pb2.ViewUpdate(), 'guest': Distributor_pb2.ViewUpdate()}
+    changed = {'host': False, 'guest': False}
+    ui_count = 0
+    for entry in message.entries:
+        kept = {'host': [], 'guest': []}
+        for op in entry.operation_list.operations:
+            if op.type in host_ops:
+                sides = ('host',)
+            elif op.type in ui_ops or (op.type == ui_update and getattr(op, 'data_context', None) in ui_contexts):
+                sides = ('guest',) if ui_to_guest else ('host',)
+                ui_count += 1
+            else:
+                sides = ('host', 'guest')
+            for side in sides:
+                kept[side].append(op)
+        for side in ('host', 'guest'):
+            total = len(entry.operation_list.operations)
+            if len(kept[side]) != total:
+                changed[side] = True
+            if not kept[side]:
+                continue
+            copy = parts[side].entries.add()
+            copy.CopyFrom(entry)
+            if len(kept[side]) != total:
+                del copy.operation_list.operations[:]
+                for op in kept[side]:
+                    copy.operation_list.operations.add().CopyFrom(op)
+    result = []
+    for side in ('host', 'guest'):
+        if not changed[side]:
+            result.append(data)
+        else:
+            result.append(parts[side].SerializeToString() if parts[side].entries else None)
+    return result[0], result[1], ui_count
+
+
+def bridge_clock_values(game_clock):
+    """Hote : heure de jeu a envoyer a l'invite, lue comme GameClock._sync_clock_and_broadcast_gameclock
+    (clock.pyc) : sans server_time ni monotonic_time, propres a chaque PC."""
+    from clock import ClockSpeedMode
+    clock_speed = game_clock.clock_speed
+    super_speed = clock_speed == ClockSpeedMode.SUPER_SPEED3
+    if super_speed:
+        clock_speed = ClockSpeedMode.SPEED3
+    startup = clock_speed == ClockSpeedMode.INTERACTION_STARTUP_SPEED
+    return {'game_time': None if startup else int(game_clock._game_clock._ticks),
+            'game_speed': float(game_clock.current_clock_speed_scale()), 'clock_speed': int(clock_speed),
+            'initial_ticks': int(game_clock._initial_ticks), 'super_speed': bool(super_speed)}
+
+
+def bridge_apply_host_clock(values):
+    """Invite (0.23.3, comme S4MP) : refait l'operation SetGameTime de l'hote avec ses propres horloges
+    (services.server_clock_service().ticks(), _loading_monotonic_ticks) et l'envoie tout de suite a son
+    ecran. Transmettre celle de l'hote decalait l'heure (2 min) et faisait arriver trajets et animations
+    deja finis (Sims teleportes, animations coupees)."""
+    import clock
+    import services
+    from clock import ClockSpeedMode
+    from distributor.ops import SetGameTime
+    from distributor.system import Distributor
+    game_clock = services.game_clock_service()
+    server_time = services.server_clock_service().ticks()
+    clock_speed = ClockSpeedMode(values['clock_speed'])
+    if values['game_time'] is None or clock_speed == ClockSpeedMode.INTERACTION_STARTUP_SPEED:
+        game_time = monotonic_time = game_clock._loading_monotonic_ticks
+    else:
+        game_time = values['game_time']
+        monotonic_time = game_time + game_clock._loading_monotonic_ticks
+    clock.g_set_game_time_serial_number += 1
+    op = SetGameTime(server_time, monotonic_time, game_time, values['game_speed'], clock_speed,
+                     values['initial_ticks'], values['super_speed'], clock.g_set_game_time_serial_number)
+    _mirror['local_send'] = True
+    try:
+        Distributor.instance().send_op_with_no_owner_immediate(op)
+    finally:
+        _mirror['local_send'] = False
+    return True
 
 
 def bridge_local_op_types(names):
@@ -1906,6 +2033,8 @@ def _handle_host_event(session, kind, value):
                 _handle_gaps(session, data)
             elif data.get('kind') == 'mirror_ready':
                 _handle_mirror_ready(session, data)
+            elif data.get('kind') == 'roster_request':
+                session.roster_sent_at = 0.0         # invite arrive sur un lot : liste au prochain passage
             elif data.get('kind') == 'cancel_si':
                 _handle_cancel_si(session, data)
             elif data.get('kind') == 'dialog':
@@ -1988,6 +2117,8 @@ def _handle_client_event(session, kind, value):
                 _handle_roster(session, value['data'])
             elif value['data'].get('kind') == 'spawned':
                 _handle_spawned(session, value['data'])
+            elif value['data'].get('kind') == 'clock_op':
+                _handle_clock_op(session, value['data'])
             elif value['data'].get('kind') == 'view':
                 _handle_view(session, value['data'])
             elif value['data'].get('kind') == 'objects':
@@ -2488,6 +2619,8 @@ def _handle_money(session, data):
 def _clock_tick(session, now):
     if not (session.endpoint.is_connected and session.handshake_done):
         return
+    if mirror_on(session):
+        return                                       # simulation unique : heure par EVENT clock_op (0.23.3)
     if session.role != 'host' or now - session.clock_sent_at < CLOCK_INTERVAL:
         return
     session.clock_sent_at = now
@@ -2525,6 +2658,13 @@ def _set_clock_request(value):
 
 
 def _handle_clock(session, data):
+    if mirror_on(session):
+        # Simulation unique (0.23.3) : plus de recalage ni de pause de l'horloge de l'invite. Ses changements
+        # de vitesse etaient pris pour des clics et renvoyes a l'hote, qui se mettait en pause en boucle
+        # (animations coupees, Sims teleportes). L'heure affichee vient de l'hote (EVENT clock_op).
+        if _sync['clock_request'] is not None:
+            _set_clock_request(None)
+        return
     seconds = _clean_float(data.get('seconds'), 10.0 ** 13)
     speed = _clean_int(data.get('speed'), 0, 16)
     if seconds is None or seconds < 0 or speed is None or not _safe('vitesse', bridge_valid_speed, speed):
@@ -2604,6 +2744,8 @@ def on_player_speed_change():
     session = _session
     if session is None or session.role != 'client' or not session.handshake_done:
         return
+    if _mirror['active'] and (_mirror['traveling'] or not _read('zone', bridge_zone_running)):
+        return                                       # chargement ou voyage : pause du jeu, pas un clic (0.23.3)
     speed = _safe('lecture vitesse du joueur', bridge_player_speed)
     if speed is None or speed not in PLAYER_SPEEDS:
         # 4 (INTERACTION_STARTUP_SPEED) et 5 (SUPER_SPEED3) sont poses par le jeu lui-meme
@@ -3743,8 +3885,11 @@ def _install_traffic_hook():
             return original(session_id, msg_id, data, *args, **kwargs)   # notification Sims4MP de ce PC
         if _mirror['capturing']:
             try:
-                if mirror_capture(msg_id, data) == 'guest':
+                captured = mirror_capture(msg_id, data)
+                if captured == 'guest':
                     return None                      # fenetre du Sim de l'invite : chez lui seulement
+                if isinstance(captured, (bytes, bytearray)):
+                    data = captured                  # sans les fenetres envoyees a l'invite (0.23.3)
             except Exception:
                 _mirror_error('recopie d\'un message')
         if _mirror['active'] and not _mirror['delivering']:
@@ -3827,6 +3972,14 @@ _mirror = {
     'own_shown': set(),      # invite : Sims qu'il affiche lui-meme (presents chez l'hote avant la recopie)
     'spawning': False,       # invite : apparition demandee par l'hote en cours (spawn_sim permis)
     'spawns_blocked': 0,     # invite : apparitions de son propre jeu refusees (elles viennent de l'hote)
+    'route': None,           # hote : (ops de son ecran, ops d'interface, UI_UPDATE, contextes) lus a la demande
+    'guest_ui_until': 0.0,   # hote : fenetres d'interface pour l'invite jusqu'a cet instant (0.23.3)
+    'ui_routed': [0, 0],     # hote : fenetres d'interface gardees chez lui, envoyees a l'invite
+    'create_ops': None,      # invite : OBJECT_CREATE / OBJECT_DELETE (affichage des Sims qu'il montre lui-meme)
+    'clock_sent_at': 0.0,    # hote : dernier envoi de l'heure a l'invite
+    'clock_sent': 0,
+    'clock_applied': 0,      # invite : heures de l'hote refaites avec ses horloges
+    'zone_seen': False,      # invite : zone en marche au dernier passage (liste de presence demandee a l'arrivee)
     'spawns_out': [],        # hote : Sims apparus depuis le dernier passage, envoyes aussitot (0.23.0)
     'spawns_sent': 0,
     'hidden': set(),         # invite : Sims de sa partie absents chez l'hote, retires de son ecran (0.22.0)
@@ -4089,6 +4242,8 @@ def _handle_command(session, data):
     finally:
         _sync['pushing'] = False
         _mirror['for_guest'] -= 1
+        if not name.startswith('clock.'):
+            mirror_guest_ui_window()                 # carnet, factures, evenement... : chez lui (0.23.3)
     _mirror['commands_applied' if done else 'commands_failed'] += 1
     log('[host] commande de l\'invite {} : {}'.format(name, 'jouee' if done else 'non jouee'))
 
@@ -4138,6 +4293,7 @@ def _apply_guest_choice(tokens):
         result = _safe('choix de l\'invite dans un menu', menu.select, choice_id)
     finally:
         _mirror['for_guest'] -= 1
+        mirror_guest_ui_window()                     # « Organiser un evenement »... : chez lui (0.23.3)
     log('[host] choix {} de l\'invite applique : {}'.format(choice_id, result))
 
 
@@ -4247,6 +4403,7 @@ def _handle_dialog(session, data):
         _sync['pushing'] = False
         _mirror['for_guest'] -= 1
         _mirror['sticky_until'] = 0.0                # il a repondu : fin du suivi (comme S4MP)
+        mirror_guest_ui_window()
     if done:
         _mirror['dialog_applied'] += 1
         log('[host] fenetre {} : reponse de l\'invite appliquee ({})'.format(dialog_id, how))
@@ -4266,12 +4423,14 @@ def mirror_filter_own(msg_id, data):
         _mirror['local_messages'] = frozenset(_mirror_host_only() | frozenset(
             m for m, name in names.items() if name in MIRROR_LOCAL_MESSAGES))
         _mirror['local_ops'] = bridge_local_op_types(MIRROR_LOCAL_OPS)
+        _mirror['create_ops'] = bridge_local_op_types(('OBJECT_CREATE', 'OBJECT_DELETE', 'OBJECT_REPLACE'))
     if msg_id != _mirror['view_update_id']:
         if msg_id in _mirror['local_messages']:
             return data
         _mirror['own_messages_dropped'] += 1         # besoins, humeur, situations... : ceux de l'hote
         return None
-    filtered, removed = bridge_filter_own_view(data, _mirror['local_ops'], _mirror['own_shown'])
+    filtered, removed = bridge_filter_own_view(data, _mirror['local_ops'], _mirror['own_shown'],
+                                               _mirror['create_ops'] or frozenset())
     if removed:
         _mirror['own_entries_dropped'] += removed
     return filtered
@@ -4293,6 +4452,16 @@ def mirror_capture(msg_id, data):
     if msg_id in host_only:
         _mirror['skipped'] += 1
         return None
+    result = None
+    if msg_id == _mirror['view_update_id']:
+        routed = _mirror_route_view(data)
+        if routed is not None:
+            host_part, guest_part = routed
+            if host_part is not data:
+                result = host_part if host_part is not None else 'guest'   # ecran de l'hote allege
+            if guest_part is None:
+                return result
+            data = guest_part
     out = _mirror['out']
     if len(data) > MIRROR_MAX_RAW:
         parts = None
@@ -4303,7 +4472,7 @@ def mirror_capture(msg_id, data):
             _mirror['too_big'] += 1
             if _mirror['too_big'] <= 5:
                 log('simulation unique : message {} trop gros ({} octets), non recopie'.format(msg_id, len(data)))
-            return
+            return result
         _mirror['split'] += 1
         log('simulation unique : gros affichage ({} octets) decoupe en {} parties'.format(len(data), len(parts)))
         out.extend((msg_id, part) for part in parts)
@@ -4313,6 +4482,38 @@ def mirror_capture(msg_id, data):
         _mirror['dropped'] += len(out)
         log('simulation unique : file pleine, {} messages abandonnes (resynchro conseillee)'.format(len(out)))
         del out[:]
+    return result
+
+
+def _mirror_route_view(data):
+    """Hote : (octets pour son ecran, octets pour l'invite) d'un ViewUpdate, ou None en cas d'erreur
+    (tout part alors des deux cotes, comme avant 0.23.3)."""
+    if _mirror['route'] is None:
+        names = _message_names()
+        ui_names = tuple(name for name in MIRROR_LOCAL_OPS if name not in MIRROR_HOST_SCREEN_OPS)
+        ui_update = bridge_local_op_types(('UI_UPDATE',))
+        _mirror['route'] = (bridge_local_op_types(MIRROR_HOST_SCREEN_OPS), bridge_local_op_types(ui_names),
+                            next(iter(ui_update), None),
+                            frozenset(m for m, name in names.items() if name in MIRROR_UI_CONTEXTS))
+    host_ops, ui_ops, ui_update, ui_contexts = _mirror['route']
+    to_guest = time.monotonic() < _mirror['guest_ui_until']
+    try:
+        host_part, guest_part, ui_count = bridge_route_host_view(data, host_ops, ui_ops, ui_update, ui_contexts,
+                                                                 to_guest)
+    except Exception:
+        _mirror_error('partage de l\'affichage de l\'hote')
+        return None
+    if ui_count:
+        _mirror['ui_routed'][1 if to_guest else 0] += ui_count
+        if to_guest:
+            log('[host] fenetre d\'interface demandee par l\'invite : ouverte chez lui seulement')
+    return host_part, guest_part
+
+
+def mirror_guest_ui_window():
+    """Hote : une commande, un choix ou une reponse de l'invite vient d'etre joue ; les fenetres
+    d'interface des prochaines secondes (carnet, factures, preparation d'evenement...) sont pour lui."""
+    _mirror['guest_ui_until'] = time.monotonic() + MIRROR_GUEST_UI_SECONDS
 
 
 def _mirror_clear_out():
@@ -4575,6 +4776,16 @@ def _mirror_tick(session, now):
         _mirror_flush_objects(session)               # avant l'affichage qui parle de ces objets
         _mirror_flush_spawns(session)
         _mirror_flush(session)
+        if now - _mirror['clock_sent_at'] >= MIRROR_CLOCK_INTERVAL and _read('zone', bridge_zone_running):
+            _safe('heure envoyee a l\'invite', mirror_send_clock)
+    if session.role == 'client' and _mirror['active'] and _connected(session):
+        running = bool(_read('zone', bridge_zone_running)) and not _mirror['traveling']
+        if running and not _mirror['zone_seen']:
+            # Arrivee sur un lot (0.23.3) : liste de presence demandee tout de suite ; les Sims de sa partie
+            # absents chez l'hote (supprimes de la famille...) disparaissent sans attendre 30 s.
+            session.endpoint.send(protocol.make_message(protocol.EVENT, {'kind': 'roster_request'}))
+            log('[client] arrivee sur le lot : liste de presence demandee a l\'hote')
+        _mirror['zone_seen'] = running
     if mirror_on(session) and now - _mirror['reported_at'] >= MIRROR_REPORT_INTERVAL:
         _mirror['reported_at'] = now
         log('simulation unique :\n  ' + '\n  '.join(mirror_lines()))
@@ -4815,9 +5026,59 @@ def _hook_clock_broadcast():
             if mirror_frozen():
                 _mirror['clock_skipped'] += 1
                 return None                          # l'heure affichee vient de l'hote
-            return original(self, *args, **kwargs)
+            result = original(self, *args, **kwargs)
+            if _mirror['capturing']:
+                try:
+                    mirror_send_clock(self)          # l'invite refait l'operation avec ses horloges (0.23.3)
+                except Exception:
+                    _mirror_error('heure envoyee a l\'invite')
+            return result
         return sync_and_broadcast
     _mirror_wrap(clock.GameClock, '_sync_clock_and_broadcast_gameclock', make)
+
+
+def bridge_game_clock():
+    import services
+    return services.game_clock_service()
+
+
+def mirror_send_clock(game_clock=None):
+    """Hote (0.23.3, comme S4MP) : envoie son heure de jeu a l'invite, sans ses horloges de PC."""
+    session = _session
+    if session is None or session.role != 'host' or not _connected(session):
+        return
+    values = bridge_clock_values(game_clock if game_clock is not None else bridge_game_clock())
+    if session.endpoint.send(protocol.make_message(protocol.EVENT, dict(values, kind='clock_op'))):
+        _flush_now(session)
+        _mirror['clock_sent'] += 1
+        _mirror['clock_sent_at'] = time.monotonic()
+
+
+def _clean_clock_op(data):
+    """Heure recue de l'hote, verifiee, ou None."""
+    game_time = data.get('game_time')
+    values = {'game_time': None if game_time is None else _clean_int(game_time, 0, 2 ** 63),
+              'game_speed': _clean_float(data.get('game_speed'), 10000.0),
+              'clock_speed': _clean_int(data.get('clock_speed'), 0, 64),
+              'initial_ticks': _clean_int(data.get('initial_ticks'), 0, 2 ** 63),
+              'super_speed': data.get('super_speed')}
+    if ((game_time is not None and values['game_time'] is None) or values['game_speed'] is None
+            or values['clock_speed'] is None or values['initial_ticks'] is None
+            or not isinstance(values['super_speed'], bool)):
+        return None
+    return values
+
+
+def _handle_clock_op(session, data):
+    """Invite : heure de l'hote, refaite avec ses propres horloges (pas pendant un chargement)."""
+    values = _clean_clock_op(data)
+    if values is None:
+        log('[client] heure de l\'hote invalide ignoree')
+        return
+    if not _mirror['active'] or _mirror['traveling'] or not _read('zone', bridge_zone_running):
+        return
+    if _safe('heure de l\'hote', bridge_apply_host_clock, values):
+        _mirror['clock_applied'] += 1
 
 
 def _hook_npc_spawner():
