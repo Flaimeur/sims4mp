@@ -1344,6 +1344,26 @@ report('invite : apparitions de son propre jeu refusees zone en marche (permises
        blocked is False and allowed is True and loading is True and mod._mirror['spawns_blocked'] == 1
        and SimSpawner.spawned == ['demande par l\'hote', 'chargement du lot'], str(SimSpawner.spawned))
 
+# Methode de classe gardee (0.23.1) : un mod qui l'accroche apres nous (WickedWhims, injecteur qui
+# reprend la fonction de la classmethod) l'appelle toujours avec cls et le Sim.
+ZONE.is_zone_running = False
+raw = SimSpawner.__dict__['spawn_sim']
+inner = raw.__func__ if isinstance(raw, classmethod) else None
+
+
+def _like_wickedwhims(cls, sim_info, **kwargs):
+    return inner(cls, sim_info, **kwargs)
+
+
+if inner is not None:
+    SimSpawner.spawn_sim = classmethod(_like_wickedwhims)
+SimSpawner.spawned = []
+result = SimSpawner.spawn_sim('Sim du chargement', sim_position=(1, 2, 3))
+SimSpawner.spawn_sim = raw
+ZONE.is_zone_running = True
+report('SimSpawner.spawn_sim reste une methode de classe, appelable par un mod accroche apres (erreur 110)',
+       inner is not None and result is True and SimSpawner.spawned == ['Sim du chargement'], str(SimSpawner.spawned))
+
 # Hote : chaque Sim apparu est annonce aussitot.
 mod._session = host
 mod._mirror['wanted'] = True

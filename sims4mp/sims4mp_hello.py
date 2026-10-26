@@ -1,4 +1,6 @@
-# Sims 4 Multiplayer - comme S4MP, apres une relecture complete de son mod (0.23.0) : l'invite ne garde
+# Sims 4 Multiplayer - correctif 0.23.1 : SimSpawner.spawn_sim reste une methode de classe une fois
+# accrochee (avec WickedWhims, le chargement d'un lot plantait : erreur 110).
+# Comme S4MP, apres une relecture complete de son mod (0.23.0) : l'invite ne garde
 # de son propre affichage qu'une liste blanche (menus, fenetres, survol, glisser : MIRROR_LOCAL_OPS et
 # MIRROR_LOCAL_MESSAGES), tout le reste vient de l'hote ; son jeu ne fait plus apparaitre de Sims
 # (SimSpawner.spawn_sim refusee zone en marche) et l'hote annonce chaque apparition aussitot (EVENT
@@ -283,7 +285,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.23.0'
+MOD_VERSION = '0.23.1'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -4697,7 +4699,20 @@ def _handle_cancel_si(session, data):
 
 
 def _mirror_wrap(owner, name, make):
-    """Remplace owner.name par make(original), une seule fois."""
+    """Remplace owner.name par make(original), une seule fois. Une methode de classe le reste (0.23.1) :
+    make recoit la fonction (cls en premier argument), le resultat est remis en classmethod. Sinon les
+    mods qui accrochent la meme methode apres nous (WickedWhims sur SimSpawner.spawn_sim) l'appellent
+    mal : le chargement de la zone plantait (erreur 110)."""
+    raw = None
+    if isinstance(owner, type):
+        raw = next((klass.__dict__[name] for klass in owner.__mro__ if name in klass.__dict__), None)
+    if isinstance(raw, classmethod):
+        if getattr(raw.__func__, '_sims4mp_hook', False):
+            return
+        wrapped = functools.wraps(raw.__func__)(make(raw.__func__))
+        wrapped._sims4mp_hook = True
+        setattr(owner, name, classmethod(wrapped))
+        return
     original = getattr(owner, name)
     if getattr(original, '_sims4mp_hook', False):
         return
