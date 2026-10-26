@@ -1,4 +1,6 @@
-# Sims 4 Multiplayer - journaux des deux PC (0.23.3), comme S4MP : l'invite refait l'heure de l'hote avec
+# Sims 4 Multiplayer - calendrier de l'invite (0.23.4) : ses propres entrees de calendrier (MSG_CALENDAR,
+# MSG_CALENDAR_UPDATE) passent la liste blanche ; son calendrier restait vide.
+# Journaux des deux PC (0.23.3), comme S4MP : l'invite refait l'heure de l'hote avec
 # ses propres horloges (EVENT clock_op ; l'operation SetGameTime de l'hote portait l'heure de son PC :
 # heure decalee de 2 min, trajets et animations deja finis a l'arrivee) ; plus de recalage ni de pause de
 # l'horloge de l'invite en simulation unique (ses changements de vitesse mettaient l'hote en pause en
@@ -298,7 +300,7 @@ import weakref
 import sims4.commands
 
 MOD_NAME = 'sims4mp'
-MOD_VERSION = '0.23.3'
+MOD_VERSION = '0.23.4'
 LOG_FILE_NAME = 'sims4mp.log'
 DEFAULT_PORT = 7777
 PUMP_INTERVAL = 0.02     # secondes reelles minimum entre deux poll() (0.15.0 : 0.05 avant)
@@ -405,6 +407,9 @@ MIRROR_LOCAL_OPS = (
     'MSG_SITUATION_GETAWAY_RULES', 'SET_RESIDENT_LIST', 'CUSTOM_SCHEDULE_SET_CUSTOM_ASSIGNMENT',
     'KINGDOM_SEND_AVAILABLE_DECREES',
 )
+# Gardees aussi chez l'invite, sans etre des fenetres (0.23.4) : les entrees du calendrier de son foyer
+# (le meme que chez l'hote) ; sans elles son calendrier restait vide. Les alertes viennent de l'hote.
+MIRROR_GUEST_OWN_OPS = ('MSG_CALENDAR', 'MSG_CALENDAR_UPDATE')
 # Messages (Consts_pb2) de son ecran ; ceux que l'hote garde pour lui (MIRROR_HOST_ONLY) passent aussi :
 # personne d'autre ne les lui enverrait.
 MIRROR_LOCAL_MESSAGES = ('MSG_OBJECT_IS_INTERACTABLE', 'MSG_PIE_MENU_CREATE', 'MSG_PHONE_MENU_CREATE',
@@ -4422,7 +4427,7 @@ def mirror_filter_own(msg_id, data):
         _mirror['view_update_id'] = next((m for m, name in names.items() if name == 'MSG_OBJECTS_VIEW_UPDATE'), -1)
         _mirror['local_messages'] = frozenset(_mirror_host_only() | frozenset(
             m for m, name in names.items() if name in MIRROR_LOCAL_MESSAGES))
-        _mirror['local_ops'] = bridge_local_op_types(MIRROR_LOCAL_OPS)
+        _mirror['local_ops'] = bridge_local_op_types(MIRROR_LOCAL_OPS + MIRROR_GUEST_OWN_OPS)
         _mirror['create_ops'] = bridge_local_op_types(('OBJECT_CREATE', 'OBJECT_DELETE', 'OBJECT_REPLACE'))
     if msg_id != _mirror['view_update_id']:
         if msg_id in _mirror['local_messages']:

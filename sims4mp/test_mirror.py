@@ -311,7 +311,7 @@ module('protocolbuffers.Distributor_pb2', ViewUpdate=_ViewUpdate)
 # UI_NOTIFICATION_SHOW 166 non (vraies valeurs de DistributorOps_pb2.Operation).
 module('protocolbuffers.DistributorOps_pb2', Operation=types.SimpleNamespace(
     FOCUS=10, HOVERTIP_CREATED=277, SET_LOCATION=3, UI_NOTIFICATION_SHOW=166, OBJECT_DELETE=1, OBJECT_CREATE=41,
-    UI_UPDATE=16, SET_GAME_TIME=150, NOTEBOOK_VIEW=1100))
+    UI_UPDATE=16, SET_GAME_TIME=150, NOTEBOOK_VIEW=1100, MSG_CALENDAR_UPDATE=702, CALENDAR_ALERT=707))
 
 
 class _DialogMessage(object):
@@ -741,6 +741,10 @@ omega.send(0xABC, 11, b'8:3')
 mod._mirror['own_shown'].clear()
 report('Sim affiche par l\'invite lui-meme : son apparition/retrait passe, pas ses autres operations (0.23.3)',
        SENT == [(0xABC, 11, b'8:3.1')], str(SENT))
+del SENT[:]
+omega.send(0xABC, 11, b'0:702.707')
+report('entrees du calendrier de son foyer : gardees (calendrier vide sinon) ; alertes : celles de l\'hote (0.23.4)',
+       SENT == [(0xABC, 11, b'0:702')], str(SENT))
 del SENT[:]
 ZONE.is_zone_running = False
 omega.send(0xABC, 159, b'chargement')
