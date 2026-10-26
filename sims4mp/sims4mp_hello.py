@@ -1,5 +1,7 @@
-# Sims 4 Multiplayer - calendrier de l'invite (0.23.4) : ses propres entrees de calendrier (MSG_CALENDAR,
-# MSG_CALENDAR_UPDATE) passent la liste blanche ; son calendrier restait vide.
+# Sims 4 Multiplayer - calendrier et construction de l'invite (0.23.4) : ses propres entrees de calendrier
+# (MSG_CALENDAR, MSG_CALENDAR_UPDATE) passent la liste blanche (calendrier vide) ; le mode construction est
+# aussi reconnu par Zone.is_in_build_buy (aucun geste de l'invite n'etait plus envoye depuis 0.22.0) ;
+# entree et sortie du mode construction notees dans le journal.
 # Journaux des deux PC (0.23.3), comme S4MP : l'invite refait l'heure de l'hote avec
 # ses propres horloges (EVENT clock_op ; l'operation SetGameTime de l'hote portait l'heure de son PC :
 # heure decalee de 2 min, trajets et animations deja finis a l'arrivee) ; plus de recalage ni de pause de
@@ -4006,6 +4008,7 @@ _mirror = {
     'distributor_skipped': 0,
     # Construction et achat faits par l'invite (0.20.3).
     'bb_session': False,     # invite : mode construction/achat ouvert (recoloriage transmis)
+    'bb_seen_zone': False,   # mode construction vu par Zone.is_in_build_buy (journal une fois, 0.23.4)
     'bb_sent': 0,
     'bb_applied': 0,
     'bb_failed': 0,
@@ -4419,8 +4422,8 @@ def mirror_filter_own(msg_id, data):
     propre a son ecran (menus, fenetres, survol, glisser...) ; tout l'etat du monde vient de l'hote.
     Rien n'est filtre en mode construction (il pose lui-meme ses objets), ni pendant un chargement ou
     un voyage (zone arretee). Renvoie les octets a afficher ou None."""
-    if (not mirror_frozen() or _mirror['bb_session'] or _mirror['traveling']
-            or not isinstance(data, (bytes, bytearray)) or not bridge_zone_running()):
+    if (not mirror_frozen() or _mirror['traveling'] or not isinstance(data, (bytes, bytearray))
+            or not bridge_zone_running() or mirror_in_build_buy()):
         return data
     if _mirror['local_messages'] is None:
         names = _message_names()
@@ -4613,6 +4616,29 @@ def _clean_object_entry(entry):
 # Chez l'invite, chaque appel part a l'hote, qui le rejoue avec la meme fonction ; l'objet cree
 # chez l'invite n'a pas d'affichage propre (copie, comme en 0.20.2) : il apparait par l'hote.
 # Murs, sols et terrain sont geres par le moteur C++ du jeu : pas par ce chemin.
+
+def bridge_zone_in_build_buy():
+    """Vrai si le jeu est en mode construction (Zone.is_in_build_buy, pose par Zone.on_build_buy_enter)."""
+    import services
+    zone = services.current_zone()
+    return zone is not None and bool(getattr(zone, 'is_in_build_buy', False))
+
+
+def mirror_in_build_buy():
+    """Mode construction ouvert ici (0.23.4) : vu par l'accroche de c_api_buildbuy_session_begin, ou par le
+    drapeau de la zone si le moteur appelle la fonction d'origine sans passer par l'accroche (aucun geste
+    de l'invite n'etait plus envoye depuis 0.22.0)."""
+    if _mirror['bb_session']:
+        return True
+    try:
+        in_bb = bridge_zone_in_build_buy()
+    except Exception:
+        return False
+    if in_bb and not _mirror['bb_seen_zone']:
+        _mirror['bb_seen_zone'] = True
+        log('mode construction vu par la zone (accroche de session non appelee)')
+    return in_bb
+
 
 def mirror_build_buy_reminder(opened):
     """Rappel (0.23.2) : murs, sols, toits et terrain ne passent pas en direct (S4MP non plus). L'invite
@@ -5315,7 +5341,7 @@ def _hook_build_buy():
             def wrapper(*args, **kwargs):
                 # Seulement en mode construction ouvert (0.22.0) : ces fonctions sont aussi appelees par
                 # le jeu en chargeant un lot (1263 gestes envoyes a tort pendant un voyage).
-                active = mirror_frozen() and not _sync['pushing'] and _mirror['bb_session']
+                active = mirror_frozen() and not _sync['pushing'] and mirror_in_build_buy()
                 values = None
                 if active:
                     try:
@@ -5358,12 +5384,13 @@ def _hook_build_buy():
         'unparent', lambda a: dict(bridge_pack_place(a.get('transform'), a.get('surface')), id=_as_int(a['obj_id']))))
     _mirror_wrap(ClientObjectMixin, 'set_definition', make(
         'design', lambda a: ({'id': a['self'].id, 'def': _as_int(getattr(a['definition_id'], 'id', a['definition_id']))}
-                             if _mirror['bb_session'] else None)))
+                             if mirror_in_build_buy() else None)))
 
     def make_session(opened):
         def make_wrapper(original):
             def session(*args, **kwargs):
                 _mirror['bb_session'] = opened
+                log('mode construction {}'.format('ouvert' if opened else 'ferme'))
                 try:
                     mirror_build_buy_reminder(opened)
                 except Exception:

@@ -968,6 +968,13 @@ report('deplacement : position, rotation, etage et type de surface',
        and 'parent' not in gestures[2] and gestures[3]['parent'] == 3001 and gestures[3]['slot'] == 7, str(gestures[1]))
 report('recoloriage transmis seulement en mode construction', gestures[5] == {'kind': 'bb', 'op': 'design',
                                                                               'id': 3001, 'def': 61})
+start = len(events(guest.endpoint, 'bb'))
+ZONE.is_in_build_buy = True                          # le moteur a appele la fonction d'origine, sans l'accroche
+obj_system.c_api_create_object(99, 62, 3003, None, 1, 0)
+ZONE.is_in_build_buy = False
+late = events(guest.endpoint, 'bb')[start:]
+report('mode construction vu seulement par la zone (Zone.is_in_build_buy) : le geste part quand meme (0.23.4)',
+       [g['op'] for g in late] == ['create'] and late[0]['id'] == 3003, str(late))
 
 mod._session = host
 mod._mirror['wanted'] = True
